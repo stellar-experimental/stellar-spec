@@ -1,8 +1,8 @@
 # Stellar Ledger Close Pipeline Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the ledger close pipeline as implemented in
-stellar-core v25.2.2. The ledger close pipeline is the deterministic
+stellar-core v26.0.0. The ledger close pipeline is the deterministic
 process by which the network transforms an agreed-upon transaction set
 (from SCP consensus) and the current ledger state into a new committed
 ledger state. It encompasses:
@@ -54,7 +54,7 @@ ledger state. It encompasses:
 - The genesis ledger bootstrap procedure.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
+exclusively from the vetted stellar-core C++ implementation (v26.0.0) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical ledger hashes, transaction result
 hashes, BucketList hashes, and ledger close metadata for all valid
@@ -939,9 +939,18 @@ During ledger close, upgrades are applied in the order they appear in
      `CONTRACT_LEDGER_COST_EXT` config settings, and update rent cost
      parameters.
    - If upgrading to p25: enable Rust Dalek signature verification
-     and create new cost types for protocol 25
-     (`createCostTypesForV25`).
-   - If the new version is ≥ 23: recompute the in-memory Soroban
+      and create new cost types for protocol 25
+      (`createCostTypesForV25`).
+    - If upgrading to p26: create initial frozen ledger key and
+      freeze bypass transaction config setting entries
+      (`createLedgerEntriesForV26`) — both start as empty sets. Update
+      CPU and memory cost parameters for BLS12-381 and BN254 operations
+      (`updateCostTypesForV26`): reduced costs for `Bls12381G1Msm`,
+      `Bls12381MapFpToG1`, `Bls12381HashToG1`, `Bls12381G2Msm`,
+      `Bls12381MapFp2ToG2`, `Bls12381HashToG2`,
+      `Bn254G2CheckPointInSubgroup`; new cost type `Bn254G1Msm`
+      (cost arrays are resized to fit). See CAP-0077.
+    - If the new version is ≥ 23: recompute the in-memory Soroban
      state size and update the state size window if applicable
      (`handleUpgradeAffectingSorobanInMemoryStateSize`).
    - Note: Upgrade actions trigger when crossing through a target
@@ -1004,6 +1013,22 @@ During ledger close, upgrades are applied in the order they appear in
    - Load the `ConfigUpgradeSet` from ledger state.
    - For each entry in the set, update the corresponding
      `CONFIG_SETTING` entry.
+   - **Non-upgradeable settings** (e.g., `FROZEN_LEDGER_KEYS`,
+     `FREEZE_BYPASS_TXS`) MUST NOT appear directly in the upgrade
+     set — validation rejects them. They are modified only through
+     their delta counterparts.
+   - **Delta settings** `@version(≥26)`: Entries of type
+     `FROZEN_LEDGER_KEYS_DELTA` and `FREEZE_BYPASS_TXS_DELTA` are
+     applied as follows:
+     - `FROZEN_LEDGER_KEYS_DELTA`: Load the existing
+       `FROZEN_LEDGER_KEYS` set. Insert all `keysToFreeze`, remove
+       all `keysToUnfreeze`. The merge uses an ordered set for
+       deterministic ordering. Write back the result.
+     - `FREEZE_BYPASS_TXS_DELTA`: Load the existing
+       `FREEZE_BYPASS_TXS` set. Insert all `addTxs`, remove all
+       `removeTxs`. Write back the result.
+     Delta entries always pass the `upgradeNeeded()` check (they
+     represent changes, not absolute values).
    - The `ConfigUpgradeSet` entry is stored as `TEMPORARY` contract
      data and is NOT explicitly deleted after application — it
      remains in ledger state and expires naturally when its TTL
@@ -1153,6 +1178,10 @@ indicated protocol version):
 | 14 | `CONTRACT_PARALLEL_COMPUTE` | 23 | Parallel Soroban execution settings (`ledgerMaxDependentTxClusters`). Upper bound: 128. See CAP-0063. |
 | 15 | `CONTRACT_LEDGER_COST_EXT` | 23 | Extended ledger cost parameters: `txMaxFootprintEntries` (max total read+write footprint entries per tx) and `feeWrite1KB` (flat-rate write fee per KB). |
 | 16 | `SCP_TIMING` | 23 | On-chain SCP consensus timing: `ledgerTargetCloseTimeMilliseconds`, `nominationTimeoutInitialMilliseconds`, `nominationTimeoutIncrementMilliseconds`, `ballotTimeoutInitialMilliseconds`, `ballotTimeoutIncrementMilliseconds`. See CAP-0070. |
+| 17 | `FROZEN_LEDGER_KEYS` | 26 | Set of frozen ledger keys (XDR-encoded opaque `EncodedLedgerKey` values). Non-upgradeable directly; modified via `FROZEN_LEDGER_KEYS_DELTA`. Allowed key types: `ACCOUNT`, `TRUSTLINE` (excluding pool share and issuer trustlines), `CONTRACT_DATA`, `CONTRACT_CODE`. See CAP-0077. |
+| 18 | `FROZEN_LEDGER_KEYS_DELTA` | 26 | Delta entry specifying `keysToFreeze` and `keysToUnfreeze`. Applied to `FROZEN_LEDGER_KEYS` during config upgrade. See CAP-0077. |
+| 19 | `FREEZE_BYPASS_TXS` | 26 | Set of transaction content hashes (`Hash` values) that may bypass freeze checks. Non-upgradeable directly; modified via `FREEZE_BYPASS_TXS_DELTA`. See CAP-0077. |
+| 20 | `FREEZE_BYPASS_TXS_DELTA` | 26 | Delta entry specifying `addTxs` and `removeTxs`. Applied to `FREEZE_BYPASS_TXS` during config upgrade. See CAP-0077. |
 
 ### 9.3 Configuration Loading
 
@@ -1186,12 +1215,18 @@ The constant 5000 ms is `TARGET_LEDGER_CLOSE_TIME_BEFORE_PROTOCOL_VERSION_23_MS`
 
 The following settings are NOT upgradeable through the config upgrade
 mechanism and are instead updated internally by the ledger close
-pipeline:
+pipeline or via their corresponding delta entries:
 
 - `BUCKETLIST_SIZE_WINDOW`: Updated during the finalize step based on
   the current BucketList size (Section 11).
 - `EVICTION_ITERATOR`: Updated by the eviction scan subsystem (see
   BucketListDB Specification, Section 12).
+- `FROZEN_LEDGER_KEYS` `@version(≥26)`: Modified only by applying
+  `FROZEN_LEDGER_KEYS_DELTA` during config upgrades (Section 7.3.4).
+  Direct upgrades are rejected.
+- `FREEZE_BYPASS_TXS` `@version(≥26)`: Modified only by applying
+  `FREEZE_BYPASS_TXS_DELTA` during config upgrades (Section 7.3.4).
+  Direct upgrades are rejected.
 
 ### 9.5 Cost Model
 
@@ -1215,6 +1250,7 @@ The parameter arrays are sized per protocol version:
 | 21 | 45 | Granular Wasm parse/instantiate types (IDs 23–42), secp256r1 verification (IDs 43–44). See CAP-0051/0054. |
 | 22–24 | 70 | BLS12-381 operations (IDs 45–69). See CAP-0059/0074. |
 | 25+ | 85 | BN254 operations (IDs 70–84): field encode/decode, G1/G2 point checks, G1 add/mul, pairing, Fr arithmetic. See CAP-0074/0075. |
+| 26+ | 86 | BN254 G1 MSM (ID 85): `Bn254G1Msm`. Updated BLS12-381 and BN254 cost parameters. See CAP-0077. |
 
 During protocol upgrades, the arrays are resized and new entries are
 populated with calibrated default values. All `constTerm` and
@@ -1593,7 +1629,7 @@ Additionally, for parallel Soroban execution (protocol 23+):
 |--------|-----------------|
 | **Execution threads** | Short-lived threads spawned per cluster for parallel Soroban transaction execution. Read-only access to the apply state. |
 
-In v25.2.2, parallel Soroban apply is enabled by default for protocol
+In v26.0.0, parallel Soroban apply is enabled by default for protocol
 23+. The previous experimental flag has been removed.
 
 ### 14.2 Thread Safety
@@ -1731,7 +1767,7 @@ order book and path finding.
 | `GENESIS_LEDGER_MAX_TX_SIZE` | 100 | Maximum transaction set size in the genesis ledger. |
 | `GENESIS_LEDGER_TOTAL_COINS` | 1,000,000,000,000,000,000 | Total lumens at genesis (stroops, 100 billion XLM). |
 | `CHECKPOINT_FREQUENCY` | 64 | Ledger interval between history checkpoints. |
-| `CURRENT_LEDGER_PROTOCOL_VERSION` | 25 | Maximum supported protocol version. |
+| `CURRENT_LEDGER_PROTOCOL_VERSION` | 26 | Maximum supported protocol version. |
 | `TARGET_LEDGER_CLOSE_TIME_BEFORE_P23_MS` | 5000 | Expected ledger close time before protocol 23 (5 seconds). |
 | `REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` | 23 | Protocol version at which the reusable contract module cache is activated. |
 
@@ -1742,14 +1778,18 @@ order book and path finding.
 | Reference | Description |
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
-| [stellar-core] | stellar-core v25.2.2 source code, `src/ledger/`, `src/herder/`. |
+| [stellar-core] | stellar-core v26.0.0 source code, `src/ledger/`, `src/herder/`. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/ledger/`, `src/herder/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
 | [TX Spec] | Stellar Transaction Processing Specification (companion document). |
 | [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
 | [CAP-0046] | Soroban Smart Contracts proposal. |
+| [CAP-0073] | SAC trustline and account creation. |
 | [CAP-0076] | P23 State Archival bug remediation. |
+| [CAP-0077] | Ability to freeze ledger keys via network configuration. |
+| [CAP-0078] | Soroban host updates for protocol 26. |
+| [CAP-0080] | Soroban host updates for protocol 26. |
 
 ---
 

@@ -1,8 +1,8 @@
 # Stellar Consensus Protocol (SCP) Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar Consensus Protocol (SCP) as
-implemented in stellar-core v25.x. SCP is a federated Byzantine
+implemented in stellar-core v26.x. SCP is a federated Byzantine
 agreement protocol that enables the Stellar network to reach consensus
 on transaction sets without requiring a closed membership list or a
 central authority.

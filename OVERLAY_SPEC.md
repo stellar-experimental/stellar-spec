@@ -1,8 +1,8 @@
 # Stellar Overlay Protocol Specification
 
-**Version:** 25 (Overlay Protocol v38–v39)
+**Version:** 26 (Overlay Protocol v38–v40)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar Overlay Protocol as implemented in
-stellar-core v25.2.2. The overlay protocol governs how Stellar network nodes
+stellar-core v26.0.0. The overlay protocol governs how Stellar network nodes
 discover peers, establish authenticated connections, propagate transactions
 and consensus messages, manage flow control, and conduct network topology
 surveys.
@@ -2084,14 +2084,14 @@ its connections, are mitigated by:
 | [RFC 2119][rfc2119] | Key words for use in RFCs to Indicate Requirement Levels |
 | [RFC 4506][rfc4506] | XDR: External Data Representation Standard |
 | [RFC 5531][rfc5531] | RPC: Remote Procedure Call Protocol Specification Version 2 (Record Marking) |
-| [Stellar-overlay.x][xdr] | Stellar Overlay XDR Schema (v25) |
+| [Stellar-overlay.x][xdr] | Stellar Overlay XDR Schema (v26) |
 | [Stellar-types.x][xdr-types] | Stellar Types XDR Schema (cryptographic primitives) |
 
 ### 15.2 Informative References
 
 | Reference | Title |
 |-----------|-------|
-| [stellar-core][stellar-core] | Stellar Core reference implementation (v25.2.2) |
+| [stellar-core][stellar-core] | Stellar Core reference implementation (v26.0.0) |
 | [RFC 7748][rfc7748] | Elliptic Curves for Security (X25519) |
 | [RFC 8032][rfc8032] | Edwards-Curve Digital Signature Algorithm (Ed25519) |
 | [RFC 5869][rfc5869] | HMAC-based Extract-and-Expand Key Derivation Function (HKDF) |

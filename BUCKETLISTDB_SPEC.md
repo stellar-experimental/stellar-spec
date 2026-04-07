@@ -1,8 +1,8 @@
 # Stellar BucketList and BucketListDB Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the BucketList and BucketListDB subsystem as
-implemented in stellar-core v25.2.2. The BucketList is a hierarchical,
+implemented in stellar-core v26.0.0. The BucketList is a hierarchical,
 append-structured data store that maintains a cumulative, hash-verified
 snapshot of all ledger state. BucketListDB is the query layer built on
 top of the BucketList that supports point lookups and bulk key loads
@@ -65,7 +65,7 @@ This specification covers:
   persistence.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
+exclusively from the vetted stellar-core C++ implementation (v26.0.0) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical bucket hashes, BucketList hashes,
 and query results for all valid inputs is considered correct. Internal
@@ -1784,7 +1784,7 @@ states from different ledgers.
 | [CAP-0035] | Stellar CAP-0035, "Asset Clawback", adds clawback-related entries. |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries. |
 | [CAP-0057] | Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction. |
-| [stellar-core] | stellar-core v25.2.2 source code, `src/bucket/` directory. |
+| [stellar-core] | stellar-core v26.0.0 source code, `src/bucket/` directory. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/bucket/` directory. |
 
 ---

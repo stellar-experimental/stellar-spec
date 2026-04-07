@@ -1,8 +1,8 @@
 # Stellar Catchup, Replay, and History Publishing Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -33,7 +33,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the catchup, replay, and history publishing
-subsystems as defined for stellar-core protocol 25. Together, these
+subsystems as defined for stellar-core protocol 26. Together, these
 subsystems enable:
 
 - **Checkpoint publishing**: Periodically writing ledger state snapshots
@@ -72,7 +72,7 @@ This specification covers:
 - Error handling, crash recovery, and retry semantics.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
+exclusively from the vetted stellar-core C++ implementation (v26.0.0) and
 its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical ledger state for all valid inputs
 is considered correct. Internal details such as work scheduling
@@ -1145,7 +1145,7 @@ each checkpoint.
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [rfc5785] | Nottingham, M., Hammer-Lahav, E., "Defining Well-Known Uniform Resource Identifiers (URIs)", RFC 5785, April 2010. |
-| [stellar-core] | stellar-core v25.2.2 source code, `src/catchup/`, `src/history/`. |
+| [stellar-core] | stellar-core v26.0.0 source code, `src/catchup/`, `src/history/`. |
 | [stellar-core-pc] | stellar-core pseudocode companion, `src/catchup/`, `src/history/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [Ledger Spec] | Stellar Ledger Close Pipeline Specification (companion document). |

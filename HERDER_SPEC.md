@@ -1,8 +1,8 @@
 # Herder Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-04-07
 
 ---
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Herder subsystem of the Stellar network as
-derived from stellar-core v25.2.2. The herder is the **orchestration
+derived from stellar-core v26.0.0. The herder is the **orchestration
 layer** that drives consensus rounds by bridging the SCP consensus
 library, the transaction pool, the overlay network, and the ledger
 close pipeline.
@@ -522,6 +522,12 @@ The construction of a transaction set proceeds as follows:
    recorded for diagnostic purposes but do not affect the
    construction.
 
+   `@version(≥26)`: During construction, the fee balance map
+   MUST be shared across all phases. Transactions trimmed from
+   Phase 0 (Classic) reduce the fee source's available balance
+   for Phase 1 (Soroban). This prevents fee-bump sources from
+   overcommitting fees across phases.
+
 3. **Apply surge pricing**: For each phase, apply the surge
    pricing mechanism (Section 12) to select the highest-fee
    transactions that fit within the phase's resource limits.
@@ -854,12 +860,28 @@ and all other per-transaction validation rules defined in
 TX_SPEC §3.
 
 After the individual validation pass, the validator MUST also
-perform an **aggregate fee-source affordability** check within
-the phase: group transactions by fee source account, sum the
-group's full fees, and compare that total against the fee
-source's available native balance at `lastClosedLedgerSeq + 1`.
-If the available balance is insufficient, all transactions from
-that fee source in the phase are invalid.
+perform an **aggregate fee-source affordability** check: group
+transactions by fee source account, sum the group's full fees,
+and compare that total against the fee source's available native
+balance at `lastClosedLedgerSeq + 1`.
+
+- `@version(<26)`: The affordability check is performed
+  **per-phase** — fee balances are tracked independently for
+  each phase. An account's fees in Phase 0 (Classic) do not
+  reduce its available balance for Phase 1 (Soroban), allowing
+  the same balance to be used for fees in both phases.
+- `@version(≥26)`: The affordability check is performed
+  **across all phases** — a single fee balance map is shared
+  across both Classic and Soroban phases. If a fee-bump source
+  account commits fees in Phase 0 that leave insufficient
+  balance for Phase 1, the Phase 1 transactions are invalid.
+  This closes a loophole where fee-bump sources could
+  overcommit fees across phases.
+
+If the available balance is insufficient for any fee source,
+all transactions from that fee source in the affected scope
+(per-phase or cross-phase, depending on protocol version) are
+invalid.
 
 ### 8.5 Legacy Transaction Set Validation
 
@@ -1832,7 +1854,7 @@ by implementations:
 ### 17.2 Recommended Parameters
 
 These values are operational parameters. The values listed are
-RECOMMENDED defaults derived from stellar-core v25.2.2:
+RECOMMENDED defaults derived from stellar-core v26.0.0:
 
 | Parameter | Recommended Value | Description |
 |-----------|-------------------|-------------|

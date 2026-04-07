@@ -1,8 +1,8 @@
 # Stellar Protocol Specification Suite
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-25
+**Date:** 2026-04-07
 
 ---
 
@@ -10,7 +10,7 @@
 
 This directory contains a comprehensive, implementation-agnostic
 specification of the Stellar network protocol, derived exclusively
-from the vetted stellar-core (v25.2.2) reference implementation. The
+from the vetted stellar-core (v26.0.0) reference implementation. The
 specifications collectively define the observable behavior that any
 conforming implementation MUST reproduce.
 
@@ -215,7 +215,7 @@ affect consensus or ledger state.
 
 This appendix consolidates cross-cutting constants and formulas used
 across multiple specs. It is non-normative but reflects stellar-core
-behavior for protocol 25.
+behavior for protocol 26.
 
 ### A.1 Timing and Consensus
 
