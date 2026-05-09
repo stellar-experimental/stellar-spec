@@ -2,7 +2,7 @@
 
 **Version:** 26 (Overlay Protocol v38–v40)
 **Status:** Informational
-**Date:** 2026-04-07
+**Date:** 2026-05-09
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar Overlay Protocol as implemented in
-stellar-core v26.0.0. The overlay protocol governs how Stellar network nodes
+stellar-core v26.0.1. The overlay protocol governs how Stellar network nodes
 discover peers, establish authenticated connections, propagate transactions
 and consensus messages, manage flow control, and conduct network topology
 surveys.
@@ -1201,7 +1201,10 @@ maxAdvertSize = clamp(
 **Per-peer deduplication**: Before queuing an advert hash, the node
 checks a per-peer advert history cache (50,000 entries). If the hash
 has already been advertised to or received from this peer, the advert
-is suppressed.
+is suppressed. The advert history and demand history caches key
+externally supplied transaction hashes with a full-width hash function
+over all 32 bytes, so adversarial peers cannot cheaply force collisions
+by controlling only the hash prefix or suffix.
 
 ### 9.4 Incoming Advert Processing
 
@@ -2091,7 +2094,7 @@ its connections, are mitigated by:
 
 | Reference | Title |
 |-----------|-------|
-| [stellar-core][stellar-core] | Stellar Core reference implementation (v26.0.0) |
+| [stellar-core][stellar-core] | Stellar Core reference implementation (v26.0.1) |
 | [RFC 7748][rfc7748] | Elliptic Curves for Security (X25519) |
 | [RFC 8032][rfc8032] | Edwards-Curve Digital Signature Algorithm (Ed25519) |
 | [RFC 5869][rfc5869] | HMAC-based Extract-and-Expand Key Derivation Function (HKDF) |

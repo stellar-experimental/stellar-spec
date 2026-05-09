@@ -1,8 +1,8 @@
 # Herder Specification
 
-**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-04-07
+**Date:** 2026-05-09
 
 ---
 
@@ -34,7 +34,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Herder subsystem of the Stellar network as
-derived from stellar-core v26.0.0. The herder is the **orchestration
+derived from stellar-core v26.0.1. The herder is the **orchestration
 layer** that drives consensus rounds by bridging the SCP consensus
 library, the transaction pool, the overlay network, and the ledger
 close pipeline.
@@ -1072,6 +1072,13 @@ the herder processes it through the following validation pipeline.
 Each step either accepts the transaction or rejects it with a
 specific result code.
 
+Transactions received from the overlay MUST use the overlay-specific
+transaction validation path before queue admission. This path is
+equivalent to normal transaction validation except for the overlay-only
+signature-checking rules in TX_SPEC §4.7. Locally constructed
+transactions may skip this revalidation when they were already validated
+while constructing the transaction set or load generator input.
+
 #### 11.3.1 Structural Fee Validation
 
 The transaction's XDR fee fields MUST be structurally valid.
@@ -1162,6 +1169,9 @@ The transaction is validated against a snapshot of the current
 ledger state at `lastClosedLedgerSeq + 1`. This includes all
 validation rules from TX_SPEC §3 (sequence numbers, time bounds,
 signatures, operation-specific preconditions, etc.).
+For peer-submitted transactions this full validation is performed via
+the overlay-validation entry point, not the ledger-apply validation
+entry point.
 
 #### 11.3.12 Balance Check
 
@@ -1854,7 +1864,7 @@ by implementations:
 ### 17.2 Recommended Parameters
 
 These values are operational parameters. The values listed are
-RECOMMENDED defaults derived from stellar-core v26.0.0:
+RECOMMENDED defaults derived from stellar-core v26.0.1:
 
 | Parameter | Recommended Value | Description |
 |-----------|-------------------|-------------|

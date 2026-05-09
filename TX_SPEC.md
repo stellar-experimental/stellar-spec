@@ -1,8 +1,8 @@
 # Stellar Transaction Processing Specification
 
-**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-04-07
+**Date:** 2026-05-09
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar transaction processing subsystem as
-implemented in stellar-core v26.0.0. The transaction subsystem governs how
+implemented in stellar-core v26.0.1. The transaction subsystem governs how
 transactions are validated, how fees are computed and charged, how
 operations mutate ledger state, how results and metadata are constructed,
 and how Soroban smart contract transactions are executed.
@@ -48,7 +48,7 @@ out of scope except where they directly affect determinism or
 correctness.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v26.0.0)
+exclusively from the vetted stellar-core C++ implementation (v26.0.1)
 and its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical observable behavior (transaction
 results, metadata, ledger state changes) for all valid inputs is
@@ -482,7 +482,13 @@ transaction's content hash), signature verification proceeds as
 follows:
 
 ```
-function checkSignature(signers, neededWeight, contentHash, signatures):
+function checkSignature(
+    signers,
+    neededWeight,
+    contentHash,
+    signatures,
+    overlayValidation = false,
+    checkEd25519SignedPayload = true):
     usedSignatures = empty set
     totalWeight = 0
 
@@ -504,7 +510,13 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
 
     // Phase 2-4: HASH_X, ED25519, ED25519_SIGNED_PAYLOAD
     // All use the same loop: outer=signatures, inner=signers
-    for each signerType in [hashXSigners, ed25519Signers, payloadSigners]:
+    signerPhases = [hashXSigners, ed25519Signers]
+    if checkEd25519SignedPayload:
+        signerPhases.append(payloadSigners)
+    else:
+        require overlayValidation
+
+    for each signerType in signerPhases:
         for each (index, sig) in signatures:
             if index in usedSignatures: continue
             for each signer in signerType:
@@ -550,6 +562,18 @@ mean the check automatically passes — at least one signer must match.
 it MUST be removed from the source account's signer list regardless
 of whether the overall signature check succeeds or the transaction
 succeeds. This removal is committed even if the transaction fails.
+
+**Overlay validation and signed-payload signers** `@version(≥26.0.1)`:
+Normal transaction validation and ledger application MUST verify
+`ED25519_SIGNED_PAYLOAD` signers when they are needed for account
+authorization. The overlay-only validation path MAY skip
+`ED25519_SIGNED_PAYLOAD` signers for source-account and fee-source
+threshold checks, and this skip is valid only when the signature checker
+is explicitly running in overlay-validation mode. Extra signer
+preconditions are still checked with signed-payload verification enabled.
+This distinction prevents background overlay validation and signature
+caching from treating arbitrary signed-payload authorization as reusable
+transaction authorization.
 
 **Extra signers** `@version(≥19)`: If `PreconditionsV2.extraSigners`
 is non-empty, each extra signer MUST be satisfied by at least one
@@ -986,8 +1010,9 @@ function commonPreApply(tx, ltx, metaBuilder):
     // Create a child ledger transaction for pre-apply work
     ltxPreApply = createChild(ltx)
 
-    // Build signature checker
-    sigChecker = SignatureChecker(tx.contentHash, tx.signatures)
+    // Build signature checker for normal validation/apply.
+    sigChecker = SignatureChecker(
+        tx.contentHash, tx.signatures, overlayValidation=false)
 
     // @version(≥20): For Soroban TXs, initialize the refundable fee
     // tracker BEFORE commonValid. This ensures the refund is computed
@@ -1031,6 +1056,13 @@ function commonPreApply(tx, ltx, metaBuilder):
     else:
         return null
 ```
+
+`commonPreApply` is the normal ledger-application path and MUST NOT use
+overlay-validation mode. Overlay/background transaction checks use a
+separate validation entry point that constructs the signature checker
+with `overlayValidation=true`; that path may skip signed-payload signers
+only as described in Section 4.7 and does not define apply-time
+semantics.
 
 #### processSignatures
 
@@ -3155,7 +3187,7 @@ may be updated via network upgrades:
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [stellar-xdr] | Stellar XDR definitions: `Stellar-transaction.x`, `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`. https://github.com/stellar/stellar-xdr/tree/curr/ |
-| [stellar-core] | stellar-core v26.0.0 source code (tag v26.0.0). https://github.com/stellar/stellar-core |
+| [stellar-core] | stellar-core v26.0.1 source code (tag v26.0.1). https://github.com/stellar/stellar-core |
 | [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
 | [CAP-0073] | Stellar CAP-0073, "SAC trustline and account creation". |

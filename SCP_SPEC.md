@@ -1,8 +1,8 @@
 # Stellar Consensus Protocol (SCP) Specification
 
-**Version:** 26 (stellar-core v26.0.0 / Protocol 26)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-04-07
+**Date:** 2026-05-09
 
 ---
 
@@ -832,7 +832,12 @@ hash-based priority computation to achieve distributed randomness.
 ```
 updateRoundLeaders():
     normalizedQSet = normalize(localQSet, removing localNodeID)
-    maxLeaderCount = 1 + countAllNodes(normalizedQSet)
+    maxLeaderCount = 0
+    if getNodeWeight(localNodeID, normalizedQSet, self=true) > 0:
+        maxLeaderCount++
+    for each node cur in normalizedQSet:
+        if getNodeWeight(cur, normalizedQSet, self=false) > 0:
+            maxLeaderCount++
 
     while |mRoundLeaders| < maxLeaderCount:
         newRoundLeaders = { localNodeID }
@@ -866,8 +871,14 @@ updateRoundLeaders():
   the algorithm silently advances `mRoundNumber` and retries. This
   "fast timeout" avoids waiting for a real timer when the hash
   function keeps selecting the same nodes.
-- The local node is always included as a starting candidate with its
-  own priority.
+- The maximum leader count includes only nodes with positive quorum-set
+  weight. Nodes with weight 0 are never round leaders. The local node is
+  included in the maximum only if its own computed weight is positive,
+  though it is still used as the initial priority candidate for each
+  round.
+- The retry loop MUST terminate. Stellar-core v26.0.1 caps fast-timeout
+  retries and raises an internal error if leader selection fails to make
+  progress after the cap.
 
 **Node priority** (`getNodePriority`):
 
