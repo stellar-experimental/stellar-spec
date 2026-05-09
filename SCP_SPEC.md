@@ -1,8 +1,8 @@
 # Stellar Consensus Protocol (SCP) Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-09
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar Consensus Protocol (SCP) as
-implemented in stellar-core v25.x. SCP is a federated Byzantine
+implemented in stellar-core v26.x. SCP is a federated Byzantine
 agreement protocol that enables the Stellar network to reach consensus
 on transaction sets without requiring a closed membership list or a
 central authority.
@@ -832,7 +832,12 @@ hash-based priority computation to achieve distributed randomness.
 ```
 updateRoundLeaders():
     normalizedQSet = normalize(localQSet, removing localNodeID)
-    maxLeaderCount = 1 + countAllNodes(normalizedQSet)
+    maxLeaderCount = 0
+    if getNodeWeight(localNodeID, normalizedQSet, self=true) > 0:
+        maxLeaderCount++
+    for each node cur in normalizedQSet:
+        if getNodeWeight(cur, normalizedQSet, self=false) > 0:
+            maxLeaderCount++
 
     while |mRoundLeaders| < maxLeaderCount:
         newRoundLeaders = { localNodeID }
@@ -866,8 +871,14 @@ updateRoundLeaders():
   the algorithm silently advances `mRoundNumber` and retries. This
   "fast timeout" avoids waiting for a real timer when the hash
   function keeps selecting the same nodes.
-- The local node is always included as a starting candidate with its
-  own priority.
+- The maximum leader count includes only nodes with positive quorum-set
+  weight. Nodes with weight 0 are never round leaders. The local node is
+  included in the maximum only if its own computed weight is positive,
+  though it is still used as the initial priority candidate for each
+  round.
+- The retry loop MUST terminate. Stellar-core v26.0.1 caps fast-timeout
+  retries and raises an internal error if leader selection fails to make
+  progress after the cap.
 
 **Node priority** (`getNodePriority`):
 

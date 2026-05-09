@@ -1,8 +1,8 @@
 # Stellar Transaction Processing Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-09
 
 ---
 
@@ -32,7 +32,7 @@
 ### 1.1 Purpose and Scope
 
 This document specifies the Stellar transaction processing subsystem as
-implemented in stellar-core v25.2.2. The transaction subsystem governs how
+implemented in stellar-core v26.0.1. The transaction subsystem governs how
 transactions are validated, how fees are computed and charged, how
 operations mutate ledger state, how results and metadata are constructed,
 and how Soroban smart contract transactions are executed.
@@ -48,7 +48,7 @@ out of scope except where they directly affect determinism or
 correctness.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2)
+exclusively from the vetted stellar-core C++ implementation (v26.0.1)
 and its pseudocode companion (stellar-core-pc). Any conforming
 implementation that produces identical observable behavior (transaction
 results, metadata, ledger state changes) for all valid inputs is
@@ -482,7 +482,13 @@ transaction's content hash), signature verification proceeds as
 follows:
 
 ```
-function checkSignature(signers, neededWeight, contentHash, signatures):
+function checkSignature(
+    signers,
+    neededWeight,
+    contentHash,
+    signatures,
+    overlayValidation = false,
+    checkEd25519SignedPayload = true):
     usedSignatures = empty set
     totalWeight = 0
 
@@ -504,7 +510,13 @@ function checkSignature(signers, neededWeight, contentHash, signatures):
 
     // Phase 2-4: HASH_X, ED25519, ED25519_SIGNED_PAYLOAD
     // All use the same loop: outer=signatures, inner=signers
-    for each signerType in [hashXSigners, ed25519Signers, payloadSigners]:
+    signerPhases = [hashXSigners, ed25519Signers]
+    if checkEd25519SignedPayload:
+        signerPhases.append(payloadSigners)
+    else:
+        require overlayValidation
+
+    for each signerType in signerPhases:
         for each (index, sig) in signatures:
             if index in usedSignatures: continue
             for each signer in signerType:
@@ -550,6 +562,18 @@ mean the check automatically passes — at least one signer must match.
 it MUST be removed from the source account's signer list regardless
 of whether the overall signature check succeeds or the transaction
 succeeds. This removal is committed even if the transaction fails.
+
+**Overlay validation and signed-payload signers** `@version(≥26.0.1)`:
+Normal transaction validation and ledger application MUST verify
+`ED25519_SIGNED_PAYLOAD` signers when they are needed for account
+authorization. The overlay-only validation path MAY skip
+`ED25519_SIGNED_PAYLOAD` signers for source-account and fee-source
+threshold checks, and this skip is valid only when the signature checker
+is explicitly running in overlay-validation mode. Extra signer
+preconditions are still checked with signed-payload verification enabled.
+This distinction prevents background overlay validation and signature
+caching from treating arbitrary signed-payload authorization as reusable
+transaction authorization.
 
 **Extra signers** `@version(≥19)`: If `PreconditionsV2.extraSigners`
 is non-empty, each extra signer MUST be satisfied by at least one
@@ -661,6 +685,79 @@ For Soroban transactions, the declared resources in
     be ≤ the declared `resourceFee`.
 
 Result: `txSOROBAN_INVALID`.
+
+### 4.10 Frozen Key Validation (CAP-0077)
+
+`@version(≥26)`: Before a transaction can be applied, the
+implementation MUST check whether the transaction accesses any
+**frozen** ledger key. Frozen keys are stored in the
+`FROZEN_LEDGER_KEYS` network configuration setting (see
+LEDGER_SPEC §9.2).
+
+**Transaction-level checks**:
+1. The transaction source account's `LedgerKey(ACCOUNT)` MUST NOT be
+   frozen.
+2. For Soroban transactions: every key in both the `readOnly` and
+   `readWrite` footprints MUST NOT be frozen.
+3. For each operation: the operation's source account (if different
+   from the transaction source) MUST NOT be frozen. Additionally,
+   each operation type defines which additional keys it accesses
+   (see per-operation table below).
+
+**Bypass mechanism**: If the transaction's `envelopeContentsHash`
+(content hash, without signatures) appears in the
+`FREEZE_BYPASS_TXS` configuration setting, all frozen key checks
+are skipped. This allows the network to authorize specific pre-signed
+transactions to operate on frozen entries. For fee-bump transactions,
+both the fee-bump's content hash and the inner transaction's content
+hash are checked independently against the bypass list.
+
+**Per-operation frozen key access** (`doesAccessFrozenKey`): Each
+operation type declares which ledger keys (beyond the source account)
+it touches. The check returns `true` if any declared key is frozen:
+
+| Operation | Frozen Keys Checked |
+|-----------|-------------------|
+| Payment | Source trustline (non-native), destination account, destination trustline (non-native). |
+| PathPaymentStrictReceive | Source send-asset trustline, destination account, destination receive-asset trustline. |
+| PathPaymentStrictSend | Source send-asset trustline, destination account, destination receive-asset trustline. |
+| ChangeTrust | Asset issuer account (non-native, non-pool-share). |
+| CreateAccount | Destination account. |
+| AccountMerge | Destination account. |
+| ManageSellOffer | Source selling-asset trustline, source buying-asset trustline. |
+| ManageBuyOffer | Source selling-asset trustline, source buying-asset trustline. |
+| CreatePassiveSellOffer | Source selling-asset trustline, source buying-asset trustline. |
+| CreateClaimableBalance | Source trustline (non-native). |
+| ClaimClaimableBalance | Claimable balance entry, source trustline (determined at apply time from the balance's asset). |
+| LiquidityPoolDeposit | Source trustlines for both pool assets, liquidity pool entry. |
+| LiquidityPoolWithdraw | Source trustlines for both pool assets, liquidity pool entry. |
+| Clawback | Target (`from`) trustline. |
+| ClawbackClaimableBalance | Claimable balance entry. |
+| SetTrustLineFlags | Target trustline. |
+| RevokeSponsorshipOp | Target entry's key. |
+| InvokeHostFunction | None (footprint is checked at the transaction level). |
+| ExtendFootprintTTL | None (footprint is checked at the transaction level). |
+| RestoreFootprint | None (footprint is checked at the transaction level). |
+| AllowTrust, BeginSponsoringFutureReserves, EndSponsoringFutureReserves, BumpSequence, Inflation, ManageData, SetOptions | None (only source account, already checked). |
+
+If any frozen key is detected and the transaction is not in the
+bypass list, the transaction MUST be rejected with
+`txFROZEN_KEY_ACCESSED` during validation (before sequence number
+advancement).
+
+**DEX offer removal**: When an offer-crossing operation encounters
+a third-party offer that accesses a frozen key, the frozen offer is
+**skipped and removed** from the order book:
+1. The offer's liabilities are released.
+2. The offer entry is erased from the ledger with sponsorship cleanup.
+3. Crossing continues with the next offer.
+The frozen offer check tests: (a) if either side is native, whether
+the seller's account key is frozen; (b) if the selling asset is
+non-native, whether the seller's selling trustline is frozen; (c) if
+the buying asset is non-native, whether the seller's buying trustline
+is frozen.
+
+Result: `txFROZEN_KEY_ACCESSED`.
 
 ---
 
@@ -913,8 +1010,9 @@ function commonPreApply(tx, ltx, metaBuilder):
     // Create a child ledger transaction for pre-apply work
     ltxPreApply = createChild(ltx)
 
-    // Build signature checker
-    sigChecker = SignatureChecker(tx.contentHash, tx.signatures)
+    // Build signature checker for normal validation/apply.
+    sigChecker = SignatureChecker(
+        tx.contentHash, tx.signatures, overlayValidation=false)
 
     // @version(≥20): For Soroban TXs, initialize the refundable fee
     // tracker BEFORE commonValid. This ensures the refund is computed
@@ -958,6 +1056,13 @@ function commonPreApply(tx, ltx, metaBuilder):
     else:
         return null
 ```
+
+`commonPreApply` is the normal ledger-application path and MUST NOT use
+overlay-validation mode. Overlay/background transaction checks use a
+separate validation entry point that constructs the signature checker
+with `overlayValidation=true`; that path may skip signed-payload signers
+only as described in Section 4.7 and does not define apply-time
+semantics.
 
 #### processSignatures
 
@@ -1063,6 +1168,17 @@ The `commonValidPreSeqNum` function checks:
 5. Time bounds and ledger bounds
 6. Minimum fee (`fee ≥ baseFee * numOps`)
 7. Source account existence
+8. **Frozen key check** `@version(≥26)`: If the Soroban network
+   configuration is available, check whether the transaction accesses
+   any frozen ledger key. If frozen keys are accessed AND the
+   transaction's content hash is NOT in the freeze bypass list, the
+   transaction fails with `txFROZEN_KEY_ACCESSED`. The check covers:
+   (a) the transaction source account key, (b) any keys in the
+   Soroban footprint (readOnly + readWrite), and (c) each operation's
+   declared frozen key set (see Section 4.10). For fee-bump
+   transactions, the fee-bump source account is also checked against
+   the frozen key set (using the fee-bump's own content hash for the
+   bypass check). See CAP-0077.
 
 ### 6.4 Operation Application
 
@@ -2185,7 +2301,14 @@ function doApply(op, ltx):
             upsert entry in ltx
             validate write byte limits
 
-    // 3b. Erase unreturned read-write entries
+    // 3b. Validate newly created non-Soroban keys
+    // @version(≥26) (CAP-0073): Soroban host may create classic
+    // ledger entries (ACCOUNT, TRUSTLINE) via the SAC. For each
+    // newly created key, if it is not a Soroban type (CONTRACT_DATA,
+    // CONTRACT_CODE), it MUST be one of: TTL, ACCOUNT, or TRUSTLINE.
+    // Pre-v26: only TTL keys are allowed as non-Soroban creations.
+
+    // 3c. Erase unreturned read-write entries
     for each key in readWrite footprint:
         if key NOT in result.createdAndModifiedKeys:
             erase the entry and its TTL entry from ltx (if they exist)
@@ -2836,6 +2959,7 @@ their own explicit mint events). It only emits `mint`/`burn`, never
 | `txBAD_MIN_SEQ_AGE_OR_GAP` | -15 | Sequence age/gap precondition not met. |
 | `txMALFORMED` | -16 | Envelope is structurally invalid. |
 | `txSOROBAN_INVALID` | -17 | Soroban resource validation failed. |
+| `txFROZEN_KEY_ACCESSED` | -18 | Transaction accesses a frozen ledger key and is not in the freeze bypass list. `@version(≥26)` See CAP-0077. |
 
 ### 12.2 Operation-Level Result Codes
 
@@ -3063,9 +3187,11 @@ may be updated via network upgrades:
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [stellar-xdr] | Stellar XDR definitions: `Stellar-transaction.x`, `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`. https://github.com/stellar/stellar-xdr/tree/curr/ |
-| [stellar-core] | stellar-core v25.2.2 source code (tag v25.2.2). https://github.com/stellar/stellar-core |
+| [stellar-core] | stellar-core v26.0.1 source code (tag v26.0.1). https://github.com/stellar/stellar-core |
 | [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
+| [CAP-0073] | Stellar CAP-0073, "SAC trustline and account creation". |
+| [CAP-0077] | Stellar CAP-0077, "Ability to freeze ledger keys via network configuration". |
 | [SCP whitepaper] | Stellar Consensus Protocol whitepaper. https://www.stellar.org/papers/stellar-consensus-protocol |
 | [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
