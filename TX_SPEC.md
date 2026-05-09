@@ -509,7 +509,11 @@ function checkSignature(
             if totalWeight >= neededWeight: return true
 
     // Phase 2-4: HASH_X, ED25519, ED25519_SIGNED_PAYLOAD
-    // All use the same loop: outer=signatures, inner=signers
+    // Loop nesting (outermost → innermost):
+    //   signerType (HASH_X, then ED25519, then ED25519_SIGNED_PAYLOAD),
+    //   signatures, signers.
+    // Each signer type is processed in turn; within a type, every
+    // remaining signature is tried against every signer of that type.
     signerPhases = [hashXSigners, ed25519Signers]
     if checkEd25519SignedPayload:
         signerPhases.append(payloadSigners)
@@ -563,7 +567,7 @@ it MUST be removed from the source account's signer list regardless
 of whether the overall signature check succeeds or the transaction
 succeeds. This removal is committed even if the transaction fails.
 
-**Overlay validation and signed-payload signers** `@version(≥26.0.1)`:
+**Overlay validation and signed-payload signers** `@version(≥26)`:
 Normal transaction validation and ledger application MUST verify
 `ED25519_SIGNED_PAYLOAD` signers when they are needed for account
 authorization. The overlay-only validation path MAY skip
@@ -573,7 +577,8 @@ is explicitly running in overlay-validation mode. Extra signer
 preconditions are still checked with signed-payload verification enabled.
 This distinction prevents background overlay validation and signature
 caching from treating arbitrary signed-payload authorization as reusable
-transaction authorization.
+transaction authorization. (Implemented in stellar-core v26.0.1; the
+behavior is gated on protocol version 26.)
 
 **Extra signers** `@version(≥19)`: If `PreconditionsV2.extraSigners`
 is non-empty, each extra signer MUST be satisfied by at least one
@@ -2303,10 +2308,36 @@ function doApply(op, ltx):
 
     // 3b. Validate newly created non-Soroban keys
     // @version(≥26) (CAP-0073): Soroban host may create classic
-    // ledger entries (ACCOUNT, TRUSTLINE) via the SAC. For each
-    // newly created key, if it is not a Soroban type (CONTRACT_DATA,
-    // CONTRACT_CODE), it MUST be one of: TTL, ACCOUNT, or TRUSTLINE.
-    // Pre-v26: only TTL keys are allowed as non-Soroban creations.
+    // ledger entries (ACCOUNT, TRUSTLINE) via the SAC.
+    //
+    // A "newly created" key is any key returned in
+    // result.modifiedLedgerEntries whose key was not present in
+    // ltx prior to this invocation (tracked here as createdKeys,
+    // distinct from the createdAndModifiedKeys set used in step 3c).
+    //
+    // For each newly created key, the allowed key types are:
+    //   - @version(≥26): CONTRACT_DATA, CONTRACT_CODE, TTL,
+    //                    ACCOUNT, TRUSTLINE
+    //   - pre-v26:        CONTRACT_DATA, CONTRACT_CODE, TTL
+    // In addition, every newly created Soroban entry (CONTRACT_DATA
+    // or CONTRACT_CODE) MUST be accompanied by a newly created TTL
+    // entry for the same key.
+    //
+    // These constraints are post-conditions on the Soroban host's
+    // output. A conforming host MUST NOT return a created entry
+    // outside this set; if an implementation observes a violation,
+    // it MUST treat it as a fatal invariant violation (i.e., abort
+    // the process or otherwise refuse to close the ledger), not as
+    // a graceful operation-level failure. There is no transaction
+    // result code reserved for this case because a correct host
+    // cannot produce it.
+    for each key in createdKeys:
+        if isSorobanEntry(key):
+            require getTTLKey(key) ∈ createdKeys
+        else if @version(≥26):
+            require key.type ∈ {TTL, ACCOUNT, TRUSTLINE}
+        else:
+            require key.type == TTL
 
     // 3c. Erase unreturned read-write entries
     for each key in readWrite footprint:
@@ -3190,8 +3221,8 @@ may be updated via network upgrades:
 | [stellar-core] | stellar-core v26.0.1 source code (tag v26.0.1). https://github.com/stellar/stellar-core |
 | [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
-| [CAP-0073] | Stellar CAP-0073, "SAC trustline and account creation". |
-| [CAP-0077] | Stellar CAP-0077, "Ability to freeze ledger keys via network configuration". |
+| [CAP-0073] | Stellar CAP-0073, "SAC trustline and account creation". https://stellar.org/protocol/cap-73 |
+| [CAP-0077] | Stellar CAP-0077, "Ability to freeze ledger keys via network configuration". https://stellar.org/protocol/cap-77 |
 | [SCP whitepaper] | Stellar Consensus Protocol whitepaper. https://www.stellar.org/papers/stellar-consensus-protocol |
 | [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |

@@ -833,10 +833,15 @@ hash-based priority computation to achieve distributed randomness.
 updateRoundLeaders():
     normalizedQSet = normalize(localQSet, removing localNodeID)
     maxLeaderCount = 0
-    if getNodeWeight(localNodeID, normalizedQSet, self=true) > 0:
+    // The local node is removed from normalizedQSet during
+    // normalization. getNodeWeight(localNodeID, ...) is still well-
+    // defined: per Section 6.7 it short-circuits to UINT64_MAX when
+    // the queried node is the local node, so the local node is
+    // always counted as a potential leader.
+    if getNodeWeight(localNodeID, normalizedQSet) > 0:
         maxLeaderCount++
     for each node cur in normalizedQSet:
-        if getNodeWeight(cur, normalizedQSet, self=false) > 0:
+        if getNodeWeight(cur, normalizedQSet) > 0:
             maxLeaderCount++
 
     while |mRoundLeaders| < maxLeaderCount:
