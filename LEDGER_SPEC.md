@@ -1,31 +1,31 @@
 # Stellar Ledger Close Pipeline Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
 **Date:** 2026-05-13
-
----
 
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
-2. [Architecture Overview](#2-architecture-overview)
-3. [Data Types and Encoding](#3-data-types-and-encoding)
+2. [Architecture](#2-architecture)
+3. [Data Types](#3-data-types)
 4. [Ledger Close Pipeline](#4-ledger-close-pipeline)
-5. [Transaction Application](#5-transaction-application)
-6. [LedgerTxn: Nested Transactional State](#6-ledgertxn-nested-transactional-state)
-7. [Protocol Upgrades](#7-protocol-upgrades)
-8. [Ledger Header Management](#8-ledger-header-management)
-9. [Network Configuration](#9-network-configuration)
-10. [Soroban State Management](#10-soroban-state-management)
-11. [Commit and Persistence](#11-commit-and-persistence)
-12. [Ledger Close Meta](#12-ledger-close-meta)
-13. [Genesis Ledger](#13-genesis-ledger)
-14. [Threading Model](#14-threading-model)
+5. [Apply State Phase Machine](#5-apply-state-phase-machine)
+6. [Transaction Application](#6-transaction-application)
+7. [LedgerTxn Nested Transactional State](#7-ledgertxn-nested-transactional-state)
+8. [Protocol and Network Upgrades](#8-protocol-and-network-upgrades)
+9. [Ledger Header Management](#9-ledger-header-management)
+10. [Soroban Network Configuration](#10-soroban-network-configuration)
+11. [Soroban State Management](#11-soroban-state-management)
+12. [Commit and Persistence](#12-commit-and-persistence)
+13. [Ledger Close Meta](#13-ledger-close-meta)
+14. [Genesis Ledger](#14-genesis-ledger)
 15. [Invariants and Safety Properties](#15-invariants-and-safety-properties)
 16. [Constants](#16-constants)
 17. [References](#17-references)
-18. [Appendices](#18-appendices)
+18. [Appendix A: LedgerTxn Entry Merge Matrix](#appendix-a-ledgertxn-entry-merge-matrix)
+19. [Appendix B: Ledger Close Pipeline Flowchart](#appendix-b-ledger-close-pipeline-flowchart)
+20. [Appendix C: Skip-List Construction Example](#appendix-c-skip-list-construction-example)
 
 ---
 
@@ -33,2025 +33,1517 @@
 
 ### 1.1 Purpose and Scope
 
-This document specifies the ledger close pipeline as implemented in
-stellar-core v25.2.2. The ledger close pipeline is the deterministic
-process by which the network transforms an agreed-upon transaction set
-(from SCP consensus) and the current ledger state into a new committed
-ledger state. It encompasses:
+This specification describes the **Stellar ledger close pipeline**: the
+deterministic sequence by which a node, having received an externalized
+consensus value, transforms the last closed ledger (LCL) into a new closed
+ledger by applying a transaction set, optional protocol or network-config
+upgrades, eviction, and state archival. It defines the apply-state phase
+machine, the nested transactional state model (LedgerTxn), the ledger header
+update sequence, the production of `LedgerCloseMeta`, and the persistence of
+the resulting state to buckets, the database, and history archives.
 
-- The complete sequence of operations from SCP value externalization
-  to committed ledger state.
-- Fee processing, sequence number advancement, and transaction
-  application (sequential and parallel phases).
-- The nested transactional state management system (LedgerTxn) that
-  provides atomic, composable state modifications with rollback
-  capability.
-- Protocol upgrade application during ledger close.
-- Ledger header field computation and update rules.
-- Network configuration management, including Soroban settings.
-- State commitment to the BucketList and persistent database.
-- Ledger close metadata construction for downstream consumers.
-- The genesis ledger bootstrap procedure.
+This specification is **implementation agnostic**. It is derived exclusively
+from the vetted stellar-core C++ implementation (v26.0.1). Any conforming
+implementation that produces an identical sequence of `LedgerHeader` hashes,
+identical bucket-list contents, identical `TransactionResultSet` contents, and
+an identical stream of `LedgerCloseMeta` for all valid inputs is considered
+correct.
 
-This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2).
-Any conforming
-implementation that produces identical ledger hashes, transaction result
-hashes, BucketList hashes, and ledger close metadata for all valid
-inputs is considered correct. Internal details such as memory management,
-specific SQL schemas, and cache eviction strategies are out of scope
-except where they affect deterministic state transitions or observable
-outputs.
+**Out of scope**:
+
+- Consensus (SCP nomination and ballot protocol): see SCP_SPEC.
+- Herder mechanics (transaction queue, candidate combination, transaction
+  set construction): see HERDER_SPEC.
+- Individual transaction and operation semantics (precondition checking,
+  operation effects, Soroban host-side execution): see TX_SPEC.
+- Bucket-list internals (merge algorithm, level sizing, hot archive merge
+  rules): see BUCKETLISTDB_SPEC.
+- Catchup, replay, and history archive publishing: see CATCHUP_SPEC.
+- Implementation-internal details: SQL schemas, threading models, caching
+  strategies, logging, metrics, file-system layouts.
 
 ### 1.2 Conventions and Terminology
 
-The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
-"SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
-document are to be interpreted as described in [RFC 2119][rfc2119].
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in RFC 2119 and RFC 8174.
 
 | Term | Definition |
-|------|------------|
-| **Ledger** | A discrete state snapshot of the Stellar network, identified by a monotonically increasing sequence number. |
-| **Ledger Close** | The deterministic process of applying a transaction set to the current ledger state to produce the next ledger. |
-| **LCL** | Last Closed Ledger — the most recently committed ledger state. |
-| **SCP Value** | The `StellarValue` agreed upon by consensus for a given slot, containing the transaction set hash, close time, and optional upgrades. |
-| **Transaction Set** | An ordered collection of transactions, possibly organized into phases (classic and Soroban), to be applied in a single ledger close. |
-| **LedgerTxn** | A nested, copy-on-write transactional abstraction for reading and modifying ledger entries during a ledger close. |
-| **LedgerTxnRoot** | The root of the LedgerTxn hierarchy, connected to persistent storage. Commits at the root flush changes to persistent storage. |
-| **Protocol Upgrade** | A network-wide change to a consensus parameter (protocol version, base fee, base reserve, max transaction set size, or Soroban configuration) embedded in the SCP value. |
-| **Entry** | A single ledger state record: an account, trust line, offer, data entry, claimable balance, liquidity pool, contract data, contract code, TTL entry, or configuration setting. |
-| **LedgerKey** | The unique identifier for a ledger entry, sufficient to locate it in the BucketList or database. |
-| **BucketList** | The hierarchical, append-structured data store that maintains a cumulative snapshot of all ledger state (see BucketListDB Specification). |
-| **HAS** | History Archive State — a serialized snapshot of the BucketList structure used for checkpointing and catchup. |
-| **Meta** | Ledger close metadata recording all state changes for downstream consumers (archives, indexers, horizon). |
-| **Soroban** | The smart contract execution environment introduced in protocol 20. |
-| **TTL** | Time-to-live entry controlling the expiration of Soroban state entries. |
-| **Phase** | A subdivision of a transaction set. Classic transactions form the sequential phase; Soroban transactions form the parallel phase (protocol 23+). |
+|---|---|
+| **Ledger** | A snapshot of the global state at a given sequence number, identified by its `LedgerHeader` and the SHA-256 hash thereof. |
+| **LCL** | Last Closed Ledger; the most recent ledger fully committed to the local node. |
+| **LedgerSeq** | A 32-bit ledger sequence number; the genesis ledger has sequence 1. |
+| **LedgerHeader** | The XDR structure that summarizes a ledger by reference to its transaction set, transaction result set, bucket-list root hash, previous header hash, skip list, close time, total coins, fee pool, and protocol version. |
+| **LedgerCloseData** | The unit handed from Herder to the ledger close pipeline: a `(ledgerSeq, txSet, StellarValue, expectedHash?)` tuple. |
+| **StellarValue** | The XDR value externalized by SCP, containing the `txSetHash`, `closeTime`, `upgrades`, and ext fields. |
+| **txSet** | The set of transactions to apply this ledger, organized into phases and (in protocol 23+) parallel stages. |
+| **LedgerTxn** | A nestable in-memory transactional view of ledger state used during transaction application. |
+| **LedgerTxnRoot** | The terminal parent in a LedgerTxn chain; commits flush to the database and the live bucket list. |
+| **InternalLedgerEntry** | A wrapper around either a `LedgerEntry`, a sponsorship marker, a sponsorship counter, or a `MaxSeqNumToApply` marker. |
+| **Sealing** | The act of finalizing a LedgerTxn for read-only inspection (after which mutating operations throw). |
+| **HAS** | History Archive State; the JSON-serializable record of the bucket-list state at a checkpoint, persisted to the database and to history archives. |
+| **ApplyState** | The mutable working state of the apply thread, comprising the in-memory Soroban state, the module cache, and the apply phase. |
+| **InMemorySorobanState** | The in-memory map of `CONTRACT_DATA`, `CONTRACT_CODE`, and TTL entries used to serve Soroban reads during apply (protocol 23+). |
+| **Module Cache** | A shared cache of compiled Wasm modules used by the Soroban host (protocol 23+). |
+| **Hot Archive** | A separate bucket list, introduced in protocol 23, that retains evicted persistent Soroban entries until restoration. |
+| **Restoration** | The act of bringing an expired persistent Soroban entry back into the live state by paying rent. |
+| **Eviction** | The act of removing expired Soroban entries from the live bucket list at ledger close; persistent entries are placed in the hot archive, temporary entries are deleted. |
 
 ### 1.3 Notation
 
-This specification uses the following notation conventions:
+Algorithms are expressed in `camelCase` pseudocode. XDR enumerators (e.g.,
+`LEDGER_ENTRY_CREATED`, `LEDGER_UPGRADE_VERSION`) are written in
+`SCREAMING_SNAKE_CASE`. Protocol-version guards are written `@version(>=N)`
+or `@version(<N)`; the canonical thresholds used in this specification are
+Protocol 9, 11, 19, 20, 22, 23, 24, 25, and 26. Cross-references to peer
+specifications use the plain-text form `SPEC_NAME §N.N`.
 
-- **XDR types**: Written in `monospace` and correspond to definitions
-  in the Stellar XDR schema files (`Stellar-ledger.x`,
-  `Stellar-types.x`, `Stellar-transaction.x`).
-- **Hash functions**: `SHA256(x)` denotes the SHA-256 digest of the
-  XDR-serialized form of `x`. `xdrSha256(x)` is the same operation.
-- **Protocol versions**: `pN` denotes "protocol version N" (e.g., p20
-  means protocol version 20).
+### 1.4 Relationship to Other Specifications
 
----
-
-## 2. Architecture Overview
-
-### 2.1 Pipeline Summary
-
-The ledger close pipeline transforms the current ledger state and an
-agreed-upon transaction set into the next ledger state through a
-deterministic sequence of operations. The pipeline is triggered when SCP
-externalizes a value for the next slot (ledger sequence number).
-
-At a high level:
-
-1. **Consensus delivers** a `LedgerCloseData` structure containing the
-   agreed-upon `StellarValue`, the transaction set, and the expected
-   ledger sequence number.
-
-2. **The pipeline opens** a top-level `LedgerTxn` on the current ledger
-   state, providing a transactional workspace for all modifications.
-
-3. **Fees and sequence numbers** are processed for all transactions in
-   the set.
-
-4. **Transactions are applied** — either sequentially (classic) or in
-   parallel stages (Soroban, protocol 23+).
-
-5. **Protocol upgrades** embedded in the SCP value are applied.
-
-6. **The ledger is sealed**: all state changes are committed to the
-   BucketList and persistent database, the ledger header is finalized,
-   and a new LCL is established.
-
-7. **Post-commit activities**: history publishing, bucket garbage
-   collection, and herder notification.
-
-### 2.2 Component Relationships
-
-The ledger close pipeline interacts with these subsystems:
-
-- **Herder / SCP**: Delivers externalized values; receives notification
-  when the ledger close completes so it can trigger the next round.
-- **Transaction Framework**: Provides fee processing, sequence number
-  validation, and transaction application logic.
-- **BucketList**: Receives batches of created, modified, and deleted
-  entries after each ledger close (see BucketListDB Specification).
-- **Persistent Database**: Stores ledger headers, the HAS, offer
-  entries, and persistent node state. Only offers are stored in the
-  database; all other entry types are stored exclusively in the
-  BucketList.
-- **History Manager**: Receives checkpointed ledger headers and
-  transaction metadata for publishing to history archives.
-- **Soroban Host**: Executes smart contract invocations and provides
-  WASM module compilation.
-
-### 2.3 Apply State Phases
-
-The ledger close pipeline maintains an internal phase state machine
-that controls when state is writable and when application is in
-progress:
-
-```
-SETTING_UP_STATE → READY_TO_APPLY → APPLYING → COMMITTING → READY_TO_APPLY
-                         ↓
-                   SETTING_UP_STATE  (on catchup / reset)
-```
-
-| Phase | Description | State Writable |
-|-------|-------------|:--------------:|
-| `SETTING_UP_STATE` | Loading state from bucket list snapshot, compiling contracts, populating caches. | Yes |
-| `READY_TO_APPLY` | Pipeline is idle, ready to accept the next ledger close. | No |
-| `APPLYING` | Transactions are being applied. State is read-only except through LedgerTxn. | No |
-| `COMMITTING` | The pipeline is committing changes to the BucketList and database. | Yes |
-
-Transitions:
-- `SETTING_UP_STATE → READY_TO_APPLY`: When initial state loading completes.
-- `READY_TO_APPLY → APPLYING`: When the pipeline begins processing a new ledger.
-- `APPLYING → COMMITTING`: When all transactions and their post-processing are complete.
-- `COMMITTING → READY_TO_APPLY`: When the commit sequence finishes.
-- `READY_TO_APPLY → SETTING_UP_STATE`: On catchup or state reset.
+| Specification | Relationship |
+|---|---|
+| **HERDER_SPEC** | Produces `LedgerCloseData` and delivers it to the ledger pipeline via the `valueExternalized` entry point; receives the `lastClosedLedgerIncreased` callback after commit. |
+| **TX_SPEC** | Defines the per-transaction fee-processing, validation, application, and post-apply behavior driven by the ledger pipeline in §6. |
+| **BUCKETLISTDB_SPEC** | Defines the live bucket list and hot archive structures; the ledger pipeline produces `(initEntries, liveEntries, deadEntries)` batches and an `EvictedStateVectors` payload for the bucket manager. |
+| **CATCHUP_SPEC** | Drives `setLastClosedLedger` and `applyLedger` via the `LedgerApplyManager`; defines the bucket-apply phase that resets the apply state to `SETTING_UP_STATE`. |
+| **SCP_SPEC** | Provides the externalized `StellarValue` that the ledger pipeline consumes; opaque to the pipeline beyond `(txSetHash, closeTime, upgrades, ext)`. |
+| **OVERLAY_SPEC** | Independent: the pipeline does not interact with overlay directly. |
 
 ---
 
-## 3. Data Types and Encoding
+## 2. Architecture
 
-### 3.1 Ledger Close Data
+The ledger close pipeline is a single-writer, multi-reader subsystem with two
+logical actors:
 
-The `LedgerCloseData` structure carries the information needed to close
-a ledger. It is constructed by the herder after SCP externalizes a value.
+- **The main thread**, which receives consensus values from Herder, manages
+  the last-closed-ledger (LCL) snapshot, publishes history checkpoints, and
+  notifies external subsystems.
+- **The apply thread**, which owns the heavy work of applying transactions,
+  reading and updating in-memory and on-disk state, and producing the new
+  ledger header. A node MAY collapse the two roles onto a single thread; a
+  conforming implementation MUST otherwise produce the same observable
+  outputs.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `ledgerSeq` | `uint32` | The sequence number of the ledger to be closed. MUST equal `LCL.ledgerSeq + 1`. |
-| `txSet` | `TxSetFrame` | The transaction set agreed upon by consensus. |
-| `stellarValue` | `StellarValue` | The SCP value containing the close time, transaction set hash, and upgrade list. |
+The apply thread MAY spawn short-lived **Soroban worker threads** during the
+parallel Soroban phase (protocol 23+). These threads operate on an immutable
+snapshot of the apply state and do not commit changes; their results are
+merged back by the apply thread.
 
-### 3.2 Stellar Value
+```mermaid
+graph TD
+  HERDER[Herder /<br/>SCP externalize]
+  LAM[LedgerApplyManager<br/>queues ledgers, decides<br/>apply vs catchup]
+  LM[LedgerManager<br/>applyLedger / close]
+  APPLY[Apply pipeline<br/>fee-phase -><br/>tx-apply -><br/>upgrades -> seal]
+  BM[BucketManager<br/>addLiveBatch /<br/>addHotArchiveBatch]
+  DB[(Persistent State<br/>ledger header + HAS)]
+  HM[HistoryManager<br/>checkpoint queue]
+  LCL[LCL snapshot<br/>+ HAS + Soroban<br/>network config]
+  META[LedgerCloseMeta<br/>stream]
 
-The `StellarValue` structure is the value agreed upon by SCP for each
-slot:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `txSetHash` | `Hash` | SHA-256 hash of the transaction set contents. |
-| `closeTime` | `TimePoint` | The close time for this ledger (Unix timestamp). |
-| `upgrades` | `UpgradeType<6>` | Up to 6 protocol upgrade entries, each an XDR-encoded `LedgerUpgrade`. |
-| `ext` | `StellarValueExt` | Extension containing the `LedgerCloseValueSignature` for signed values. |
-
-### 3.3 Ledger Header
-
-The `LedgerHeader` structure contains all metadata for a closed ledger:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `ledgerVersion` | `uint32` | Protocol version of this ledger. |
-| `previousLedgerHash` | `Hash` | Hash of the previous ledger header. |
-| `scpValue` | `StellarValue` | The SCP value that produced this ledger. |
-| `txSetResultHash` | `Hash` | SHA-256 hash of the serialized `TransactionResultSet`. |
-| `bucketListHash` | `Hash` | Hash of the BucketList after applying this ledger's changes. |
-| `ledgerSeq` | `uint32` | Sequence number of this ledger. |
-| `totalCoins` | `int64` | Total lumens in existence. |
-| `feePool` | `int64` | Total fees accumulated in the fee pool. |
-| `inflationSeq` | `uint32` | Number of inflation operations run (deprecated). |
-| `idPool` | `uint64` | Last-used identifier for sequential ID generation. |
-| `baseFee` | `uint32` | Base fee per operation in stroops. |
-| `baseReserve` | `uint32` | Base reserve per ledger entry in stroops. |
-| `maxTxSetSize` | `uint32` | Maximum number of operations allowed in a transaction set. |
-| `skipList` | `Hash[4]` | Skip list of previous ledger hashes for efficient historical lookups. |
-| `ext` | `LedgerHeaderExt` | Extension field (currently unused). |
-
-### 3.4 Ledger Header History Entry
-
-A `LedgerHeaderHistoryEntry` pairs a `LedgerHeader` with its hash:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `hash` | `Hash` | `SHA256(header)` — the ledger hash. |
-| `header` | `LedgerHeader` | The ledger header. |
-
-### 3.5 Transaction Result Set
-
-The `TransactionResultSet` is the serialized collection of transaction
-results for a single ledger close:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `results` | `TransactionResultPair[]` | One result per transaction in the set, in application order. |
-
-Each `TransactionResultPair` contains:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `transactionHash` | `Hash` | SHA-256 hash of the transaction envelope. |
-| `result` | `TransactionResult` | The result of applying the transaction. |
-
-### 3.6 Ledger Entry Types
-
-Ledger entries are keyed by `LedgerKey` and stored as `LedgerEntry`
-values. The supported entry types are:
-
-| Type | Protocol | Description |
-|------|----------|-------------|
-| `ACCOUNT` | All | Stellar account with balances, sequence numbers, signers. |
-| `TRUSTLINE` | All | Trust line for non-native assets. |
-| `OFFER` | All | Order book offer. |
-| `DATA` | All | Named data attached to an account. |
-| `CLAIMABLE_BALANCE` | 15+ | Claimable balance with claim conditions. |
-| `LIQUIDITY_POOL` | 18+ | AMM liquidity pool. |
-| `CONTRACT_DATA` | 20+ | Soroban smart contract data entry. |
-| `CONTRACT_CODE` | 20+ | Soroban WASM bytecode. |
-| `TTL` | 20+ | Time-to-live for a Soroban state entry. |
-| `CONFIG_SETTING` | 20+ | Network configuration setting (not a ledger key in the traditional sense). |
-
-**TTL key derivation**: A `TTL` entry is keyed by a 32-byte `keyHash`
-derived deterministically from its parent Soroban entry's key:
-
-```
-ttlKey.type    = TTL
-ttlKey.keyHash = SHA256(XDR_serialize(parentKey))
+  HERDER --> LAM
+  LAM --> LM
+  LM --> APPLY
+  APPLY --> BM
+  APPLY --> DB
+  APPLY --> HM
+  APPLY --> META
+  APPLY --> LCL
+  LCL --> HERDER
 ```
 
-where `parentKey` MUST be a `CONTRACT_DATA` or `CONTRACT_CODE`
-`LedgerKey`. The derivation function is otherwise undefined; conforming
-implementations MUST use this exact recipe so that TTL lookups and
-co-location with parent entries are deterministic across the network.
+The pipeline is driven by `valueExternalized(ledgerData, isLatestSlot)`,
+which delegates to the `LedgerApplyManager` (see CATCHUP_SPEC §6) to either
+queue the ledger for the apply thread or trigger catchup. When the
+`LedgerApplyManager` releases a `LedgerCloseData` to the apply thread, it
+invokes `applyLedger(ledgerData, calledViaExternalize)`. Catchup MAY invoke
+`applyLedger` directly with `calledViaExternalize = false`.
 
-### 3.7 Internal Entry Types
+The pipeline MUST preserve the following ordering invariant on the four
+sequence-number checkpoints maintained by the system:
 
-In addition to the standard XDR ledger entry types, the transactional
-state system tracks internal entry types that are not persisted to the
-BucketList:
+```
+LCL  <=  A  <=  Q  <=  H
+```
 
-| Type | Description |
-|------|-------------|
-| `SPONSORSHIP` | Tracks reserve sponsorship relationships. |
-| `SPONSORSHIP_COUNTER` | Tracks the count of sponsored entries per account. |
-| `MAX_SEQ_NUM_TO_APPLY` | Records the maximum sequence number to apply per account for a single ledger close (protocol 19+). |
+where `H` is the largest ledger sequence heard from the network, `Q` is the
+largest ledger sequence dequeued and posted to the apply thread, `A` is the
+ledger sequence currently being applied, and `LCL` is the ledger sequence
+reflected in the main thread's last-closed-ledger snapshot. Any conforming
+implementation MUST maintain this monotonic ordering.
 
-These internal entries exist only within the LedgerTxn hierarchy during
-a ledger close and are never serialized to buckets or the database.
+---
 
-### 3.8 Entry Lifecycle States
+## 3. Data Types
 
-Within the LedgerTxn system, entries are tracked in one of three
-lifecycle states:
+### 3.1 LedgerHeader
 
-| State | Meaning |
-|-------|---------|
-| `INIT` | The entry was created in this transaction and does not exist in any ancestor. |
-| `LIVE` | The entry was loaded from an ancestor or database and may have been modified. |
-| `DELETED` | The entry has been erased in this transaction. |
+The `LedgerHeader` XDR structure is the canonical summary of a closed ledger.
+Its fields, in canonical order:
 
-These states govern the merge semantics during commit (Section 6.6).
+| Field | Type | Description |
+|---|---|---|
+| `ledgerVersion` | `uint32` | Protocol version active for this ledger. |
+| `previousLedgerHash` | `Hash` | SHA-256 of the previous `LedgerHeader`. |
+| `scpValue` | `StellarValue` | Embeds `txSetHash`, `closeTime`, `upgrades`, ext. |
+| `txSetResultHash` | `Hash` | SHA-256 of the `TransactionResultSet`. |
+| `bucketListHash` | `Hash` | Root hash of the live bucket list (protocol 22 and earlier) or `SHA-256(liveBLHash || hotArchiveBLHash)` (protocol 23+). |
+| `ledgerSeq` | `uint32` | This ledger's sequence number. |
+| `totalCoins` | `int64` | Total lumens in existence in this ledger. |
+| `feePool` | `int64` | Accumulated fees not yet distributed. |
+| `inflationSeq` | `uint32` | Number of inflation operations applied. |
+| `idPool` | `uint64` | Monotonic counter for offer/data IDs. |
+| `baseFee` | `uint32` | Per-operation base fee in stroops. |
+| `baseReserve` | `uint32` | Per-entry reserve in stroops. |
+| `maxTxSetSize` | `uint32` | Maximum classic tx set size (ops in protocol < 11, txs in protocol 11+). |
+| `skipList` | `Hash[4]` | Four-level skip list of historic bucket-list hashes (see §9.3). |
+| `ext` | union | Reserved for future extension; `ext.v(1).flags` carries the disable-liquidity-pool-trading flag. |
+
+### 3.2 LedgerKey and LedgerEntry
+
+`LedgerKey` is the discriminated union (XDR) keying ledger state. Its types
+are: `ACCOUNT`, `TRUSTLINE`, `OFFER`, `DATA`, `CLAIMABLE_BALANCE`,
+`LIQUIDITY_POOL`, `CONTRACT_DATA`, `CONTRACT_CODE`, `CONFIG_SETTING`, and
+`TTL`. `LedgerEntry` carries the corresponding entry data plus
+`lastModifiedLedgerSeq` and an `ext` block (including sponsorship and rent
+fields).
+
+A `LedgerEntry`'s `lastModifiedLedgerSeq` MUST equal the `ledgerSeq` of the
+ledger in which it was most recently created or modified (see §7.7).
+
+### 3.3 InternalLedgerEntry
+
+An `InternalLedgerEntry` is a non-XDR wrapper used internally by LedgerTxn,
+discriminated by `InternalLedgerEntryType`:
+
+| Type | Use |
+|---|---|
+| `LEDGER_ENTRY` | Wraps a real XDR `LedgerEntry`. |
+| `SPONSORSHIP` | Tracks per-account sponsorship relationships within a transaction's bounds. |
+| `SPONSORSHIP_COUNTER` | Tracks the number of objects an account sponsors. |
+| `MAX_SEQ_NUM_TO_APPLY` | Records, for protocol 19+ ledgers containing `AccountMerge`, the maximum sequence number an account may reach within the same ledger (see §6.2). |
+
+Sponsorship and sponsorship-counter entries MUST be empty across LedgerTxn
+seal boundaries that surface to the bucket batch — sponsorship state is
+reconciled within the per-transaction LedgerTxn (see TX_SPEC §11).
+`MAX_SEQ_NUM_TO_APPLY` entries exist only during the fee-processing phase.
+
+### 3.4 LedgerCloseData
+
+Produced by Herder and consumed by the pipeline. Fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `ledgerSeq` | `uint32` | Sequence of the ledger being closed. |
+| `txSet` | `TxSetXDRFrame` | The transaction set, hash-referenced from `StellarValue`. |
+| `value` | `StellarValue` | The externalized SCP value. |
+| `expectedHash` | `Hash?` | Optional hash to verify against the locally computed header hash; used in catchup. |
+| `expectedResults` (test-only) | `TransactionResultSet?` | Replay-mode expected results. |
+
+### 3.5 LedgerCloseMeta
+
+`LedgerCloseMeta` is an XDR union, currently with three versions (v0, v1, v2),
+emitted to subscribers (e.g., Horizon) for every closed ledger.
+
+| Version | Required protocol | Contents |
+|---|---|---|
+| **v0** | protocol < 20 | `ledgerHeader`, `txSet`, `txProcessing[]` (each with `feeProcessing` and `txApplyProcessing`), `upgradesProcessing[]`, optional ext. |
+| **v1** | protocol 20-22 | v0 + `totalByteSizeOfLiveSorobanState`, `evictedKeys[]`, ext v1 carrying `sorobanFeeWrite1KB`. |
+| **v2** | protocol 23+ | v1 + per-tx `postTxApplyFeeProcessing` (for Soroban refund accounting). |
+
+A pipeline MUST select the meta version from the protocol version that was
+active **at the start** of the ledger (`initialLedgerVers`), not the
+potentially upgraded version (see §9.2).
+
+### 3.6 EntryPtrState
+
+Each entry tracked inside a LedgerTxn carries a three-valued state:
+
+| State | Semantics |
+|---|---|
+| `INIT` | The entry was first created at this LedgerTxn level (no prior version exists in any parent). |
+| `LIVE` | The entry was modified at this LedgerTxn level (a prior version exists). |
+| `DELETED` | The entry was erased at this LedgerTxn level. |
+
+### 3.7 RestoredEntries
+
+Used in protocol 23+ to track entries restored from the hot archive and from
+the live bucket list during a single ledger. Layout:
+
+```
+RestoredEntries:
+  hotArchive: Map<LedgerKey, LedgerEntry>      // hot-archive restorations
+  liveBucketList: Map<LedgerKey, LedgerEntry>  // live-BL TTL-only restorations
+```
+
+A key MUST NOT appear in both maps within the same ledger; the maps are
+disjoint by construction (see INV-L5).
 
 ---
 
 ## 4. Ledger Close Pipeline
 
-### 4.1 Entry Point: Value Externalized
+The pipeline is invoked by `applyLedger(ledgerData, calledViaExternalize)`.
+It executes the following numbered steps in order. Each step MUST be
+observable-deterministic across conforming implementations.
 
-When SCP externalizes a value for the next slot, the herder constructs
-a `LedgerCloseData` and delivers it to the ledger manager. The ledger
-manager:
+### 4.1 Entry, Setup, and Header Initialization
 
-1. SHALL validate that its current state is `BOOTING`, `CATCHING_UP`,
-   or `SYNCED`.
-2. SHALL pass the `LedgerCloseData` to the apply manager for
-   processing.
-3. If the apply manager indicates that the ledger must be buffered
-   (e.g., because a catchup is in progress), the ledger manager SHALL
-   transition to the `CATCHING_UP` state.
+1. If the node is stopping, the pipeline returns without action.
+2. If a Wasm module compilation was started during the previous ledger
+   close, it MUST be finished before continuing (`finishPendingCompilation`).
+3. The apply state transitions from `READY_TO_APPLY` to `APPLYING` (§5).
+4. A root-level LedgerTxn `ltx` is opened against the LedgerTxnRoot.
+5. The previous header is loaded; its SHA-256 is computed as `prevHash`.
+6. `header.ledgerSeq` is incremented by 1.
+7. `header.previousLedgerHash` is set to `prevHash`.
 
-### 4.2 Apply Ledger: Complete Sequence
+### 4.2 Validation of LedgerCloseData
 
-The `applyLedger` procedure is the core of the ledger close pipeline.
-It MUST execute the following steps in exact order:
+8. If `header.ledgerVersion > Config::CURRENT_LEDGER_PROTOCOL_VERSION`, the
+   pipeline MUST throw `cannot apply ledger with not supported version`; a
+   ledger MUST NOT be applied beyond the implementation's compiled protocol
+   support.
+9. If `txSet.previousLedgerHash() != prevHash`, the pipeline MUST throw
+   `txset mismatch`. This guarantees the txset is rooted at the current LCL.
+10. If `txSet.getContentsHash() != ledgerData.value.txSetHash`, the pipeline
+    MUST throw `corrupt transaction set`. This guarantees the txset matches
+    the consensus value.
+11. `header.scpValue` is assigned to `ledgerData.value`.
+12. The txset is converted to its applicable form via
+    `txSet.prepareForApply(prevHeader)`; if the result is null, the
+    pipeline MUST throw `transaction set cannot be processed`.
 
-#### Step 1: Finish Pending Compilation
+### 4.3 LedgerCloseMeta Construction
 
-If a background contract module cache compilation from the previous
-ledger is still in progress, the pipeline MUST block until it
-completes and swap in the new module cache.
+13. If meta streaming is enabled, a `LedgerCloseMetaFrame` is constructed
+    at the meta version corresponding to `header.ledgerVersion` (see §13).
+    Tx-processing slots are reserved and the txset is populated into the
+    meta.
 
-#### Step 2: Enter APPLYING Phase
+### 4.4 Fee Phase
 
-The pipeline MUST transition from `READY_TO_APPLY` to `APPLYING`.
+14. Source-account IDs are prefetched (`prefetchTxSourceIds`).
+15. `processFeesSeqNums(txSet, ltx, meta, ledgerData)` is invoked
+    (see §6.2). It produces a vector of `MutableTransactionResult` —
+    exactly one per transaction in the txset, in `getPhasesInApplyOrder`
+    order — with fees already charged and (for protocol 19+) per-source
+    `MAX_SEQ_NUM_TO_APPLY` markers committed to `ltx`.
 
-#### Step 3: Open LedgerTxn and Prepare Header
+### 4.5 Apply Phase
 
-The pipeline MUST:
+16. `applyTransactions(txSet, mutableTxResults, ltx, meta)` is invoked
+    (see §6.3). It produces a `TransactionResultSet` aligned with the
+    apply-order traversal of phases.
 
-1. Open a top-level `LedgerTxn` on the current LCL state.
-2. Load the current ledger header.
-3. Record the `initialLedgerVers` — the protocol version BEFORE any
-   upgrades in this ledger. This value is critical because it
-   determines the meta format version.
-4. Increment `ledgerSeq` by 1.
-5. Set `previousLedgerHash` to the hash of the current LCL header.
+### 4.6 Result-Set Hash and History Append
 
-Note: `scpValue` is set AFTER validation (Step 4), not during this
-step.
+17. If the node is configured to store historical data
+    (`MODE_STORES_HISTORY_MISC`), the per-checkpoint transaction set and
+    result set are appended via the HistoryManager.
+18. `header.txSetResultHash` is set to `xdrSha256(txResultSet)`.
 
-#### Step 4: Validate Transaction Set and Set SCP Value
+### 4.7 Commit Phase Start
 
-The pipeline MUST verify:
+19. The apply state transitions from `APPLYING` to `COMMITTING` (§5).
 
-- The transaction set's `previousLedgerHash` matches the current LCL
-  hash.
-- The `txSetHash` in the `StellarValue` matches the hash of the
-  provided transaction set.
+### 4.8 Upgrades
 
-If validation fails, the pipeline MUST abort.
+20. For each `upgrade` in `header.scpValue.upgrades`, in order:
+    - The upgrade is validated via `Upgrades::isValidForApply` (see §8).
+    - If `XDR_INVALID` or `INVALID`, the upgrade is logged and skipped.
+    - If `VALID`, a nested `LedgerTxn` `ltxUpgrade(ltx)` is opened, the
+      upgrade is applied via `Upgrades::applyTo`, its `LedgerEntryChanges`
+      are pushed into `meta.upgradesProcessing`, and `ltxUpgrade` is
+      committed.
+    - If `Upgrades::applyTo` throws, the exception is caught and logged;
+      the upgrade is skipped. `upgradeApplied` is set to true on success.
 
-After validation succeeds, the pipeline MUST set the ledger header's
-`scpValue` to the `StellarValue` from the `LedgerCloseData`.
+### 4.9 Seal and Persist
 
-#### Step 5: Prepare Transaction Set for Application
+21. `initialLedgerVers` captures `ledgerVersion` from before any upgrade;
+    `maybeNewVersion` is `ledgerVersion` after upgrades.
+22. The current `ledgerSeq` is captured.
+23. `sealLedgerTxnAndStoreInBucketsAndDB(...)` (see §12.1) is invoked:
+    - Snapshots of the live and hot-archive bucket lists from the LCL are
+      copied into the call.
+    - `finalizeLedgerTxnChanges` is invoked: it resolves the background
+      eviction scan, processes hot-archive evictions and restorations
+      (protocol 23+), snapshots the Soroban state size into the network
+      config window (protocol 20+), loads the post-upgrade Soroban network
+      config, seals the LedgerTxn via `getAllEntries`, and feeds
+      `(initEntries, liveEntries, deadEntries)` to `addLiveBatch`.
+    - The module cache is updated: evicted entries dropped, new contract
+      code added.
+    - The in-memory Soroban state is updated.
+    - The unsealed header is finalized: `snapshotLedger` writes the
+      `bucketListHash` and skip list (§9.3), and the header + HAS are
+      persisted via `storePersistentStateAndLedgerHeaderInDB`.
+    - A new LCL snapshot is produced.
 
-The transaction set MUST be converted from its wire format to an
-applicable form. For generalized transaction sets (protocol 20+), this
-involves resolving the per-phase structure and computing base fees for
-each component. If preparation fails (the wire-format transaction set
-cannot be converted into an applicable form), the pipeline MUST abort
-with a fatal error.
+### 4.10 LedgerCloseMeta Finalization and Emission
 
-Additionally, before Step 4 the pipeline MUST verify that the
-proposed `ledgerVersion` (currently `header.ledgerVersion`, which has
-not yet been touched by upgrades) is no greater than
-`CURRENT_LEDGER_PROTOCOL_VERSION`. A higher version indicates the
-network has moved past what this node can support and the pipeline
-MUST abort.
+24. If meta is enabled and the protocol started at SOROBAN_PROTOCOL_VERSION
+    or later, `meta.setNetworkConfiguration(sorobanConfig)` is invoked with
+    the post-apply Soroban config and the `EMIT_LEDGER_CLOSE_META_EXT_V1`
+    flag.
+25. If `ledgerData.expectedHash` is set and does not equal the locally
+    computed `lastClosedLedgerHeader.hash`, the pipeline MUST throw `Local
+    node's ledger corrupted during close`. This is the hash-chain check
+    that protects against silent state corruption (see INV-L11).
+26. The completed meta is moved to `mNextMetaToEmit`, then emitted via
+    `emitNextMeta`.
 
-#### Step 6: Construct Meta Frame
+### 4.11 Subtle 8-Step Sequence after Seal
 
-If meta streaming is enabled, the pipeline MUST create a
-`LedgerCloseMetaFrame` of the appropriate version. The meta version is
-determined by `initialLedgerVers` (not the post-upgrade version):
+After §4.9 the pipeline MUST execute the following steps in this exact
+order:
 
-| initialLedgerVers | Meta Version |
-|-------------------|-------------|
-| < 20 | v0 |
-| 20–22 | v1 |
-| ≥ 23 | v2 |
+| # | Step |
+|---|---|
+| 1 | `maybeQueueHistoryCheckpoint(ledgerSeq, maybeNewVersion)` — queues the next checkpoint within the current SQL transaction. Uses the **post-upgrade** ledger version. |
+| 2 | `ltx.commit()` — persists the SQL transaction. |
+| 3 | `maybeCheckpointComplete(ledgerSeq)` — finalizes any newly complete checkpoint files. |
+| 4 | If protocol >= 20, start the background eviction scan for the next ledger using the post-commit snapshot. |
+| 5 | The apply state transitions from `COMMITTING` to `READY_TO_APPLY` (§5). Copy the in-memory Soroban state if the snapshot invariant is enabled for this ledger. |
+| 6 | (in `advanceLedgerStateAndPublish`, on main thread) `publishQueuedHistory` — kicks off history publishing for queued checkpoints. |
+| 7 | (in `advanceLedgerStateAndPublish`, on main thread) `forgetUnreferencedBuckets(HAS)` — garbage-collects unreferenced bucket files. |
+| 8 | (in `advanceLedgerStateAndPublish`, on main thread) Update LM state via `ledgerCloseComplete` — possibly transition to `LM_SYNCED_STATE`, notify Herder via `lastClosedLedgerIncreased`, and trigger the snapshot invariant. |
 
-#### Step 7: Process Fees and Sequence Numbers
-
-The pipeline MUST call `processFeesSeqNums` (Section 5.1) to charge
-fees and advance sequence numbers for all transactions in the set. This
-step executes in a nested `LedgerTxn` that is committed upon success.
-
-#### Step 8: Apply Transactions
-
-The pipeline MUST call `applyTransactions` (Section 5.2) to execute
-all transactions. Transaction results are accumulated into a
-`TransactionResultSet`.
-
-#### Step 9: Store Transaction History
-
-If the node stores history, the pipeline SHALL persist the transaction
-set and result set for the current ledger.
-
-#### Step 10: Compute Transaction Result Hash
-
-The pipeline MUST compute:
-```
-txSetResultHash = SHA256(TransactionResultSet)
-```
-and store it in the ledger header.
-
-#### Step 11: Enter COMMITTING Phase
-
-The pipeline MUST transition from `APPLYING` to `COMMITTING`.
-
-#### Step 12: Apply Protocol Upgrades
-
-The pipeline MUST iterate over the `upgrades` field of the
-`StellarValue` and apply each valid upgrade (Section 7). Each upgrade
-is applied in its own nested `LedgerTxn`. Invalid upgrades (those that
-fail `isValidForApply` at the current ledger version) SHALL be skipped
-with a warning.
-
-#### Step 13: Seal and Store
-
-The pipeline MUST call the seal-and-store procedure (Section 11) to:
-
-1. Finalize all LedgerTxn changes (eviction, hot archive updates,
-   BucketList batch additions).
-2. Snapshot the BucketList and compute the `bucketListHash`.
-3. Store the ledger header and HAS in the persistent database.
-4. Create a new `CompleteConstLedgerState`.
-
-#### Step 14: Populate Meta with Network Config
-
-If `initialLedgerVers >= 20`, the pipeline MUST populate the meta
-frame with the current Soroban network configuration.
-
-#### Step 15: Verify Expected Hash
-
-If the `LedgerCloseData` includes an expected ledger hash, the
-pipeline MUST verify that the computed ledger hash matches. A mismatch
-indicates a consensus divergence and MUST be treated as a fatal error.
-
-#### Step 16: Emit Meta
-
-If meta streaming is enabled, the pipeline MUST emit the completed
-meta frame to the meta stream.
-
-#### Step 17: Commit Sequence
-
-The pipeline MUST execute the following 8-step commit sequence in
-exact order:
-
-1. **Queue history checkpoint**: If this ledger is at a checkpoint
-   boundary, queue the checkpoint for publishing (within current DB
-   transaction).
-2. **Commit LedgerTxn**: Commit the top-level `LedgerTxn`, flushing
-   offers to DB and committing the SQL transaction.
-3. **Finalize checkpoint files**: If a checkpoint was queued, finalize
-   the checkpoint files.
-4. **Start background eviction scan**: Begin the eviction scan for
-   the next ledger (`ledgerSeq + 1`).
-5. **Exit COMMITTING phase**: Transition from `COMMITTING` to
-   `READY_TO_APPLY`.
-6. **Copy Soroban state for invariant check**: If invariant checking
-   is enabled, capture a snapshot of Soroban state.
-7. **Advance LCL, publish queued history, and GC buckets**: This step
-   MUST execute on the main thread:
-   a. Swap in the new `CompleteConstLedgerState` as the current LCL.
-   b. Publish Soroban metrics.
-   c. Kick off queued history publishing.
-   d. GC unreferenced buckets (under ledger state mutex).
-8. **Notify herder and run invariant snapshot check**: Signal that the
-   ledger close is complete so the herder can trigger the next
-   consensus round, and run the invariant snapshot check.
+The split between steps 1-5 (apply thread, post-seal) and 6-8 (main thread)
+exists because LCL is owned by the main thread; the apply thread MUST post
+back the new `CompleteConstLedgerState` to the main thread for installation
+into `mLastClosedLedgerState`.
 
 ---
 
-## 5. Transaction Application
+## 5. Apply State Phase Machine
 
-### 5.1 Fee and Sequence Number Processing
-
-Before transactions are applied, their fees MUST be charged and their
-sequence numbers MUST be advanced. This ensures that even if a
-transaction fails during application, the fee is collected and the
-sequence number is consumed.
-
-The `processFeesSeqNums` procedure:
-
-1. SHALL open a nested `LedgerTxn`.
-2. SHALL iterate over all transactions in the set, in phase order
-   (classic phase first if present, then Soroban phase).
-3. For each transaction, SHALL call `processFeeSeqNum` which:
-   a. Loads the source account.
-   b. Deducts the fee from the source account balance.
-   c. Adds the fee to the ledger header's `feePool`.
-   d. For protocol versions < 10: increments the source account's
-      `seqNum`. For protocol versions ≥ 10: does NOT advance the
-      sequence number here — it is advanced later during transaction
-      application (`processSeqNum` in the apply step).
-4. For protocol 19+: If the transaction set contains account merge
-   operations, the procedure SHALL create `MAX_SEQ_NUM_TO_APPLY`
-   internal entries for each source account, recording the highest
-   sequence number seen for that account. This prevents sequence
-   number reuse after an account merge and re-creation within the
-   same ledger. The detection is gated on the presence of any
-   `ACCOUNT_MERGE` operation across the whole set; if none is
-   present, no `MAX_SEQ_NUM_TO_APPLY` entries are created. Before
-   `create`, the procedure MUST verify that no
-   `MAX_SEQ_NUM_TO_APPLY` entry already exists for the source
-   account in the current `LedgerTxn` — a pre-existing entry
-   indicates a programming error and MUST abort.
-5. SHALL record fee processing changes in the meta frame (if
-   streaming).
-6. SHALL commit the nested `LedgerTxn`.
-
-### 5.2 Transaction Application
-
-The `applyTransactions` procedure applies all transactions in the set
-to the current ledger state:
-
-1. SHALL compute the `sorobanBasePrngSeed` as the transaction set
-   contents hash (used for deterministic randomness in Soroban
-   transactions).
-2. SHALL load the Soroban network configuration if protocol ≥ 20.
-3. SHALL iterate over phases in apply order.
-4. For each phase, SHALL apply transactions according to the phase
-   type:
-   - **Sequential phase**: Apply transactions one at a time
-     (Section 5.3).
-   - **Parallel phase**: Apply transactions in parallel stages
-     (Section 5.4, protocol 23+).
-
-### 5.3 Sequential Phase Application
-
-In the sequential phase (used for all classic transactions and for
-Soroban transactions before protocol 23), each transaction is applied
-individually:
-
-1. For each transaction in the phase:
-   a. Open a nested `LedgerTxn`.
-   b. Create a `TransactionMetaBuilder` to track state changes.
-   c. For Soroban transactions, compute a per-transaction sub-seed:
-      `subSeed = SHA256(baseSeed || transactionIndex)`.
-      The `transactionIndex` is a **global counter** across all
-      phases, NOT a per-phase counter. Phases are applied in order
-      (Phase 0, then Phase 1), and the index increments sequentially
-      across them. For example, if Phase 0 contains N transactions
-      and Phase 1 contains M transactions, Phase 0 TXs receive
-      indices 0..N-1 and Phase 1 TXs receive indices N..N+M-1.
-   d. Call `transaction.apply(...)` to execute the transaction.
-   e. Call `transaction.processPostApply(...)` for post-application
-      processing.
-   f. Record refundable fee metadata.
-   g. Process the result and metadata immediately.
-   h. Commit or rollback the nested `LedgerTxn` based on the
-      transaction result.
-
-### 5.4 Parallel Phase Application
-
-In the parallel phase (protocol 23+, used for Soroban transactions),
-transactions are organized into stages and clusters as defined in
-**HERDER_SPEC §7** ("Parallel Soroban Transaction Sets"). The
-execution mechanics are specified in **TX_SPEC §8.7**.
-
-The ledger-close orchestration for the parallel phase is:
-
-1. The transaction set provides a `TxStageFrameList` — an ordered
-   list of stages, where each stage contains clusters.
-2. A global parallel-apply ledger state is created as a read-only
-   snapshot.
-3. For each stage:
-   a. All clusters in the stage are applied in parallel (each on a
-      separate execution thread).
-   b. Each cluster applies its transactions sequentially within the
-      cluster.
-   c. After all clusters in the stage complete, their results are
-      checked for invariant violations.
-   d. All cluster changes are committed to the main `LedgerTxn` in
-      deterministic order.
-4. After all stages complete, post-transaction-set processing runs
-   for each transaction:
-   a. `processPostTxSetApply` executes in a nested `LedgerTxn`.
-   b. Post-apply fee processing changes are recorded in the meta
-      frame.
-   c. Results and metadata are processed (deferred from the parallel
-      apply step).
-
-### 5.5 Transaction Application Ordering
-
-The order in which transactions are applied within a phase is
-deterministic and MUST match the order specified by the transaction set
-frame. Within a sequential phase, transactions are applied in the order
-they appear in the phase. Within a parallel phase, stages are applied in
-order, clusters within a stage are applied in parallel (but committed in
-order), and transactions within a cluster are applied in order.
-
-The overall phase ordering is:
-
-1. **Phase 0**: Classic transactions (sequential).
-2. **Phase 1**: Soroban transactions (parallel in protocol 23+,
-   sequential before that).
-
----
-
-## 6. LedgerTxn: Nested Transactional State
-
-### 6.1 Overview
-
-The LedgerTxn system provides a hierarchical, copy-on-write
-transactional abstraction for ledger state. It enables nested
-transactions where modifications at any level can be independently
-committed or rolled back without affecting sibling or ancestor
-transactions.
-
-The system forms a tree:
+The apply state cycles through four phases:
 
 ```mermaid
-graph TD
-    Root["LedgerTxnRoot (persistent storage)"]
-    Root --> TL["LedgerTxn (top-level, one per ledger close)"]
-    TL --> Fee["LedgerTxn (fee processing)"]
-    TL --> Tx1["LedgerTxn (transaction 1 application)"]
-    TL --> Tx2["LedgerTxn (transaction 2 application)"]
-    TL --> Up1["LedgerTxn (upgrade 1)"]
-    TL --> Up2["LedgerTxn (upgrade 2)"]
-    Tx2 --> Op["LedgerTxn (inner operation)"]
+stateDiagram-v2
+  [*] --> SETTING_UP_STATE
+  SETTING_UP_STATE --> READY_TO_APPLY: markEndOfSetupPhase
+  READY_TO_APPLY --> SETTING_UP_STATE: resetToSetupPhase<br/>(e.g. lost sync,<br/>bucket-apply)
+  READY_TO_APPLY --> APPLYING: markStartOfApplying
+  APPLYING --> COMMITTING: markStartOfCommitting
+  COMMITTING --> READY_TO_APPLY: markEndOfCommitting
 ```
 
-### 6.2 LedgerTxnRoot
+Phase semantics:
 
-The `LedgerTxnRoot` is the root of the hierarchy and the interface to
-persistent storage. It:
+| Phase | Mutability of ApplyState | Soroban worker threads | Typical work |
+|---|---|---|---|
+| `SETTING_UP_STATE` | Mutable by primary apply thread. | None. | Startup; post-bucket-apply state setup; populating in-memory Soroban state. |
+| `READY_TO_APPLY` | Immutable. | None. | Idle between ledgers; ApplyState is a fixed snapshot. |
+| `APPLYING` | Immutable for the primary thread except via the aggregating LedgerTxn. | MAY be live, reading immutable state. | Fee phase, sequential phase, parallel Soroban phase. |
+| `COMMITTING` | Mutable by primary apply thread only. | MUST be joined. | Apply upgrades, seal, persist, advance header. |
 
-1. SHALL maintain the connection to persistent storage.
-2. SHALL provide the initial entry data for lookups that miss all
-   child caches — this data comes from the BucketList snapshot, not
-   persistent storage.
-3. SHALL maintain an in-memory representation of the order book (the
-   "multi-order book") for efficient offer queries.
-4. SHALL track the "best offer" for each asset pair, used to
-   optimize path finding.
-5. SHALL commit accumulated changes to persistent storage when the
-   top-level `LedgerTxn` commits. Only offer entries are written to
-   persistent storage; all other entry types are stored exclusively
-   in the BucketList.
+The pipeline MUST enforce these transitions via runtime assertion. In
+particular, while the apply thread is in `APPLYING`, the primary thread MUST
+NOT mutate `InMemorySorobanState` or the module cache; Soroban worker
+threads MAY only call const methods of `ApplyState`.
 
-### 6.3 Nesting Rules
-
-The following rules govern LedgerTxn nesting:
-
-1. **Single child**: A `LedgerTxn` (or `LedgerTxnRoot`) SHALL have
-   at most one active child at any time. Creating a second child
-   while a first is active is a programming error.
-2. **Deactivation**: When a child `LedgerTxn` is created, the parent
-   SHALL deactivate all its live entry handles. This prevents
-   simultaneous modification of the same entry at two levels.
-   Accessing a deactivated handle is a programming error.
-3. **Reactivation**: When a child commits or rolls back, the parent
-   SHALL reactivate its entry handles.
-4. **Depth**: There is no formal limit on nesting depth, though
-   typical usage nests 2–4 levels deep.
-5. **No writes while sealed or with child**: A `LedgerTxn` MUST
-   reject any state-mutating call (`create`, `erase`, `load`,
-   `loadWithoutRecord`, `loadHeader`, `markRestoredFromHotArchive`,
-   `restoreFromLiveBucketList`) if either (a) the transaction is
-   sealed or (b) it currently has an active child. These are
-   programming errors and MUST abort the close.
-6. **CONFIG_SETTING entries are not erasable**: `erase(key)` MUST
-   reject any key whose type is `CONFIG_SETTING`. Config settings
-   may only be updated (via `LEDGER_UPGRADE_CONFIG`) or, in the
-   case of non-upgradeable settings, mutated internally by the
-   pipeline (Section 9.4); they are never deleted.
-
-### 6.4 Entry Operations
-
-A `LedgerTxn` supports the following operations on entries:
-
-#### 6.4.1 Load
-
-`load(key) → LedgerTxnEntry | null`
-
-1. If the key exists in this transaction's local cache:
-   a. If the entry's lifecycle state is `DELETED`, return null.
-   b. Otherwise, return the cached entry (creating an active handle).
-2. Otherwise, recursively load from the parent.
-3. If found, create a copy in this transaction's cache (copy-on-write)
-   with lifecycle state `LIVE`.
-4. If not found, return null.
-
-A load SHALL NOT modify the entry in any ancestor.
-
-**Deleted-key visibility invariant**: A `load` for a key that has been
-erased (lifecycle state `DELETED`) in *any* scope within the current
-ledger close MUST return null. Implementations MUST NOT fall through
-to the backing store (e.g., BucketList snapshot) for a key that was
-deleted, regardless of whether the deletion occurred in the current
-scope, a sibling scope that has already committed, or a parent scope.
-
-This invariant has two practical consequences for implementations that
-use flat state with scoped snapshots rather than true nested
-transactions:
-
-1. **Intra-transaction**: When multiple operations execute within the
-   same transaction, an entry deleted by an earlier operation MUST
-   remain invisible to later operations' preloading, even though
-   per-operation snapshot state may have been cleared.
-2. **Cross-transaction**: When multiple transactions execute within
-   the same ledger, an entry deleted by an earlier transaction MUST
-   remain invisible to later transactions' preloading, even though
-   per-transaction state is committed and cleared between transactions.
-   The ledger-level accumulator of deleted keys (the "delta") persists
-   across transaction boundaries and MUST be consulted before loading
-   from the backing store.
-
-#### 6.4.2 Load Without Record
-
-`loadWithoutRecord(key) → ConstLedgerTxnEntry | null`
-
-Similar to `load`, but returns a read-only handle and does NOT create
-a copy in this transaction's cache. Used for read-only queries that
-should not trigger copy-on-write overhead.
-
-#### 6.4.3 Create
-
-`create(entry) → LedgerTxnEntry`
-
-1. The key derived from the entry MUST NOT already exist in this
-   transaction or any ancestor.
-2. The entry is added to this transaction's cache with lifecycle
-   state `INIT`.
-3. Returns an active handle.
-
-#### 6.4.4 Erase
-
-`erase(key)`
-
-1. The key MUST exist in this transaction or an ancestor.
-2. If the key has lifecycle state `INIT` (was created in this
-   transaction and has never been committed to an ancestor), the
-   entry is removed entirely — this is **annihilation** (the create
-   and delete cancel out).
-3. Otherwise, the entry is marked with lifecycle state `DELETED`.
-
-#### 6.4.5 Load Header
-
-`loadHeader() → LedgerTxnHeader`
-
-Returns an active handle to the ledger header for this transaction.
-Header modifications follow the same copy-on-write and commit semantics
-as entry modifications.
-
-### 6.5 Sealing
-
-Before a `LedgerTxn` can provide its accumulated changes for external
-consumption (e.g., for the BucketList batch add), it MUST be **sealed**.
-
-Sealing:
-
-1. Calls `getAllEntries(initEntries, liveEntries, deadEntries)` to
-   extract all accumulated changes, partitioned by lifecycle state.
-2. After sealing, the `LedgerTxn` SHALL NOT accept any further
-   modifications.
-
-The three output partitions are:
-
-| Partition | Contents |
-|-----------|----------|
-| `initEntries` | Entries with lifecycle state `INIT` — newly created entries. |
-| `liveEntries` | Entries with lifecycle state `LIVE` — modified existing entries. |
-| `deadEntries` | Keys with lifecycle state `DELETED` — erased entries. |
-
-### 6.6 Commit Semantics
-
-When a child `LedgerTxn` commits, its changes are merged into the
-parent according to these rules:
-
-#### 6.6.1 Last Modified Update
-
-Before merging, the committing transaction SHALL update the
-`lastModifiedLedgerSeq` field of every modified or created entry to
-the current ledger sequence number, unless the entry is an internal
-type (sponsorship, sponsorship counter, max-seq-num-to-apply) which
-does not carry this field.
-
-#### 6.6.2 Entry Merge Rules
-
-For each entry in the committing child, the merge into the parent
-proceeds based on the child's lifecycle state and the parent's existing
-state for the same key:
-
-| Child State | Parent State | Result in Parent |
-|-------------|-------------|-----------------|
-| `INIT` | absent | `INIT` (new entry propagated up) |
-| `INIT` | `DELETED` | `LIVE` (re-creation after deletion) |
-| `LIVE` | `LIVE` | `LIVE` (modification propagated) |
-| `LIVE` | `INIT` | `INIT` (still a new entry, now modified) |
-| `DELETED` | `LIVE` | `DELETED` |
-| `DELETED` | `INIT` | absent (annihilation — entry removed entirely) |
-
-**Annihilation**: When a `DELETED` entry in the child meets an `INIT`
-entry in the parent, both are removed. This is critical because the
-entry was created and destroyed within the same transactional scope,
-so no net change needs to propagate further.
-
-#### 6.6.3 Header Merge
-
-If the child modified the ledger header, the parent's header is
-replaced with the child's version.
-
-#### 6.6.4 Root Commit
-
-When the top-level `LedgerTxn` commits to the `LedgerTxnRoot`:
-
-1. All accumulated offer changes are flushed to persistent storage
-   (inserts, updates, deletes).
-2. The in-memory order book is updated.
-3. The persistent storage transaction is committed.
-
-Non-offer entry types are NOT written to persistent storage during
-root commit — they are persisted exclusively through the BucketList
-batch add that occurs during the seal-and-store step (Section 11).
-
-### 6.7 Rollback Semantics
-
-When a `LedgerTxn` is rolled back (either explicitly or by
-destruction without commit):
-
-1. All entry modifications in this transaction are discarded.
-2. The parent is notified to reactivate its entry handles.
-3. No changes propagate to the parent or any ancestor.
-
-Rollback is the default behavior — if a `LedgerTxn` is destroyed
-without calling `commit()`, it implicitly rolls back.
-
-**Snapshot immutability invariant**: When an entry is first loaded
-or copied into a `LedgerTxn`'s local cache (copy-on-write), the
-entry's value at that point becomes the rollback target. Subsequent
-modifications to the entry within the same `LedgerTxn` MUST NOT
-alter the original cached copy in any ancestor scope.
-Implementations that use alternative state management approaches
-(e.g., flat state with savepoint snapshots) MUST ensure that the
-pre-scope entry value is captured exactly once and is never
-overwritten by later updates within the same scope.
-
-### 6.8 Restored Entries Tracking
-
-In addition to the per-key entry cache, every `LedgerTxn` maintains two
-**restored-entries maps** that record entries that have been restored
-during this close, partitioned by their source:
-
-| Map | Source | Populated by |
-|-----|--------|--------------|
-| `hotArchive` | Hot Archive BucketList (protocol 24+) | `markRestoredFromHotArchive(entry, ttlEntry)` |
-| `liveBucketList` | Live BucketList | `restoreFromLiveBucketList(entry, ttl)` |
-
-The maps obey the following invariants:
-
-1. **Mutual exclusivity**: No `LedgerKey` MAY appear in both the
-   `hotArchive` and `liveBucketList` maps. An entry is restored from
-   exactly one source.
-2. **TTL co-storage**: Every restored Soroban entry (`CONTRACT_DATA`
-   or `CONTRACT_CODE`) MUST be paired with its TTL entry. Both keys
-   and entries are inserted atomically into the same map.
-3. **Persistent-only**: Only persistent entry types may be restored;
-   inserting a non-persistent key SHALL abort.
-4. **Inheritance**: When a child `LedgerTxn` is constructed, it
-   inherits a copy of both restored-entry maps from its parent. New
-   restorations performed in the child are added to the child's copy.
-5. **Commit merge (with duplicates)**: When a child commits, its
-   restored-entries maps are merged into the parent's. Because the
-   child inherited the parent's maps at construction, duplicates are
-   expected and MUST NOT cause an error (`allowDuplicates=true` on
-   commit). When restoring entries during fine-grained operations
-   (per-operation → per-thread or per-thread → shared parallel-apply
-   state), duplicates are NOT permitted (`allowDuplicates=false`).
-6. **Rollback**: Both maps are cleared on rollback.
-
-The restored-entries maps are consumed by the finalize step (Section
-11.1) to drive hot archive eviction filtering and per-protocol
-invariant checks.
-
-### 6.9 Unseal Header
-
-The `unsealHeader` operation is a special mechanism used during the
-seal-and-store step. After the `LedgerTxn` has been sealed (all entries
-extracted), the header is still "sealed" and cannot be modified.
-`unsealHeader` accepts a callback that receives a mutable reference to
-the header, allowing the seal-and-store step to finalize header fields
-(such as `bucketListHash`) that depend on the BucketList state computed
-from the sealed entries.
+A node that has fallen out of sync and is starting catchup MUST reset the
+apply state to `SETTING_UP_STATE` (via `markApplyStateReset`) before
+performing bucket-apply.
 
 ---
 
-## 7. Protocol Upgrades
+## 6. Transaction Application
 
-### 7.1 Overview
+Transaction application is two-phased: a **fee phase** that charges fees
+and binds sequence numbers, followed by an **apply phase** that executes
+each transaction's operations. The apply phase itself is structured by
+**phases** of the txset (classic and Soroban), and (in protocol 23+) the
+Soroban phase MAY be **parallel**, organized into stages and clusters.
 
-Protocol upgrades are network-wide parameter changes that are embedded
-in the SCP `StellarValue` and applied during ledger close, AFTER
-transaction application but BEFORE the ledger is sealed. This ordering
-ensures that transactions in a given ledger are applied under the
-pre-upgrade rules, while the resulting ledger header reflects the
-post-upgrade parameters.
+### 6.1 Apply Order
 
-### 7.2 Upgrade Types
+The order of phases used during apply is `txSet.getPhasesInApplyOrder()` —
+this differs from the consensus order. Within a phase, the per-phase apply
+order is defined by `TxSetFrame::getTxsInApplyOrder` (see HERDER_SPEC §6.5):
+transactions are sorted such that a given source account's transactions are
+strictly sequence-number ordered, while inter-account ordering is
+randomized using a seed derived from the txset hash.
 
-The `LedgerUpgrade` XDR union supports the following upgrade types:
+### 6.2 Fee Phase (`processFeesSeqNums`)
 
-| Upgrade Type | Parameter Changed | Introduced |
-|-------------|-------------------|-----------|
-| `LEDGER_UPGRADE_VERSION` | `ledgerVersion` (protocol version) | Genesis |
-| `LEDGER_UPGRADE_BASE_FEE` | `baseFee` | Genesis |
-| `LEDGER_UPGRADE_MAX_TX_SET_SIZE` | `maxTxSetSize` | Genesis |
-| `LEDGER_UPGRADE_BASE_RESERVE` | `baseReserve` | p9 |
-| `LEDGER_UPGRADE_FLAGS` | Ledger header flags | p18 |
-| `LEDGER_UPGRADE_CONFIG` | Soroban configuration settings | p20 |
-| `LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE` | Maximum Soroban transaction set size | p20 |
+For each transaction in apply order:
 
-### 7.3 Upgrade Lifecycle
+1. A nested `LedgerTxn` `ltxTx` is opened over the outer fee LedgerTxn.
+2. `tx.processFeeSeqNum(ltxTx, baseFee)` is invoked (see TX_SPEC §7):
+   - The fee is charged from the fee source account.
+   - The sequence number of the source account is advanced.
+   - Sequence-number preconditions are validated.
+3. The transaction's `MutableTransactionResult` is captured into
+   `txResults[i]`.
+4. @version(>=19) For each transaction whose source-account sequence
+   number is being advanced, the maximum sequence number seen this ledger
+   is tracked per account in `accToMaxSeq`. If any transaction in the
+   txset contains an `ACCOUNT_MERGE` operation, the boolean `mergeSeen`
+   is set.
+5. If meta is enabled, the fee-processing changes (`ltxTx.getChanges()`)
+   are pushed into the meta's `feeProcessing` for this transaction.
+6. `ltxTx.commit()`.
 
-#### 7.3.1 Nomination
+After all transactions have been fee-processed:
 
-Validators may configure desired upgrades (target protocol version,
-base fee, etc.) with an effective time. During SCP nomination, a
-validator SHALL include upgrades in its proposed `StellarValue` only if:
+7. @version(>=19) If `mergeSeen` is true, for each `(accountID, seqNum)`
+   in `accToMaxSeq`, an `InternalLedgerEntry` of type
+   `MAX_SEQ_NUM_TO_APPLY` is created. If such an entry already exists in
+   the outer LedgerTxn, the pipeline MUST throw `found unexpected
+   MAX_SEQ_NUM_TO_APPLY`.
+8. The outer fee LedgerTxn is committed.
 
-1. The current time is at or past the configured effective time.
-2. The proposed value differs from the current ledger header value.
-3. For protocol version upgrades: the new version is exactly
-   `currentVersion + 1` (single-step upgrades only).
+The `MAX_SEQ_NUM_TO_APPLY` entries are consumed by transaction application
+to ensure that a transaction whose source account is later merged in the
+same ledger still observes its declared sequence number (see TX_SPEC §5.6).
 
-#### 7.3.2 Validation
+### 6.3 Apply Phase (`applyTransactions`)
 
-When receiving a proposed `StellarValue` from another validator, the
-upgrade MUST be validated:
+For each phase in apply order:
 
-1. Each upgrade entry MUST deserialize to a valid `LedgerUpgrade`.
-2. The upgrade MUST be valid for the current protocol version
-   (via `isValidForApply`).
-3. For `LEDGER_UPGRADE_VERSION`: the new version MUST be ≤
-   `CURRENT_LEDGER_PROTOCOL_VERSION` and MUST be > `currentVersion`
-   (strictly greater). Note: the `currentVersion + 1` constraint
-   applies only during nomination, not during apply validation.
-   Multi-version jumps are valid during apply.
-4. For `LEDGER_UPGRADE_CONFIG`: the `ConfigUpgradeSet` MUST exist in
-   the ledger state, entries MUST be sorted by `configSettingID` with
-   no duplicates, and each setting MUST pass its specific validation
-   logic. For cost parameters (`CONTRACT_COST_PARAMS_CPU` and
-   `CONTRACT_COST_PARAMS_MEMORY`): the array length MUST equal the
-   expected count for the target protocol version (see Section 9.5),
-   and every `constTerm` and `linearTerm` value MUST be non-negative.
+- If `phase.isParallel()` is true, the phase MUST be applied via
+  `applyParallelPhase` (§6.5).
+- Otherwise, the phase MUST be applied via `applySequentialPhase` (§6.4).
 
-#### 7.3.3 Combination
+The Soroban network configuration (post-protocol-20) MUST be loaded once
+from the LedgerTxn before the loop and reused for the parallel-phase
+invocations. The base PRNG seed for Soroban transactions is
+`sorobanBasePrngSeed = txSet.getContentsHash()`.
 
-When SCP combines values from multiple validators, upgrades are
-combined by taking the highest proposed value for each parameter type.
-For protocol version upgrades, the maximum of all proposed versions is
-taken (clamped to `currentVersion + 1`). For config upgrades, if
-multiple validators propose different config sets, the one with the
-lexicographically highest `(contractID, contentHash)` pair wins —
-`contractID` is compared first, and `contentHash` is used as a
-tiebreaker when `contractID` values are equal.
+After all phases, `processPostTxSetApply` is invoked to handle Soroban
+post-tx-set processing (refunds, post-tx-apply fee meta) for the parallel
+phase (see §6.6).
 
-#### 7.3.4 Application
+### 6.4 Sequential Phase (`applySequentialPhase`)
 
-During ledger close, upgrades are applied in the order they appear in
-`stellarValue.upgrades`. For each upgrade:
+For each transaction `tx` in the phase, in apply order:
 
-1. Open a nested `LedgerTxn`.
-2. Validate the upgrade via `isValidForApply`. Skip with a warning if
-   invalid.
-3. Apply the upgrade:
+1. A `TransactionMetaBuilder` is constructed at the current ledger version.
+2. A `TRANSACTION_EVENT_STAGE_BEFORE_ALL_TXS` fee event is emitted into
+   the meta.
+3. A per-tx seed is derived: for Soroban transactions,
+   `subSeed = SHA-256(sorobanBasePrngSeed || index)` where `index` is
+   the global transaction index encoded as a `uint64`. For classic
+   transactions, the base seed is used unchanged.
+4. `tx.apply(ltx, tm, mutableTxResult, sorobanConfig, subSeed)` is invoked
+   (see TX_SPEC §6).
+5. `tx.processPostApply(ltx, tm, mutableTxResult)` is invoked
+   (see TX_SPEC §13).
+6. Refundable fee meta is set if present.
+7. `processResultAndMeta(meta, index, tm, tx, mutableTxResult, txResultSet)`
+   appends the result pair, increments success/failure counters, and
+   stores the per-tx meta.
 
-   **Version upgrade** (`LEDGER_UPGRADE_VERSION`):
-   - Set `header.ledgerVersion` to the new version.
-   - If upgrading to p10: run `prepareLiabilities` to adjust all
-     offers and trust lines for the new reserve calculation rules.
-    - If upgrading from p15 to p16 exactly **on the production
-      (mainnet) network only** (`gIsProductionNetwork`): remove an
-      invalid sponsorship from offer `289733046`. This is a
-      one-time data repair for a specific problematic ledger entry;
-      the fix is a no-op on non-production networks. The production
-      network is identified by the network passphrase
-      `"Public Global Stellar Network ; September 2015"`.
-   - If upgrading to p20: create all initial Soroban `CONFIG_SETTING`
-     entries with their default values.
-   - If upgrading to p21: create new cost types for protocol 21
-     (`createCostTypesForV21`).
-   - If upgrading to p22: create new cost types for protocol 22
-     (`createCostTypesForV22`).
-   - If upgrading to p23: create new ledger entries for protocol 23
-     (`createAndUpdateLedgerEntriesForV23`): create
-     `CONTRACT_PARALLEL_COMPUTE`, `SCP_TIMING`, and
-     `CONTRACT_LEDGER_COST_EXT` config settings, and update rent cost
-     parameters.
-   - If upgrading to p25: enable Rust Dalek signature verification
-     and create new cost types for protocol 25
-     (`createCostTypesForV25`).
-   - If the new version is ≥ 23: recompute the in-memory Soroban
-     state size and update the state size window if applicable
-     (`handleUpgradeAffectingSorobanInMemoryStateSize`).
-   - Note: Upgrade actions trigger when crossing through a target
-     version (using `needUpgradeToVersion(target, prev, new)` which
-     returns true when `prev < target && new >= target`). Upgrading
-     from v19 to v25 triggers ALL of v20, v21, v22, v23, and v25
-     upgrade actions.
-   - Note: Protocol version 24 has no version-specific upgrade actions
-     (no `createCostTypesForV24` or similar). The only v24-specific
-     behavior is the mainnet hot archive bug fix during the p23→p24
-     transition.
-    - If upgrading from p23 to p24 **on the production (mainnet)
-      network only** (`gIsProductionNetwork`): apply the CAP-0076
-      P23 hot archive bug remediation. In protocol 23, the
-      persistent entry eviction scan could archive a stale
-      version of an entry from a deeper bucket level instead of
-      the newest version, because no point lookup was performed.
-      This corrupted 478 entries on mainnet. The remediation:
-      (a) Add `31,879,035` stroops to `feePool` to account for
-      unintentional XLM burns from restored corrupted SAC
-      balance entries.
-      (b) The hot archive entry fix is applied during
-      `finalizeLedgerTxnChanges` (Section 11.1, Step 1c).
-      Note: These fixes are mainnet-specific; testnet and
-           private networks MUST NOT apply them.
-      The production network is identified by the network
-      passphrase `"Public Global Stellar Network ; September 2015"`.
+### 6.5 Parallel Soroban Phase (`applyParallelPhase`, protocol 23+)
 
-   **Base fee upgrade** (`LEDGER_UPGRADE_BASE_FEE`):
-   - Set `header.baseFee` to the new value.
+The parallel phase is structured as an ordered list of **stages**; within
+each stage, an ordered list of **clusters**; within each cluster, an
+ordered list of transactions. Clusters within a stage are guaranteed
+footprint-disjoint by the Herder construction (see HERDER_SPEC §6.4) and
+MAY thus be applied concurrently. Stages MUST be applied serially.
 
-   **Max tx set size upgrade** (`LEDGER_UPGRADE_MAX_TX_SET_SIZE`):
-   - Set `header.maxTxSetSize` to the new value.
+For each stage:
 
-   **Base reserve upgrade** (`LEDGER_UPGRADE_BASE_RESERVE`):
-   - Set `header.baseReserve` to the new value.
-   - `@version(≥10)`: If the new base reserve is strictly greater than
-     the previous value, run `prepareLiabilities` to reconcile all offers
-     against the new minimum balance. Reserve decreases do NOT trigger
-     liability adjustment. The algorithm:
-     1. Iterate all offers grouped by `accountID`, then by `offerID`.
-     2. For each account's offers, compute the new minimum balance
-        given the updated `baseReserve`.
-     3. Delete offers whose reserve can no longer be supported (the
-        account has insufficient balance to cover the minimum balance
-        plus selling liabilities after the offer is removed).
-     4. For surviving offers, recompute `amount` so that selling
-        liabilities fit within the account's available balance. Adjust
-        buying liabilities accordingly using the exchange function
-        (`exchangeV10WithoutPriceErrorThresholds`).
-     5. Update the liabilities fields on the account entry and any
-        affected trustline entries.
-     6. Record all changes (offer deletions, amount adjustments,
-        account/trustline liability updates) in `UpgradeEntryMeta`.
+1. A `GlobalParallelApplyLedgerState` is constructed wrapping
+   `(app, ltx, allStages, inMemorySorobanState, sorobanConfig)`.
+2. For each cluster `c` in the stage, an independent
+   `ThreadParallelApplyLedgerState` is constructed and a Soroban worker
+   thread is dispatched to run `applyThread(c, ...)`:
+   - For each `txBundle` in the cluster, in cluster-order:
+     - `flushRoTTLBumpsInTxWriteFootprint(txBundle)` is invoked.
+     - `subSeed = SHA-256(sorobanBasePrngSeed || txNum)`.
+     - `txBundle.tx.parallelApply(...)` is invoked (see TX_SPEC §11.5).
+     - On success, `commitChangesFromSuccessfulTx` accumulates per-tx
+       changes into the thread state.
+   - After all bundles, `flushRemainingRoTTLBumps()` is invoked.
+3. All worker thread results are gathered (`std::future::get`); any
+   exception MUST abort with a fatal error.
+4. After the threads join, `checkAllTxBundleInvariants` MUST run
+   per-tx invariant checks against the operation-level delta produced by
+   the thread.
+5. `globalParState.commitChangesFromThreads(threadStates, stage)` merges
+   the stage's accumulated state into the global state.
 
-   **Flags upgrade** (`LEDGER_UPGRADE_FLAGS`):
-   - Set the ledger header flags to the new value.
+After all stages:
 
-   **Config upgrade** (`LEDGER_UPGRADE_CONFIG`):
-   - Load the `ConfigUpgradeSet` from ledger state.
-   - For each entry in the set, update the corresponding
-     `CONFIG_SETTING` entry.
-   - The `ConfigUpgradeSet` entry is stored as `TEMPORARY` contract
-     data and is NOT explicitly deleted after application — it
-     remains in ledger state and expires naturally when its TTL
-     runs out.
+6. `globalParState.commitChangesToLedgerTxn(ltx)` MUST be invoked, which
+   transfers the accumulated parallel-phase changes (including
+   restorations) into the outer LedgerTxn `ltx`.
 
-   **Max Soroban tx set size upgrade** (`LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE`):
-   - Update the corresponding Soroban config setting.
+Cluster and stage counts MAY be exposed as observability metrics but do
+not affect consensus.
 
-4. Record upgrade changes in the meta frame.
-5. Commit the nested `LedgerTxn`.
+### 6.6 Post-Tx-Set Apply (`processPostTxSetApply`)
+
+For the parallel phase, after `applyTransactions` returns:
+
+1. For each `txBundle` in stage/cluster order:
+   - A nested LedgerTxn `ltxInner(ltx)` is opened.
+   - `tx.processPostTxSetApply(ltxInner, resPayload, txEventManager)` is
+     invoked (see TX_SPEC §11.6). This is the Soroban refund pathway.
+   - If meta is enabled, `meta.setPostTxApplyFeeProcessing(
+     ltxInner.getChanges(), txNum)` records the post-apply fee diff (v2
+     meta only).
+   - `ltxInner.commit()`.
+   - `processResultAndMeta` records the (possibly refund-adjusted) result.
+
+The sequential (classic) phase does not currently use post-tx-set apply.
+
+### 6.7 Source-Account Prefetch and Tx-Data Prefetch
+
+Before the fee phase, `prefetchTxSourceIds` collects the set of keys
+implied by `tx.insertKeysForFeeProcessing` across all transactions and
+issues a bulk prefetch against the LedgerTxnRoot if `PREFETCH_BATCH_SIZE > 0`
+and not all buckets are in memory. Similarly, `prefetchTransactionData`
+issues a bulk prefetch of all keys implied by `tx.insertKeysForTxApply`
+before the apply loop. Prefetching is advisory and does not affect
+consensus.
 
 ---
 
-## 8. Ledger Header Management
+## 7. LedgerTxn Nested Transactional State
 
-### 8.1 Header Update Sequence
+`LedgerTxn` is the in-memory transactional view of ledger state used
+throughout the pipeline. It is the sole mechanism by which operations,
+transactions, and the close pipeline observe and mutate `LedgerEntry`s.
 
-During a ledger close, the ledger header fields are updated in the
-following order:
+### 7.1 Hierarchy and Nesting Rules
 
-1. **Before transaction application** (Step 3 of the pipeline):
-   - `ledgerSeq` ← `previousLedgerSeq + 1`
-   - `previousLedgerHash` ← `SHA256(previousLedgerHeader)`
-   - `scpValue` ← the agreed-upon `StellarValue`
+There are three roles:
 
-2. **After transaction application** (Step 10):
-   - `txSetResultHash` ← `SHA256(TransactionResultSet)`
+| Role | Definition |
+|---|---|
+| `LedgerTxnRoot` | The terminal parent. Reads cascade down into the LCL bucket-list snapshot (or, for offers, into SQL); commits flush to the bucket list and database. |
+| `LedgerTxn` (non-root) | An in-memory nested transaction; commits flush into its parent's entry map. |
+| `AbstractLedgerTxnParent` | The interface common to both. |
 
-3. **During upgrades** (Step 12):
-   - Any of `ledgerVersion`, `baseFee`, `baseReserve`, `maxTxSetSize`,
-     or flags may be updated.
+A `LedgerTxn` is constructed with a reference to its parent
+(`AbstractLedgerTxnParent`) and is then automatically attached as the
+parent's `mChild`. The following invariants MUST hold:
 
-4. **During seal** (Step 13, via `unsealHeader`):
-   - `bucketListHash` ← computed from the BucketList after adding
-     all entries from this ledger.
+- **INV-L1: Single-child.** At any given time, a parent MUST have at most
+  one active child LedgerTxn. Construction of a second child MUST throw.
+- **INV-L2: Same-thread access.** A LedgerTxn MUST be accessed only from
+  the thread that opened it, until it is committed or rolled back.
+  Violation MUST abort the program.
+- A `LedgerTxn` MUST NOT be opened against a sealed parent or against a
+  parent that already has a child.
 
-5. **Fee pool and total coins**: Updated throughout transaction
-   application as fees are charged and inflation (if applicable) is
-   processed.
+### 7.2 Entry State Model
 
-### 8.2 Skip List
+Each entry stored in a LedgerTxn's `mEntry` map is associated with one of
+three states (see §3.6): `INIT`, `LIVE`, `DELETED`.
 
-The `skipList` array in the ledger header provides a geometric skip
-structure for efficient historical lookups. The skip list is an array
-of 4 `Hash` values, updated as follows:
+- `create(entry)` produces an `INIT` entry. It throws if any newer version
+  of the key (in self or any parent) already exists.
+- `load(key)` traverses parents, finds the newest version, and inserts a
+  `LIVE` copy into `mEntry` (the entry's state in the parent's map is left
+  unchanged). It throws if the key is already active in this LedgerTxn.
+- `erase(key)` produces a `DELETED` entry. It throws if no version of the
+  key exists in self or any parent. It throws if the key is currently
+  active.
+- `loadWithoutRecord(key)` is identical to `load` except no record is
+  written into `mEntry`; if a record already exists, that record's state
+  is retained.
 
-For a ledger with sequence number `N`, the skip list constants are:
+`createWithoutLoading`, `updateWithoutLoading`, `eraseWithoutLoading` are
+bulk-loading shortcuts that bypass the "loading" semantics and are used
+only by catchup's bucket-apply phase; they MUST NOT be used during
+transaction processing. The `eraseWithoutLoading` shortcut weakens the
+LedgerTxn's consistency to `EXTRA_DELETES` (see §7.9).
+
+### 7.3 Active-Entry Tracking
+
+A `LedgerTxn` maintains an `mActive` map of currently-handed-out
+`LedgerTxnEntry` handles. The handles are weakly linked to internal
+records; opening a child MUST deactivate all parent handles, preventing
+two concurrency anomalies:
+
+- **Stale reads** of parent entries while a child holds modified versions.
+- **Lost updates** when modifying a parent entry that the child has also
+  modified.
+
+A double-indirect handle design ensures that the destructor of a
+`LedgerTxnEntry` always removes its entry from `mActive` even after
+parent-side deactivation. Handles MUST NOT be retained across the lifetime
+of a sub-LedgerTxn.
+
+### 7.4 Sealing Semantics
+
+A `LedgerTxn` is **sealed** the first time any of `getChanges()`,
+`getDelta()`, or `getAllEntries()` is called, or as part of its own
+`commit()`. Sealing has these observable effects:
+
+- `mIsSealed` is set; further mutation throws.
+- `lastModifiedLedgerSeq` is updated on every non-deleted, non-sponsorship
+  entry to equal `mHeader->ledgerSeq` (if `mShouldUpdateLastModified`).
+- The multi-order-book is cleared.
+- Active handles are cleared.
+- The active header handle is reset.
+
+After sealing, only the header MAY be re-unsealed via `unsealHeader(f)`,
+which MUST NOT modify entries. This is used to write the `bucketListHash`
+and skip-list values into the header AFTER the entry set has been finalized
+(see §12.1).
+
+### 7.5 Commit and Rollback Semantics
+
+`LedgerTxn::commit()` MUST:
+
+1. Run `maybeUpdateLastModifiedThenInvokeThenSeal`, which seals self and
+   produces an iterator over `mEntry`.
+2. Invoke `parent.commitChild(iter, mRestoredEntries, mConsistency)`.
+3. Reset self (the implementation pointer).
+
+`LedgerTxn::Impl::commitChild(iter, restoredEntries, consistency)` MUST:
+
+1. Copy the child header into a unique pointer (for swap-based exception
+   safety).
+2. If self has any active entries, abort (active parent entries during
+   child commit is a logic error).
+3. For each `(key, entryPtr)` in the iterator, invoke `updateEntry(key,
+   ..., entryPtr, /*effectiveActive=*/false)` on self.
+4. Update self's worst-best-offer map via `forAllWorstBestOffers` on the
+   child.
+5. Merge `restoredEntries` from child into self via `addRestoresFrom`. The
+   per-key uniqueness MUST be preserved across the merge: a key restored
+   in the child MUST NOT already be restored in self.
+6. Update consistency: `mConsistency = max(mConsistency, cons)` where
+   `EXTRA_DELETES > EXACT`.
+7. Swap in the child header.
+8. Clear `mChild`.
+
+`LedgerTxn::rollback()` MUST simply notify the parent (which clears
+`mChild`) and reset self. No changes propagate.
+
+### 7.6 Entry Merge Matrix
+
+When committing a child into a parent, each child entry is merged with
+the corresponding parent entry (if any) at the same key. The merge rules
+are summarized in Appendix A; the key non-trivial cases are:
+
+- **Parent INIT, Child DELETED**: the parent entry is annihilated
+  (removed from `mEntry`). This represents an entry that was created and
+  immediately deleted within the lifetime of the closer transaction and
+  has no observable effect on the database.
+- **Parent DELETED, Child INIT**: the merged state is `LIVE`. The entry
+  was deleted at the parent level but a child re-creates it; this can
+  occur only because the deleted entry must have existed prior to the
+  delete (otherwise the delete would have thrown).
+- **Parent LIVE, Child INIT**: MUST throw `cannot commit a child init
+  entry into a parent live entry`. A child cannot validly INIT an entry
+  the parent already considers LIVE.
+- **Parent INIT, Child INIT**: not possible by `create` semantics — a
+  `create` throws if any parent has the key.
+- **Parent DELETED, Child LIVE**: MUST throw `cannot set deleted entry
+  to live`.
+- **Parent DELETED, Child DELETED**: MUST throw `cannot delete deleted
+  entry`.
+
+See Appendix A for the complete 3x3 matrix.
+
+### 7.7 Last-Modified Stamping
+
+Inside the seal-and-store helper, for every non-deleted entry of
+`LEDGER_ENTRY` type, `lastModifiedLedgerSeq` MUST be set to the current
+`mHeader->ledgerSeq` if the LedgerTxn was constructed with
+`shouldUpdateLastModified = true` (the default). This is the unique source
+of `lastModifiedLedgerSeq` for normally-applied transactions.
+
+### 7.8 getAllEntries / getChanges / getDelta
+
+These three accessors all seal the LedgerTxn:
+
+- `getAllEntries(initEntries, liveEntries, deadEntries)` partitions
+  `LEDGER_ENTRY` entries: `INIT` -> initEntries, `LIVE` -> liveEntries,
+  `DELETED` -> deadEntries (as keys). Non-`LEDGER_ENTRY` entries are
+  skipped. This is the input to `BucketManager::addLiveBatch`.
+- `getChanges()` produces an XDR `LedgerEntryChanges` array in
+  (`CREATED` / `STATE` + `UPDATED` / `STATE` + `REMOVED`) form, used for
+  the meta. This MUST NOT be called on a LedgerTxn with `EXTRA_DELETES`
+  consistency.
+- `getDelta()` produces a structured `(current, previous)` pair per entry
+  for the Invariants subsystem.
+
+### 7.9 LedgerTxnConsistency
+
+A LedgerTxn's `mConsistency` is one of:
+
+| Value | Meaning |
+|---|---|
+| `EXACT` | The LedgerTxn faithfully reflects the database. Default. |
+| `EXTRA_DELETES` | At least one `eraseWithoutLoading` call has occurred; the LedgerTxn MAY contain spurious deletes for keys that never existed. `getChanges` / `getDelta` / `getDeadEntries` MUST NOT be invoked on such a LedgerTxn. |
+
+`createWithoutLoading` does not weaken consistency — INIT-then-DELETE is
+stored the same way as just INIT (and is annihilated naturally).
+
+### 7.10 Configuration Settings Are Immutable
+
+Erasure of a `CONFIG_SETTING` key MUST throw `Configuration settings
+cannot be erased`. Config settings MAY only be created (during the V20
+upgrade or subsequent upgrades) and updated (via config upgrades).
+
+---
+
+## 8. Protocol and Network Upgrades
+
+`StellarValue.upgrades` is a list of `UpgradeType` opaque XDR blobs.
+After transaction application, the pipeline applies upgrades sequentially.
+
+### 8.1 Upgrade Types
+
+`LedgerUpgrade` is an XDR union over the following types:
+
+| Type | Field | Effect |
+|---|---|---|
+| `LEDGER_UPGRADE_VERSION` | `newLedgerVersion: uint32` | Sets `header.ledgerVersion`. Triggers `applyVersionUpgrade`, which MAY also create new ledger entries (Soroban config in v20+, etc.). |
+| `LEDGER_UPGRADE_BASE_FEE` | `newBaseFee: uint32` | Sets `header.baseFee`. |
+| `LEDGER_UPGRADE_MAX_TX_SET_SIZE` | `newMaxTxSetSize: uint32` | Sets `header.maxTxSetSize`. |
+| `LEDGER_UPGRADE_BASE_RESERVE` | `newBaseReserve: uint32` | Sets `header.baseReserve` and runs the liability-rescaling upgrade. |
+| `LEDGER_UPGRADE_FLAGS` | `newFlags: uint32` | Sets `header.ext.v1().flags`. |
+| `LEDGER_UPGRADE_CONFIG` | `newConfig: ConfigUpgradeSetKey` | Applies a network-config upgrade encoded as a `ConfigUpgradeSetFrame` retrieved from a `CONTRACT_DATA` entry. |
+| `LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE` | `newMaxSorobanTxSetSize: uint32` | Updates the Soroban max-tx-count config setting. |
+
+### 8.2 Upgrade Validation (`isValidForApply`)
+
+For each `UpgradeType`:
+
+1. Deserialize as `LedgerUpgrade`. If deserialization fails, return
+   `XDR_INVALID`.
+2. Run type-specific validity checks (e.g., the new protocol version is
+   supported and is monotonically increasing; the new flags are
+   recognized; the config upgrade key resolves to a valid
+   `ConfigUpgradeSet`). On failure, return `INVALID`.
+3. Otherwise, return `VALID`.
+
+Invalid upgrades MUST be **skipped, not aborted**. The pipeline logs and
+continues with the next upgrade.
+
+### 8.3 Upgrade Application
+
+For each `VALID` upgrade `lupgrade`, the pipeline opens a nested LedgerTxn
+`ltxUpgrade(ltx)` and invokes `Upgrades::applyTo(lupgrade, app, ltxUpgrade)`:
+
+- `LEDGER_UPGRADE_VERSION`: `applyVersionUpgrade` sets the new
+  `ledgerVersion` and, if upgrading **into** a Soroban-enabled protocol
+  version, MAY create the initial `CONFIG_SETTING` entries via
+  `SorobanNetworkConfig::createLedgerEntriesForV20`,
+  `createCostTypesForV21`, `createCostTypesForV22`,
+  `createAndUpdateLedgerEntriesForV23`, `createCostTypesForV25`,
+  `updateCostTypesForV26`, `createLedgerEntriesForV26`, as applicable to
+  the new version.
+- `LEDGER_UPGRADE_BASE_FEE` / `MAX_TX_SET_SIZE` / `FLAGS`: a simple header
+  field assignment.
+- `LEDGER_UPGRADE_BASE_RESERVE`: updates the reserve and rescales any
+  pending liabilities/sponsorships affected by the new reserve.
+- `LEDGER_UPGRADE_CONFIG`: loads the `ConfigUpgradeSetFrame` from the
+  ledger via the embedded `ConfigUpgradeSetKey`, re-validates it
+  (`isValidForApply()` MUST return `VALID`), and applies it to `ltx` via
+  `ConfigUpgradeSetFrame::applyTo`.
+- `LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE`: updates the Soroban
+  parallel-execution config setting.
+
+After each upgrade, `ltxUpgrade.getChanges()` is captured into
+`meta.upgradesProcessing[i]` (as an `UpgradeEntryMeta` with the
+canonicalized `lupgrade` and its `LedgerEntryChanges`), then
+`ltxUpgrade.commit()` flushes the upgrade into `ltx`.
+
+Exceptions thrown by `Upgrades::applyTo` MUST be caught; the upgrade is
+logged and skipped. `upgradeApplied` is set to true iff at least one
+upgrade was applied successfully.
+
+### 8.4 Protocol-Version Side Effects on the Pipeline
+
+A protocol-version upgrade may have downstream effects observable later
+in the same close cycle:
+
+- The `initialLedgerVers` (captured before upgrades) MUST be used to drive
+  the meta version selection and the "in pre-upgrade protocol" branches
+  in `finalizeLedgerTxnChanges`. The `maybeNewVersion` MUST be used for
+  history-checkpoint queuing (Step 1 of §4.11) and for evaluating
+  protocol-version branches that depend on the upgraded version.
+- A version upgrade **into** Soroban (P20) MAY emit Soroban-meta fields
+  but only if `initialLedgerVers >= SOROBAN_PROTOCOL_VERSION` already;
+  otherwise meta is v0 and Soroban fields MUST NOT be set.
+- A version upgrade from P23 to P24 on a production network MUST invoke
+  the `p23_hot_archive_bug` correction path when adding the hot-archive
+  batch.
+- If a protocol or config upgrade alters the in-memory Soroban state-size
+  formula, `handleUpgradeAffectingSorobanInMemoryStateSize` MUST be
+  called to recompute and overwrite all stored state-size snapshots
+  before the size-sensitive next step proceeds.
+
+---
+
+## 9. Ledger Header Management
+
+### 9.1 Header Update Sequence
+
+Within `applyLedger`, the header is mutated in the following order:
+
+1. `ledgerSeq += 1` (immediately after opening the root LedgerTxn).
+2. `previousLedgerHash = SHA-256(prevHeader)`.
+3. `scpValue = ledgerData.value` (which sets `closeTime`, `txSetHash`,
+   `upgrades`).
+4. Transaction application MAY indirectly mutate header fields via
+   operations (e.g., `Inflation` increases `inflationSeq`; account-merge
+   and offer creation update `idPool`; fees are added to `feePool`).
+5. After tx-apply, `txSetResultHash = SHA-256(txResultSet)`.
+6. Upgrades MAY mutate header fields (`ledgerVersion`, `baseFee`,
+   `maxTxSetSize`, `baseReserve`, `ext.v1().flags`).
+7. The LedgerTxn is sealed; the header is then unsealed via
+   `unsealHeader(f)` for the final updates:
+   - `bucketListHash` is set by `BucketManager::snapshotLedger(header)`.
+   - `skipList` is updated by `calculateSkipValues(header)` (see §9.3).
+
+After `unsealHeader` completes, the header is finalized and its SHA-256 is
+the canonical ledger hash.
+
+### 9.2 Validity
+
+A `LedgerHeader` MUST be considered valid (for storage) iff:
+
+- `ledgerSeq <= INT32_MAX`.
+- `scpValue.closeTime <= INT64_MAX`.
+- `feePool >= 0`.
+- `idPool <= INT64_MAX`.
+
+A pipeline MUST refuse to load or persist a header that fails these checks.
+
+### 9.3 Skip List Construction
+
+The `skipList` field is a fixed-size array of 4 hashes. After
+`bucketListHash` is set, the skip list is updated according to the current
+`ledgerSeq` modulo the skip constants:
 
 ```
-SKIP_1 = 50
-SKIP_2 = 5000
-SKIP_3 = 50000
+SKIP_1 =     50
+SKIP_2 =   5000
+SKIP_3 =  50000
 SKIP_4 = 500000
 ```
 
-The update algorithm uses **nested** conditions (not mutually exclusive
-else-if). Multiple slots may shift in a single call:
+Algorithm (`calculateSkipValues`):
 
 ```
-if (N mod SKIP_1) == 0:
-    v = N - SKIP_1
-    if v > 0 and (v mod SKIP_2) == 0:
-        v2 = N - SKIP_2 - SKIP_1
+if (ledgerSeq mod SKIP_1) == 0:
+    v1 = ledgerSeq - SKIP_1
+    if v1 > 0 and (v1 mod SKIP_2) == 0:
+        v2 = ledgerSeq - SKIP_2 - SKIP_1
         if v2 > 0 and (v2 mod SKIP_3) == 0:
-            v3 = N - SKIP_3 - SKIP_2 - SKIP_1
+            v3 = ledgerSeq - SKIP_3 - SKIP_2 - SKIP_1
             if v3 > 0 and (v3 mod SKIP_4) == 0:
                 skipList[3] = skipList[2]
             skipList[2] = skipList[1]
         skipList[1] = skipList[0]
-    skipList[0] = currentHeader.bucketListHash
+    skipList[0] = bucketListHash
 ```
 
-Key details:
-- The value stored in `skipList[0]` is `currentHeader.bucketListHash`
-  (the BucketList hash of the current ledger being closed), NOT a hash
-  of the previous ledger header.
-- Values cascade upward: `[0]→[1]`, `[1]→[2]`, `[2]→[3]` — the
-  oldest value is pushed to higher indices.
-- The conditions are nested, meaning that at certain ledger numbers
-  (e.g., when all conditions are met), multiple shifts happen in a
-  single invocation.
+Cascading semantics: at every `SKIP_1` boundary, `skipList[0]` is
+overwritten with the new `bucketListHash`. At deeper boundaries the older
+slots are shifted up by one before the overwrite. See Appendix C for a
+worked example.
 
-Note: The skip list is updated during the `unsealHeader` callback,
-not during the initial header setup.
+### 9.4 Hash Computation
 
-### 8.3 Ledger Hash Computation
+The canonical hash of a `LedgerHeader` is `SHA-256(xdr_encode(header))`.
+All cross-ledger references — `previousLedgerHash`, the entries in
+`skipList`, the `expectedHash` field of `LedgerCloseData`, and references
+in archived `LedgerHeaderHistoryEntry`s — use this canonical hash.
 
-The ledger hash is computed as:
-```
-ledgerHash = SHA256(XDR_serialize(ledgerHeader))
-```
-
-This hash uniquely identifies a ledger and is stored in the
-`LedgerHeaderHistoryEntry` alongside the header. The
-`previousLedgerHash` field in each ledger header creates a hash chain
-linking all ledgers.
-
-### 8.4 Persistence
-
-Ledger headers are stored in the persistent database. The storage
-operation records:
-
-1. The `LedgerHeader` serialized as XDR.
-2. The `ledgerHash`.
-3. The `previousLedgerHash` (for indexed lookups).
-
-The most recent ledger header hash is also stored in the persistent
-state table as `kLastClosedLedger` for crash recovery.
-
-Before any header is stored or accepted from persistent storage, an
-implementation MUST validate the following well-formedness predicates:
-
-```
-ledgerHeader.ledgerSeq <= INT32_MAX
-ledgerHeader.scpValue.closeTime <= INT64_MAX
-ledgerHeader.feePool >= 0
-ledgerHeader.idPool <= INT64_MAX
-```
-
-A header that fails any predicate MUST be rejected. The same predicate
-is applied both when writing a freshly closed header and when decoding
-a header read back from the database; a stored header that fails the
-predicate indicates database corruption and MUST be treated as a fatal
-error.
+@version(>=23) The bucket-list hash that feeds `bucketListHash` is
+`SHA-256(liveBLHash || hotArchiveBLHash)`; @version(<23) it is the live
+bucket list hash directly.
 
 ---
 
-## 9. Network Configuration
+## 10. Soroban Network Configuration
 
-### 9.1 Overview
+The Soroban network configuration is a set of `CONFIG_SETTING` ledger
+entries written at the Protocol 20 upgrade and updated by subsequent
+protocol-version and config upgrades. It governs Soroban resource limits,
+cost model parameters, rent fees, eviction settings, and (from Protocol 23)
+SCP timing.
 
-The network configuration subsystem manages consensus-agreed parameters
-that govern network behavior. It is divided into two categories:
+### 10.1 Setting Categories
 
-1. **Legacy header parameters**: `baseFee`, `baseReserve`,
-   `maxTxSetSize`, `ledgerVersion` — stored directly in the ledger
-   header.
-2. **Soroban configuration** (protocol 20+): A set of typed
-   `CONFIG_SETTING` entries stored in the ledger state, governing
-   smart contract execution limits, fees, and resource constraints.
+| Category | Fields (representative) |
+|---|---|
+| Contract size | `maxContractSizeBytes`, `maxContractDataKeySizeBytes`, `maxContractDataEntrySizeBytes`. |
+| Compute | `ledgerMaxInstructions`, `txMaxInstructions`, `feeRatePerInstructionsIncrement`, `txMemoryLimit`. |
+| Ledger access | `ledgerMaxDiskReadEntries`, `ledgerMaxDiskReadBytes`, `ledgerMaxWriteLedgerEntries`, `ledgerMaxWriteBytes`, plus per-tx versions; per-entry and per-1KB read/write fees. |
+| Historical | `feeHistorical1KB`. |
+| Contract events | `txMaxContractEventsSizeBytes`, `feeContractEventsSize1KB`. |
+| Bandwidth | `ledgerMaxTransactionSizesBytes`, `txMaxSizeBytes`, `feeTransactionSize1KB`. |
+| State archival | `maxEntriesToArchive`, `minPersistentEntryLifetime`, `minTemporaryEntryLifetime`, `maxEntryLifetime`, eviction iterator, rent-rate denominators, state-size sliding window. |
+| Cost model | `cpuCostParams`, `memCostParams` arrays of `(linearTerm, constantTerm)` tuples per host-function cost type. |
+| Execution lanes | `ledgerMaxTxCount`. |
+| Parallel execution | `ledgerMaxDependentTxClusters` (MUST NOT exceed `MAX_LEDGER_DEPENDENT_TX_CLUSTERS = 128`). |
+| Soroban state size | `sorobanStateTargetSizeBytes`, `rentFee1KBSorobanStateSizeLow`, `rentFee1KBSorobanStateSizeHigh`, `sorobanStateRentFeeGrowthFactor`. |
+| SCP timing (P23+) | `ledgerTargetCloseTimeMilliseconds`, `nominationTimeoutInitialMs`, `nominationTimeoutIncrementMs`, `ballotTimeoutInitialMs`, `ballotTimeoutIncrementMs` (bounded by `Minimum` / `MaximumSorobanNetworkConfig`). |
+| Ledger cost extension (P23+) | `feeFlatRateWrite1KB`, `txMaxFootprintEntries`. |
 
-### 9.2 Soroban Configuration Settings
+### 10.2 Minimum Values on Upgrade
 
-The following configuration setting types exist (introduced at the
-indicated protocol version):
+The `MinimumSorobanNetworkConfig` struct defines the lower bounds an
+upgrade MUST satisfy (e.g., `TX_MAX_READ_LEDGER_ENTRIES >= 3`,
+`TX_MAX_SIZE_BYTES >= 10000`, `MAXIMUM_ENTRY_LIFETIME <= 1054080`, ...).
+An upgrade that does not satisfy the minimums MUST be rejected by
+`isValidConfigSettingEntry`.
 
-| Setting ID | Name | Protocol | Description |
-|-----------|------|----------|-------------|
-| 0 | `CONTRACT_MAX_SIZE_BYTES` | 20 | Maximum WASM bytecode size. |
-| 1 | `CONTRACT_COMPUTE` | 20 | CPU instruction limits per transaction and ledger. |
-| 2 | `CONTRACT_LEDGER_COST` | 20 | Ledger entry read/write limits and sizes. |
-| 3 | `CONTRACT_HISTORICAL_DATA` | 20 | Historical storage fee parameters. |
-| 4 | `CONTRACT_EVENTS` | 20 | Event size limits. |
-| 5 | `CONTRACT_BANDWIDTH` | 20 | Transaction size and bandwidth limits. |
-| 6 | `CONTRACT_COST_PARAMS_CPU` | 20 | CPU cost model parameters (per host function). |
-| 7 | `CONTRACT_COST_PARAMS_MEMORY` | 20 | Memory cost model parameters (per host function). |
-| 8 | `CONTRACT_DATA_KEY_SIZE_BYTES` | 20 | Maximum contract data key size. |
-| 9 | `CONTRACT_DATA_ENTRY_SIZE_BYTES` | 20 | Maximum contract data entry size. |
-| 10 | `STATE_ARCHIVAL` | 20 | Eviction and archival parameters (min TTLs, max entry size, scan limits). |
-| 11 | `CONTRACT_EXECUTION_LANES` | 20 | Number of execution lanes for parallel processing. |
-| 12 | `BUCKETLIST_SIZE_WINDOW` | 20 | Sliding window of BucketList sizes for rent fee computation. |
-| 13 | `EVICTION_ITERATOR` | 20 | Current position of the eviction scan iterator. |
-| 14 | `CONTRACT_PARALLEL_COMPUTE` | 23 | Parallel Soroban execution settings (`ledgerMaxDependentTxClusters`). Upper bound: 128. See CAP-0063. |
-| 15 | `CONTRACT_LEDGER_COST_EXT` | 23 | Extended ledger cost parameters: `txMaxFootprintEntries` (max total read+write footprint entries per tx) and `feeWrite1KB` (flat-rate write fee per KB). |
-| 16 | `SCP_TIMING` | 23 | On-chain SCP consensus timing: `ledgerTargetCloseTimeMilliseconds`, `nominationTimeoutInitialMilliseconds`, `nominationTimeoutIncrementMilliseconds`, `ballotTimeoutInitialMilliseconds`, `ballotTimeoutIncrementMilliseconds`. See CAP-0070. |
+### 10.3 Loading
 
-### 9.3 Configuration Loading
+`SorobanNetworkConfig::loadFromLedger(LedgerSnapshot | Snapshot | LedgerTxn)`
+reads every relevant `CONFIG_SETTING` entry by `ConfigSettingID` and
+populates an in-memory `SorobanNetworkConfig` struct. The pipeline MUST
+load the config from the current `ltx` once at the start of the apply
+phase (for the parallel-phase invocation) and again at the end of
+`finalizeLedgerTxnChanges` (for the post-upgrade meta).
 
-Soroban network configuration MUST be loaded from the ledger state at
-specific points during the ledger close pipeline:
+### 10.4 State-Size Sliding Window
 
-1. **Before transaction application**: The configuration is loaded to
-   provide transaction resource limits and cost parameters.
-2. **After upgrades**: The configuration is reloaded to reflect any
-   config upgrades applied in this ledger. This reload provides the
-   final configuration state for the `CompleteConstLedgerState`.
+A sliding window of `sorobanStateSize` samples is maintained in the
+`CONFIG_SETTING_STATE_ARCHIVAL` entry. At each ledger whose `ledgerSeq`
+is divisible by the window's `samplePeriod`, the oldest entry is dropped
+and a new sample is pushed:
 
-Configuration loading reads all `CONFIG_SETTING` entries from the
-current `LedgerTxn` and assembles them into a cached configuration
-object. This object is immutable for the duration of its use.
+- @version(<23): the sample is `bucketManager.getLiveBucketList().getSize()`.
+- @version(>=23): the sample is the in-memory Soroban state size as of the
+  start of the ledger (snapshotted **before** the in-memory state is
+  updated with this ledger's new entries — see §11.3).
 
-**Expected ledger close time**: The overlay and herder derive
-`expectedLedgerCloseTime` from configuration as follows:
-
-```
-if protocolVersion < 23:
-    expectedLedgerCloseTime = 5000 ms
-else:
-    expectedLedgerCloseTime =
-        SCP_TIMING.ledgerTargetCloseTimeMilliseconds
-```
-
-The constant 5000 ms is `TARGET_LEDGER_CLOSE_TIME_BEFORE_PROTOCOL_VERSION_23_MS`.
-
-### 9.4 Non-Upgradeable Settings
-
-The following settings are NOT upgradeable through the config upgrade
-mechanism and are instead updated internally by the ledger close
-pipeline:
-
-- `BUCKETLIST_SIZE_WINDOW`: Updated during the finalize step based on
-  the current BucketList size (Section 11).
-- `EVICTION_ITERATOR`: Updated by the eviction scan subsystem (see
-  BucketListDB Specification, Section 12).
-
-**State-size-window resize on config upgrade**: A `LEDGER_UPGRADE_CONFIG`
-that changes `STATE_ARCHIVAL.liveSorobanStateSizeWindowSampleSize` MUST
-resize the `BUCKETLIST_SIZE_WINDOW` deterministically:
-
-- If the new sample-window size equals the current size: no change.
-- If the new size is **smaller**: drop the oldest entries (from the
-  front) until the window has the new size.
-- If the new size is **larger**: backfill at the front by replicating
-  the current oldest entry so the new slots are the first to be
-  replaced by subsequent snapshots.
-
-After resizing, `window.length` MUST equal the new size.
-
-**Sampling cadence**: A new state-size snapshot is appended to
-`BUCKETLIST_SIZE_WINDOW` only when
-`currentLedgerSeq mod STATE_ARCHIVAL.liveSorobanStateSizeWindowSamplePeriod == 0`.
-On sampling, the oldest entry is removed and the new sample is pushed
-to the back. Before protocol 23, the snapshot value is the live
-BucketList size; from protocol 23 onward, it is the in-memory Soroban
-state size (Section 10.4).
-
-**State-size recomputation on protocol upgrade**: A
-`LEDGER_UPGRADE_VERSION` that triggers
-`handleUpgradeAffectingSorobanInMemoryStateSize` (e.g., crossing into
-protocol 23) MUST overwrite **every** slot of `BUCKETLIST_SIZE_WINDOW`
-with the newly recomputed in-memory Soroban state size. This is the
-only path that mutates more than one slot at a time, and it preserves
-window length.
-
-### 9.5 Cost Model
-
-The Soroban cost model defines per-host-function CPU and memory costs
-as linear models:
-
-```
-cost(size) = constTerm + linearTerm × size
-```
-
-Each host function has its own `constTerm` and `linearTerm` for both
-CPU and memory. The cost model parameters are stored in
-`CONTRACT_COST_PARAMS_CPU` and `CONTRACT_COST_PARAMS_MEMORY` and are
-updated during protocol version upgrades.
-
-The parameter arrays are sized per protocol version:
-
-| Protocol | Entry Count | Additions |
-|----------|------------|-----------|
-| 20 | 23 | Base cost types (IDs 0–22): Wasm execution, memory, hashing, Ed25519, ECDSA, integer ops, ChaCha20. |
-| 21 | 45 | Granular Wasm parse/instantiate types (IDs 23–42), secp256r1 verification (IDs 43–44). See CAP-0051/0054. |
-| 22–24 | 70 | BLS12-381 operations (IDs 45–69). See CAP-0059/0074. |
-| 25+ | 85 | BN254 operations (IDs 70–84): field encode/decode, G1/G2 point checks, G1 add/mul, pairing, Fr arithmetic. See CAP-0074/0075. |
-
-During protocol upgrades, the arrays are resized and new entries are
-populated with calibrated default values. All `constTerm` and
-`linearTerm` values MUST be non-negative.
-
-### 9.6 Rent Fee Computation
-
-The rent fee for Soroban state entries is computed using a two-phase
-piecewise-linear model based on the average Soroban state size.
-
-#### Step 1: Compute per-1KB rent write fee
-
-The average Soroban state size `S` is computed as the arithmetic mean
-of the sliding window of state size snapshots (the
-`BUCKETLIST_SIZE_WINDOW` configuration setting).
-
-Let:
-- `T` = `state_target_size_bytes`
-- `F_low` = `rent_fee_1kb_state_size_low`
-- `F_high` = `rent_fee_1kb_state_size_high`
-- `G` = `state_size_rent_fee_growth_factor`
-- `M` = `F_high - F_low` (fee rate multiplier)
-
-**Phase 1 (S < T):** Linear interpolation from `F_low` to `F_high`:
-```
-feePerKB = F_low + ceil(M × S / T)
-```
-
-**Phase 2 (S ≥ T):** Accelerated linear growth beyond the target:
-```
-feePerKB = F_high + ceil(M × (S - T) × G / T)
-```
-
-The result is clamped to a minimum of 1,000 stroops per 1KB.
-
-Note: `F_low` may be negative (protocol 23 sets it to −17,000),
-meaning the fee can be at the minimum floor for small state sizes.
-
-#### Step 2: Compute per-entry rent fee
-
-For each entry, the rent fee is:
-```
-rentFee = ceil(entrySize × feePerKB × rentLedgers / (1024 × rentRateDenominator))
-```
-
-where `rentRateDenominator` differs for persistent vs temporary
-entries. For `CONTRACT_CODE` entries, the result is further divided
-by a code entry rent discount factor of 3.
-
-The rent fee computation is implemented in the Soroban host (Rust),
-not in the C++ layer. The C++ side calls into the Rust bridge with
-the configuration parameters and average state size.
-
-### 9.7 Resource Limits
-
-The network configuration defines resource limits at two levels:
-
-1. **Per-ledger limits** (returned by `maxLedgerResources`):
-   - For classic transactions: limits based on `maxTxSetSize`.
-   - For Soroban transactions: limits from the Soroban configuration
-     (CPU instructions, memory, read/write bytes, read/write entries,
-     transaction size).
-
-2. **Per-transaction limits** (returned by
-   `maxSorobanTransactionResources`): Maximum resources a single
-   Soroban transaction may consume.
+The window provides smoothed input to rent-fee computations.
 
 ---
 
-## 10. Soroban State Management
+## 11. Soroban State Management
 
-### 10.1 In-Memory Soroban State
+### 11.1 InMemorySorobanState
 
-For protocol 20+, the ledger close pipeline maintains an in-memory
-cache of all Soroban state entries (`CONTRACT_DATA`, `CONTRACT_CODE`,
-and `TTL` entries). This cache enables efficient state lookups during
-smart contract execution without requiring bucket list queries for
-every access.
+`InMemorySorobanState` is an in-memory map of all Soroban `CONTRACT_DATA`,
+`CONTRACT_CODE`, and TTL entries. It is co-located with the apply state
+and is the authoritative source for Soroban reads during transaction
+apply.
 
-### 10.2 State Population
+Co-location of TTL with its data:
 
-The in-memory Soroban state is populated:
+- `CONTRACT_DATA` entries are stored in `mContractDataEntries`, keyed by
+  the SHA-256 hash of the TTL key (`getTTLKey(contractDataKey).keyHash`).
+  Each entry carries its `liveUntilLedgerSeq` and `lastModifiedLedgerSeq`
+  inline.
+- `CONTRACT_CODE` entries are stored in `mContractCodeEntries`, keyed by
+  the TTL key hash. Each entry carries TTL data plus a `sizeBytes` field
+  reflecting the in-memory module size (used for the state-size
+  computation).
+- TTL entries are **not** stored separately; the TTL is folded into the
+  data/code entry. Lookup of a `TTL` key MUST reconstruct the TTL entry
+  from the underlying data/code entry's TTL fields.
 
-1. **At startup**: All Soroban entries are loaded from the BucketList
-   snapshot during the `SETTING_UP_STATE` phase.
-2. **After each ledger close**: The state is incrementally updated
-   with the entries created, modified, and deleted in that ledger.
+The state MUST be thread-safe for **concurrent reads** (during the
+`APPLYING` phase) but is not thread-safe for concurrent writes; the
+primary apply thread is the sole writer.
 
-### 10.3 TTL Co-location
+### 11.2 Update Sequence
 
-TTL entries are co-located with their parent Soroban entries in the
-in-memory state. When a `CONTRACT_DATA` or `CONTRACT_CODE` entry is
-loaded, its associated `TTL` entry is fetched and stored alongside it.
-This avoids separate lookups for TTL information during execution.
+After all transactions are applied and `getAllEntries(initEntries,
+liveEntries, deadEntries)` is invoked on the outer LedgerTxn:
 
-If a TTL entry arrives before its parent entry (a "pending TTL"), it
-is stored temporarily and associated when the parent entry is loaded.
+1. New `CONTRACT_CODE` entries are added to the module cache.
+2. `bucketManager.addLiveBatch(header, initEntries, liveEntries,
+   deadEntries)` is invoked.
+3. `applyState.updateInMemorySorobanState(initEntries, liveEntries,
+   deadEntries, header, sorobanConfig)` is invoked.
 
-**Pending-TTL drain invariant**: After every full `updateState`
-(applying a ledger's init/live/dead entries) and after
-`initializeStateFromSnapshot`, the pending-TTL buffer MUST be empty.
-A non-empty pending buffer at the end of an update indicates an
-orphaned TTL with no matching `CONTRACT_DATA`/`CONTRACT_CODE` entry
-and MUST abort.
+`updateState` MUST process the entries by category:
 
-**Ledger-seq monotonicity**: Each `updateState(initEntries,
-liveEntries, deadEntries, header, ...)` call MUST advance the
-in-memory state's tracked ledger sequence by exactly one — i.e.,
-`header.ledgerSeq == previousTrackedSeq + 1`. Skipping ledgers or
-re-applying the same ledger is a programming error and MUST abort.
+- For TTL entries (data type `TTL`), look up the data/code entry by key
+  hash and update its TTL fields. If a TTL arrives before its data entry
+  (only possible during initialization from a snapshot), buffer it in
+  `mPendingTTLs`.
+- For `CONTRACT_DATA` entries, create or update in `mContractDataEntries`.
+- For `CONTRACT_CODE` entries, create or update in `mContractCodeEntries`,
+  recomputing `sizeBytes` from the config and protocol version.
+- For deleted keys, remove the corresponding entries.
 
-### 10.4 State Size Tracking
+After update, `mLastClosedLedgerSeq = ledgerSeq`.
 
-The in-memory state tracks the total size of Soroban state separately
-for code and data:
+### 11.3 State-Size Snapshot Ordering
 
-- **Code size**: Total size of all `CONTRACT_CODE` entries. For
-  protocol 23+, this includes an estimated memory cost based on the
-  bytecode size.
-- **Data size**: Total size of all `CONTRACT_DATA` entries.
+The pipeline MUST snapshot the in-memory state size into the sliding
+window **before** the new ledger's entries are flushed into the in-memory
+state. As a result, the sample taken at ledger `N` reflects the state
+size at the end of ledger `N - 1`. This is a deliberate protocol-level
+ordering.
 
-These sizes feed into the BucketList size window for rent fee
-computation.
+### 11.4 Module Cache
 
-### 10.5 Module Cache
+The module cache is a Rust-side cache of compiled Wasm modules (one per
+protocol version in `mModuleCacheProtocols`, which spans
+`REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` through
+`Config::CURRENT_LEDGER_PROTOCOL_VERSION`). It is the sole compiled-form
+of contract code available to the Soroban host during apply.
 
-For protocol 23+, a contract module cache is maintained to avoid
-recompiling smart contract bytecode on every invocation:
+- On startup or after bucket-apply, `compileAllContractsInLedger(snap,
+  ledgerVersion)` populates the cache from the LCL snapshot.
+- On every `addLiveBatch`, contract code entries in `initEntries` and
+  `liveEntries` are compiled into the cache via
+  `addAnyContractsToModuleCache`.
+- On eviction or hot-archive transfer, `evictFromModuleCache` removes the
+  corresponding compiled modules.
+- After commit, `maybeRebuildModuleCache(snapshot, initialLedgerVers)`
+  MAY trigger a background recompile if the cache's memory-budget
+  estimate exceeds twice the last-recompile size times the per-byte
+  worst-case multiplier from `memCostParams[VmInstantiation]`.
 
-1. **Compilation**: All `CONTRACT_CODE` entries are compiled for all
-   supported protocol versions at startup and cached.
-2. **Incremental updates**: After each ledger close, newly added
-   contracts are compiled and added to the cache; evicted contracts
-   are removed. Evictions are processed before additions, so if the
-   same entry is both evicted and re-uploaded in a single ledger, the
-   cache will contain the entry after close.
-3. **Same-ledger upload**: A contract uploaded and invoked in the
-   same ledger incurs the full parse/validate/translate CPU cost.
-   The low-cost cached instantiation only applies starting in the
-   ledger after the contract is uploaded.
-4. **Rebuild heuristic**: If the cache memory arena has grown beyond
-   twice the last compiled size (adjusted by a memory cost model
-   multiplier), the entire cache is rebuilt to reclaim fragmented
-   memory.
-5. **Background compilation**: Compilation MAY occur on a background
-   thread. The pipeline MUST block at the start of the next ledger
-   close to await completion.
+A node MUST `finishPendingCompilation` before starting the next
+`applyLedger`.
 
----
+### 11.5 Hot Archive Restoration
 
-## 11. Commit and Persistence
+When a transaction's `RestoreFootprint` operation references a key that
+has been evicted to the hot archive:
 
-### 11.1 Seal and Store Procedure
+- The data and TTL entries are read from the hot archive bucket list
+  (see BUCKETLISTDB_SPEC §10), the TTL is recomputed using the current
+  network config, and the restored entries are re-created in `ltx`.
+- The keys are recorded into `mRestoredEntries.hotArchive`.
 
-The seal-and-store procedure finalizes the
-ledger close by committing all accumulated state changes. It MUST
-execute the following steps under a ledger state mutex:
+When a `RestoreFootprint` references a key still in the live bucket list
+but expired (TTL passed), only the TTL is updated; the entries are
+recorded into `mRestoredEntries.liveBucketList`.
 
-#### Step 1: Finalize LedgerTxn Changes
-
-The `finalizeLedgerTxnChanges` procedure:
-
-1. **Resolve eviction** (protocol 20+):
-   a. Load the Soroban configuration and collect all TTL keys.
-   b. Resolve the background eviction scan started at the previous
-      ledger. This produces a set of eviction candidates. Filter
-      candidates: any entry whose TTL key appears in the current
-       ledger's modified TTL key set (i.e., was touched by a
-      transaction in this ledger) MUST be excluded from eviction.
-      Additionally, if an eviction candidate's **live entry key**
-      appears in the current ledger's modified key set, the
-      implementation MUST treat this as an internal consistency
-      failure and MUST NOT evict the entry from the stale snapshot.
-      The remaining candidates form the final set of evicted entries.
-   c. For protocol 24+ (persistent eviction):
-      - Collect restored hot archive keys.
-      - Run consistency invariant checks.
-       - If upgrading from p23 to p24 **on mainnet only**
-         (CAP-0076): apply the hot archive entry fix. For each
-         of 478 hardcoded (corrupted, correct) entry pairs:
-         (1) If the entry does NOT exist in the Hot Archive,
-         log a warning and **skip** this entry (soft check —
-         the entry may have been restored before the upgrade).
-         (2) Entry state MUST match the known corrupted state
-         (`releaseAssert` — hard abort).
-         (3) Entry MUST NOT exist in live state
-         (`releaseAssert` — hard abort).
-         (4) Entry MUST NOT be in the current eviction batch
-         (`releaseAssert` — hard abort).
-         If all checks pass, append the correct entry to the
-         hot archive batch (overwriting the corrupted version).
-         These amendments are NOT reflected in `LedgerCloseMeta`
-         but are observable via the `bucketListHash` change.
-      - Otherwise, add hot archive entries via `addHotArchiveBatch`.
-      - Note: From protocol 24+, the eviction scan itself is
-        fixed — for persistent entries, a BucketList point
-        lookup is performed to ensure the newest version of
-        the entry is archived (see BUCKETLISTDB_SPEC
-        Invariant 10).
-   d. Populate evicted entries in the meta frame.
-   e. Remove evicted `CONTRACT_CODE` entries from the module cache.
-   f. Commit the eviction `LedgerTxn`.
-   g. Snapshot the Soroban state size (recording the size as of the
-      previous ledger, taken before flushing this ledger's entries).
-
-2. **Load final configuration**: Load the Soroban configuration at
-   the post-upgrade protocol version.
-
-3. **Seal the LedgerTxn**: Call `getAllEntries` to extract all
-   accumulated changes partitioned into init, live, and dead entries.
-   After this call, the LedgerTxn is sealed and accepts no further
-   modifications.
-
-4. **Update module cache**: Add any new `CONTRACT_CODE` entries from
-   the init/live partitions to the module cache.
-
-5. **Add to BucketList**: Call `addLiveBatch` on the live BucketList,
-   passing the init, live, and dead entries. This triggers the
-   BucketList level-add and potential merge operations (see
-   BucketListDB Specification).
-
-6. **Update in-memory Soroban state**: Apply the init, live, and
-   dead entries to the in-memory Soroban state cache.
-
-#### Step 2: Unseal Header and Persist
-
-Via the `unsealHeader` callback:
-
-1. **Snapshot BucketList**: Tell the BucketManager to snapshot the
-   current BucketList state. This computes the `bucketListHash`.
-
-2. **Update header**: Set `header.bucketListHash` to the computed
-   hash.
-
-3. **Store persistent state**: Write to persistent storage:
-   a. The LCL hash in `PersistentState::kLastClosedLedger`.
-   b. The `HistoryArchiveState` (derived from the current BucketList
-      structure) in `PersistentState::kHistoryArchiveState`.
-   c. The ledger header in the headers table.
-   d. If at a checkpoint boundary, append the header to the
-      checkpoint file.
-
-4. **Create new ledger state**: Construct a `CompleteConstLedgerState`
-   containing:
-   - The searchable live BucketList snapshot.
-   - The searchable hot archive BucketList snapshot (protocol 24+).
-   - The `LedgerHeaderHistoryEntry` (header + hash).
-   - The `HistoryArchiveState`.
-   - The Soroban network configuration (protocol 20+).
-
-   The constructed `CompleteConstLedgerState` MUST satisfy the
-   following consistency invariants:
-   - `historyArchiveState.currentLedger == header.ledgerSeq`.
-   - If `header.ledgerSeq > 0`, the live BucketList snapshot's
-     header MUST equal the just-finalized `header`.
-
-   Violation of either invariant indicates a programmer error and
-   MUST abort.
-
-#### Step 3: Conditional Module Cache Rebuild
-
-For protocol 23+, if the module cache arena has grown beyond the
-rebuild threshold, rebuild the entire module cache from the new
-BucketList snapshot.
-
-### 11.2 History Archive State
-
-The `HistoryArchiveState` (HAS) is a serialization of the BucketList
-structure at a given ledger. It records:
-
-- The ledger sequence number and network passphrase.
-- For each BucketList level: the current and snap bucket hashes, and
-  any pending future bucket merge state.
-- For protocol 24+: the hot archive bucket list state.
-
-The HAS is stored in the persistent database after every ledger close
-and published to history archives at checkpoint boundaries.
-
-### 11.3 Checkpoint Boundaries
-
-Checkpoints occur at regular intervals defined by:
-```
-CHECKPOINT_FREQUENCY = 64
-```
-
-A ledger is at a checkpoint boundary if:
-```
-(ledgerSeq + 1) mod CHECKPOINT_FREQUENCY == 0
-```
-
-At checkpoint boundaries, the pipeline queues the current ledger for
-history publishing, which includes the HAS, transaction sets, and
-ledger close metadata.
+The two maps MUST be disjoint within a single ledger (`INV-L5`,
+restored-entries mutual exclusion).
 
 ---
 
-## 12. Ledger Close Meta
+## 12. Commit and Persistence
 
-### 12.1 Overview
+### 12.1 Seal-and-Store (`sealLedgerTxnAndStoreInBucketsAndDB`)
 
-Ledger close metadata records all observable state changes produced by
-a ledger close, enabling downstream systems (indexers, explorers,
-analytics) to reconstruct state transitions without re-executing
-transactions.
+Under a mutex held against the live bucket list, the pipeline:
 
-### 12.2 Meta Versions
+1. Loads `ledgerHeader = ltx.loadHeader().current()`.
+2. Invokes `finalizeLedgerTxnChanges(lclSnapshot, lclHotArchiveSnapshot,
+   ltx, meta, ledgerHeader, initialLedgerVers)`:
+   - @version(>=20): resolves the background eviction scan against the
+     LCL snapshot and the modified-key set
+     (`ltx.getAllKeysWithoutSealing()`), producing
+     `EvictedStateVectors{deletedKeys, archivedEntries}`.
+   - @version(>=23): checks per-ledger invariants
+     (`checkOnLedgerCommit`); if this is the P23 -> P24 upgrade ledger
+     on the production network, the `p23_hot_archive_bug` fixup pathway
+     is applied; otherwise `bucketManager.addHotArchiveBatch(header,
+     archivedEntries, restoredHotArchiveKeys)` is invoked. The optional
+     `Protocol23CorruptionDataVerifier` MAY validate evicted entries
+     against a pre-loaded corruption dataset.
+   - @version(>=20): populates `meta.evictedKeys` (v1/v2 meta).
+   - @version(>=20): updates the module cache (evict + add).
+   - Snapshots the Soroban state size into the sliding window (§10.4).
+   - Loads `finalSorobanConfig` from the post-upgrade ledger.
+   - Calls `ltx.getAllEntries(initEntries, liveEntries, deadEntries)` —
+     this seals the LedgerTxn.
+   - Adds any new contract code to the module cache.
+   - Invokes `bucketManager.addLiveBatch(header, initEntries, liveEntries,
+     deadEntries)`.
+   - Invokes `applyState.updateInMemorySorobanState(...)`.
+3. Re-opens the header via `ltx.unsealHeader([&](LedgerHeader& lh){ ... })`
+   and:
+   - Calls `bucketManager.snapshotLedger(lh)` (sets `bucketListHash` and
+     skip-list).
+   - Calls `storePersistentStateAndLedgerHeaderInDB(lh,
+     /*appendToCheckpoint=*/true)` to persist the HAS, the encoded
+     header, and append the header to the current checkpoint.
+   - Builds the new `CompleteConstLedgerState` via
+     `advanceBucketListSnapshotAndMakeLedgerState(lh, has)` and stores
+     it in the local `res`.
+4. @version(>=REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION): triggers
+   `maybeRebuildModuleCache(snapshot, initialLedgerVers)`.
 
-The meta frame version is determined by the `initialLedgerVers`
-(the protocol version BEFORE any upgrades in this ledger):
+After return, the pipeline returns to `applyLedger`'s subtle 8-step
+sequence (§4.11) starting from Step 1.
 
-| initialLedgerVers | Meta Version | Description |
-|-------------------|-------------|-------------|
-| < 20 | v0 | Pre-Soroban format. |
-| 20–22 | v1 | Includes Soroban metadata, eviction info. |
-| ≥ 23 | v2 | Adds parallel Soroban transaction metadata. |
+### 12.2 Persistent State and HAS
 
-### 12.3 Meta Contents
+`storePersistentStateAndLedgerHeaderInDB(header, appendToCheckpoint)`:
 
-The meta frame contains:
+1. Builds a `HistoryArchiveState` from the live bucket list.
+   @version(>=FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION) the HAS
+   additionally includes the hot-archive bucket list.
+2. Persists `(kHistoryArchiveState, has.toString())` and
+   `(kLastClosedLedgerHeader, base64(xdr_encode(header)))` into
+   `PersistentState` (in the LCL table).
+3. If `appendToCheckpoint`, appends `header` to the in-progress checkpoint
+   file via `HistoryManager::appendLedgerHeader`.
 
-| Component | Description |
-|-----------|-------------|
-| **Transaction set** | The applied transaction set. |
-| **Fee processing changes** | State changes from fee and sequence number processing. |
-| **Transaction metadata** | Per-transaction state changes, events, and return values. For v2, this includes per-stage, per-cluster metadata. |
-| **Upgrade metadata** | State changes from each protocol upgrade applied. |
-| **Evicted entries** | Soroban entries evicted in this ledger (protocol 20+). |
-| **Network configuration** | Current Soroban network config (protocol 20+). |
+The HAS is the durable serialization of the bucket-list state and is the
+unit of recovery: on restart, the bucket manager rehydrates from the
+stored HAS, and the LCL is reconstructed by decoding
+`kLastClosedLedgerHeader`. The two MUST agree on `ledgerSeq`; a mismatch
+MUST be treated as database corruption (see INV-L13).
 
-### 12.4 Evicted Entries Partitioning
+### 12.3 Last Closed Ledger State
 
-The `evictedKeys` field in the v1/v2 meta frame is populated from the
-finalize step's eviction result (Section 11.1) and partitioned as
-follows:
+After persistence, the pipeline constructs a `CompleteConstLedgerState`
+containing:
 
-- For each `key` in `evictedState.deletedKeys`: the key's type MUST
-  be either a temporary entry type (`CONTRACT_DATA` with
-  `durability == TEMPORARY`) or `TTL`. The key is appended directly
-  to `evictedKeys` (no payload — these are deletions).
-- For each `entry` in `evictedState.archivedEntries`: the entry MUST
-  be a persistent entry (`CONTRACT_DATA` with
-  `durability == PERSISTENT`, or `CONTRACT_CODE`). The entry's
-  `LedgerKey` is appended to `evictedKeys`.
+| Component | Source |
+|---|---|
+| `bucketSnapshot` | A new searchable snapshot of the live bucket list. |
+| `hotArchiveSnapshot` | A new searchable snapshot of the hot archive bucket list. |
+| `lastClosedLedgerHeader` | `(header, SHA-256(header))`. |
+| `historyArchiveState` | The HAS computed above. |
+| `sorobanConfig` (optional) | Loaded from the post-apply ledger (protocol >= 20). |
 
-Violation of either type predicate indicates an internal consistency
-failure and MUST abort.
-
-Meta frames at version 0 do NOT carry evicted entries. The
-`populateEvictedEntries` step is skipped when the meta frame version
-is 0.
-
-### 12.5 Meta Streaming
-
-Meta frames are emitted to a configured output stream after the
-ledger is sealed but before the final commit sequence. The stream is
-configured at startup and can target a file or a pipe. If the stream
-is not configured, meta construction is skipped entirely.
-
----
-
-## 13. Genesis Ledger
-
-### 13.1 Genesis Constants
-
-The genesis ledger (sequence number 1) is bootstrapped with the
-following constants:
-
-| Parameter | Value |
-|-----------|-------|
-| `ledgerSeq` | 1 |
-| `ledgerVersion` | 0 |
-| `baseFee` | 100 stroops |
-| `baseReserve` | 100,000,000 stroops (10 XLM) |
-| `maxTxSetSize` | 100 operations |
-| `totalCoins` | 1,000,000,000,000,000,000 stroops (100 billion XLM) |
-| `feePool` | 0 |
-| `inflationSeq` | 0 |
-| `idPool` | 0 |
-| `previousLedgerHash` | all zeros |
-| `scpValue` | empty |
-| `txSetResultHash` | all zeros |
-| `bucketListHash` | computed from the genesis entries |
-
-### 13.2 Genesis Procedure
-
-The `startNewLedger` procedure creates the genesis state:
-
-1. Create a `LedgerHeader` with the genesis constants.
-2. Open a `LedgerTxn` on an empty state.
-3. Create the root account:
-   - **Public key**: Derived from the network ID (the SHA-256 hash of
-     the network passphrase, interpreted as a key seed, from which the
-     Ed25519 public key is derived).
-   - **Balance**: `totalCoins` (the entire supply).
-   - **Sequence number**: 0.
-   - **Thresholds**: `[1, 0, 0, 0]` (master weight 1, all thresholds
-     0).
-4. Seal and persist the genesis ledger, computing the genesis
-   `bucketListHash`.
-5. Commit the `LedgerTxn`, which flushes accumulated offer changes
-   (if any) to persistent storage.
-6. Advance the LCL to the genesis state.
+This state is shared (immutable) and replaces the previous LCL state on
+the main thread (`mLastClosedLedgerState`). It is the snapshot served to
+external readers between this close and the next.
 
 ---
 
-## 14. Threading Model
+## 13. Ledger Close Meta
 
-### 14.1 Thread Roles
+### 13.1 Selection
 
-The ledger close pipeline uses two primary thread contexts:
+`LedgerCloseMetaFrame` is constructed at the protocol version active at
+the start of the ledger (`initialLedgerVers`). The version selected is:
 
-| Thread | Responsibilities |
-|--------|-----------------|
-| **Main thread** | Handles all LCL state queries, LCL state publishing, herder notification, and state machine transitions that require main-thread context. |
-| **Apply thread** | Executes the `applyLedger` pipeline (may be the main thread in single-threaded mode). |
+```
+@version(<20)               -> v0
+@version(>=20 and <23)      -> v1
+@version(>=23)              -> v2
+```
 
-Additionally, for parallel Soroban execution (protocol 23+):
+A `LEDGER_UPGRADE_VERSION` to a higher meta version within the same
+ledger does NOT bump the meta version: the meta MUST remain at the
+initial version, because it is structurally shaped at construction time.
 
-| Thread | Responsibilities |
-|--------|-----------------|
-| **Execution threads** | Short-lived threads spawned per cluster for parallel Soroban transaction execution. Read-only access to the apply state. |
+### 13.2 Contents
 
-In v25.2.2, parallel Soroban apply is enabled by default for protocol
-23+. The previous experimental flag has been removed.
+| Field | v0 | v1 | v2 |
+|---|---|---|---|
+| `ledgerHeader` | yes | yes | yes |
+| `txSet` | yes | yes | yes |
+| `txProcessing[i].feeProcessing` | yes | yes | yes |
+| `txProcessing[i].txApplyProcessing` | yes | yes | yes |
+| `txProcessing[i].result` | yes | yes | yes |
+| `txProcessing[i].postTxApplyFeeProcessing` | no | no | yes |
+| `upgradesProcessing[]` | yes | yes | yes |
+| `evictedKeys[]` | no | yes | yes |
+| `totalByteSizeOfLiveSorobanState` | no | yes | yes |
+| `ext.v1().sorobanFeeWrite1KB` | no | optional | optional |
 
-### 14.2 Thread Safety
+Eviction-key entries `evictedKeys[]` MUST contain temporary and TTL keys
+that were deleted plus the keys of persistent entries that were
+archived (NOT the entries themselves).
 
-1. The `CompleteConstLedgerState` (LCL) is immutable and can be read
-   from any thread.
-2. The apply state is writable only during the
-   `SETTING_UP_STATE` and `COMMITTING` phases. During `APPLYING`, it
-   is read-only (except through the `LedgerTxn` system).
-3. The seal-and-store procedure executes under a ledger state mutex.
-4. The LCL publish procedure MUST execute on the main thread. If the
-   apply thread is separate, this is achieved by posting the work to
-   the main thread's event loop.
-5. Bucket garbage collection executes under the same ledger state
-   mutex as the seal procedure.
+### 13.3 Construction Order
 
-### 14.3 Background Work
+The pipeline MUST populate the meta in this order:
 
-The following operations may execute on background threads:
+1. `populateTxSet(txSet)`.
+2. Per transaction: `pushTxFeeProcessing(feeChanges)` during the fee phase.
+3. Per transaction: `setTxProcessingMetaAndResultPair(tm, result, index)`
+   immediately after `processResultAndMeta`.
+4. (Parallel phase only, v2 meta) Per tx: `setPostTxApplyFeeProcessing(
+   changes, index)`.
+5. Per applied upgrade: an `UpgradeEntryMeta` appended to
+   `upgradesProcessing`.
+6. @version(>=20): `populateEvictedEntries(evictedState)`.
+7. @version(>=20): `setNetworkConfiguration(sorobanConfig, emitExtV1)`.
+8. `ledgerHeader = appliedLedgerState.lastClosedLedgerHeader`.
 
-- **Contract module cache compilation**: May run in the background
-  during a ledger close, with the pipeline blocking at the start of
-  the next ledger to await completion.
-- **Eviction scanning**: Background scans for expired Soroban entries
-  run between ledger closes and are resolved at the start of the next
-  commit phase.
+### 13.4 Emission
+
+Meta is emitted exactly once per ledger via `emitNextMeta`, which writes
+the XDR to the configured output stream and flushes. If a crash occurs
+between commit and emit on a subsequent close, the previous meta MAY be
+re-emitted (duplicates are tolerated by downstream consumers).
+
+A separate debug meta stream MAY be opened on `METADATA_DEBUG_LEDGERS`
+segment boundaries for diagnostics.
+
+---
+
+## 14. Genesis Ledger
+
+The genesis ledger is the starting point of the chain when a node
+initializes a new database.
+
+### 14.1 Constants
+
+| Constant | Value |
+|---|---|
+| `GENESIS_LEDGER_SEQ` | 1 |
+| `GENESIS_LEDGER_VERSION` | 0 |
+| `GENESIS_LEDGER_BASE_FEE` | 100 |
+| `GENESIS_LEDGER_BASE_RESERVE` | 100000000 |
+| `GENESIS_LEDGER_MAX_TX_SIZE` | 100 |
+| `GENESIS_LEDGER_TOTAL_COINS` | 1000000000000000000 |
+
+### 14.2 Procedure (`startNewLedger`)
+
+1. The apply state MUST be in `SETTING_UP_STATE`.
+2. A root LedgerTxn `ltx` is opened with `shouldUpdateLastModified =
+   false`.
+3. The genesis `LedgerHeader` is installed.
+4. A single root `AccountEntry` is created with public key
+   `SecretKey::fromSeed(networkID).getPublicKey()`, threshold `[1, 0, 0,
+   0]`, and balance equal to `totalCoins`.
+5. `sealLedgerTxnAndStoreInBucketsAndDB(...)` is invoked with
+   `initialLedgerVers = 0`.
+6. The resulting LCL state is installed.
+
+A node MAY override the genesis protocol version, base fee, reserve, and
+max-tx-set size via the `USE_CONFIG_FOR_GENESIS` configuration; in that
+case `SorobanNetworkConfig::initializeGenesisLedgerForTesting` MAY also
+populate the Soroban config setting entries at genesis.
+
+### 14.3 Subsequent Initialization
+
+After `startNewLedger`, `setLastClosedLedger(lastClosed, /*rebuild=*/...)`
+is invoked to complete the LCL setup, which optionally rebuilds the
+in-memory Soroban state and module cache. The apply state then
+transitions from `SETTING_UP_STATE` to `READY_TO_APPLY`.
 
 ---
 
 ## 15. Invariants and Safety Properties
 
-### 15.1 Determinism
+The following invariants are protocol-deterministic and MUST hold across
+all conforming implementations.
 
-**INV-L1**: The ledger close pipeline MUST be fully deterministic.
-Given the same LCL state and `LedgerCloseData`, any conforming
-implementation MUST produce:
-- The same ledger hash.
-- The same `txSetResultHash`.
-- The same `bucketListHash`.
-- The same ledger close metadata.
+**INV-L1: Single-child LedgerTxn.** At any instant, an
+`AbstractLedgerTxnParent` SHALL have at most one active child. Attempting
+to add a second child MUST throw. Why: prevents stale reads and lost
+updates between concurrent overlapping transactions.
 
-### 15.2 Ledger Sequence Monotonicity
+**INV-L2: Same-thread LedgerTxn access.** A `LedgerTxn` SHALL be accessed
+only from the thread that constructed it, until commit or rollback.
+Violation MUST abort. Why: LedgerTxn is intentionally not thread-safe.
 
-**INV-L2**: Ledger sequence numbers MUST be strictly monotonically
-increasing. Each closed ledger MUST have `ledgerSeq = previousLedger.ledgerSeq + 1`.
+**INV-L3: Monotonic ledger sequence and hash chain.** Every applied
+ledger MUST have `ledgerSeq = prev.ledgerSeq + 1` and
+`previousLedgerHash = SHA-256(prev.header)`. The pipeline MUST verify the
+txset's declared `previousLedgerHash` matches the local LCL hash before
+applying. Why: the hash chain is the spine of consensus determinism.
 
-### 15.3 Hash Chain Integrity
+**INV-L4: Total coins conservation.** Total coins
+(`header.totalCoins + sum_of_all_account_balances + locked_in_offers
++ locked_in_pools + locked_in_claimable_balances`) MUST remain invariant
+across ledger close, modulo deliberate inflationary effects (which adjust
+`header.totalCoins` themselves). Why: monetary conservation. (Enforced by
+the `ConservationOfLumens` invariant.)
 
-**INV-L3**: Each ledger header MUST contain the correct
-`previousLedgerHash = SHA256(previousLedgerHeader)`, forming an
-unbroken hash chain from the genesis ledger.
+**INV-L5: Restored entries mutual exclusion.** Within a single ledger,
+the same `LedgerKey` MUST NOT appear in both
+`mRestoredEntries.hotArchive` and `mRestoredEntries.liveBucketList`.
+Why: an entry was either evicted to the hot archive (paying restoration
+cost) or still in the live bucket list (only its TTL is updated) —
+never both. Asserted at commit time via `getEntryOpt`.
 
-### 15.4 Fee Conservation
+**INV-L6: Sealed-after-commit.** Once a `LedgerTxn` has been sealed
+(via `commit`, `getChanges`, `getDelta`, or `getAllEntries`), all further
+mutating operations MUST throw `LedgerTxn is sealed`. The header MAY be
+re-unsealed via `unsealHeader(f)` for bucket-list and skip-list updates
+ONLY.
 
-**INV-L4**: The total coins in the system MUST be conserved.
-`totalCoins = sum(all account balances) + feePool + sum(all claimable balance amounts) + sum(all liquidity pool reserves)`.
-Any deviation indicates a consensus-breaking bug.
+**INV-L7: Fee pool non-negative.** `header.feePool >= 0` MUST hold at all
+times. The pipeline MUST refuse to encode a header with a negative fee
+pool.
 
-### 15.5 Transaction Result Integrity
+**INV-L8: Phase-state safety.** Mutating operations on `ApplyState`
+(updating in-memory Soroban state, module cache, etc.) are permitted
+only in `SETTING_UP_STATE` or `COMMITTING`. Reads during `APPLYING`
+are permitted from any Soroban worker thread. Why: this enforces the
+single-writer property of the apply pipeline.
 
-**INV-L5**: The `txSetResultHash` MUST equal
-`SHA256(TransactionResultSet)` where the result set contains one result
-per transaction in application order.
+**INV-L9: LedgerHeader validity.** Encoded headers MUST satisfy
+`ledgerSeq <= INT32_MAX`, `scpValue.closeTime <= INT64_MAX`,
+`feePool >= 0`, `idPool <= INT64_MAX`.
 
-### 15.6 BucketList Hash Integrity
+**INV-L10: TxSet rooting.** The applied txset MUST have
+`previousLedgerHash == SHA-256(prev_header)` AND
+`getContentsHash() == ledgerData.value.txSetHash`. Failure of either
+MUST abort apply.
 
-**INV-L6**: The `bucketListHash` MUST be computed from the BucketList
-state after all entries from this ledger (including evictions and hot
-archive updates) have been added.
+**INV-L11: Expected-hash check.** If `ledgerData.expectedHash` is set
+(typically by catchup), the locally computed post-apply header hash MUST
+equal it; otherwise the pipeline MUST abort with "ledger corrupted during
+close".
 
-### 15.7 LedgerTxn Atomicity
+**INV-L12: Single SCP value per LCL.** Once an LCL of `ledgerSeq = N` is
+committed, no other distinct `LedgerCloseData` for `ledgerSeq = N` MAY be
+applied. This is enforced by the LedgerApplyManager's queue ordering
+(`LCL <= A <= Q <= H`).
 
-**INV-L7**: A `LedgerTxn` commit MUST be all-or-nothing. Either all
-changes are merged into the parent, or none are (rollback). Partial
-commits are never observable.
+**INV-L13: HAS / LCL agreement.** On reload, the persisted HAS and the
+persisted LCL header MUST agree on `ledgerSeq`. Disagreement MUST be
+treated as database corruption.
 
-### 15.8 Single Child
+**INV-L14: Configuration immutability.** `CONFIG_SETTING` ledger entries
+MUST NOT be erased; they MAY only be created (at the V20 upgrade and
+subsequent protocol upgrades) or updated (via `LEDGER_UPGRADE_CONFIG`).
 
-**INV-L8**: A `LedgerTxn` SHALL have at most one active child at any
-time. Violation of this invariant is a programming error that MUST be
-caught at runtime.
-
-### 15.9 Annihilation
-
-**INV-L9**: When a `DELETED` entry commits into a parent that holds
-an `INIT` entry for the same key, both MUST be removed (annihilation).
-The net effect is as if neither the creation nor the deletion occurred.
-
-### 15.10 Upgrade Ordering
-
-**INV-L10**: Protocol upgrades MUST be applied AFTER all transactions
-and BEFORE the ledger is sealed. Transactions in a ledger always
-execute under the pre-upgrade protocol version.
-
-### 15.11 Initial Ledger Version for Meta
-
-**INV-L11**: The meta frame version MUST be determined by
-`initialLedgerVers` (the protocol version at the start of the ledger
-close, before upgrades), not the post-upgrade version. This ensures
-the meta format matches what downstream consumers expect based on the
-ledger's transaction semantics.
-
-### 15.12 Eviction Size Snapshot Ordering
-
-**INV-L12**: The Soroban state size snapshot at ledger N records the
-size as of ledger N-1 (taken BEFORE flushing ledger N's entries). This
-ensures the rent fee computation uses a trailing indicator of state
-size.
-
-### 15.13 Commit Sequence Ordering
-
-**INV-L13**: The 8-step commit sequence (Section 4.2, Step 17) MUST
-execute in the specified order. Reordering any step may cause
-incorrect history publishing, database inconsistency, or crash
-recovery failures.
-
-### 15.14 Offer-Only Persistent Storage
-
-**INV-L14**: Only offer entries are persisted to the persistent
-storage layer during `LedgerTxnRoot` commit. All other entry types
-are persisted exclusively through the BucketList. This ensures the
-order book store contains only the data needed for the in-memory
-order book and path finding.
+**INV-L15: Header re-seal must not modify entries.** `unsealHeader(f)`
+gives `f` mutable access to the header only; `f` MUST NOT modify the
+entry map. This invariant is preserved by exposing only `LedgerHeader&`
+to the callback.
 
 ---
 
 ## 16. Constants
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `GENESIS_LEDGER_SEQ` | 1 | Sequence number of the genesis ledger. |
-| `GENESIS_LEDGER_VERSION` | 0 | Protocol version of the genesis ledger. |
-| `GENESIS_LEDGER_BASE_FEE` | 100 | Base fee in the genesis ledger (stroops). |
-| `GENESIS_LEDGER_BASE_RESERVE` | 100,000,000 | Base reserve in the genesis ledger (stroops, 10 XLM). |
-| `GENESIS_LEDGER_MAX_TX_SIZE` | 100 | Maximum transaction set size in the genesis ledger. |
-| `GENESIS_LEDGER_TOTAL_COINS` | 1,000,000,000,000,000,000 | Total lumens at genesis (stroops, 100 billion XLM). |
-| `CHECKPOINT_FREQUENCY` | 64 | Ledger interval between history checkpoints. |
-| `CURRENT_LEDGER_PROTOCOL_VERSION` | 25 | Maximum supported protocol version. |
-| `TARGET_LEDGER_CLOSE_TIME_BEFORE_P23_MS` | 5000 | Expected ledger close time before protocol 23 (5 seconds). |
-| `REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` | 23 | Protocol version at which the reusable contract module cache is activated. |
+| Constant | Value | Description | Section |
+|---|---|---|---|
+| `GENESIS_LEDGER_SEQ` | 1 | Sequence of the genesis ledger. | [14.1](#141-constants) |
+| `GENESIS_LEDGER_VERSION` | 0 | Protocol version at genesis. | [14.1](#141-constants) |
+| `GENESIS_LEDGER_BASE_FEE` | 100 | Base fee at genesis (stroops). | [14.1](#141-constants) |
+| `GENESIS_LEDGER_BASE_RESERVE` | 100000000 | Base reserve at genesis (stroops). | [14.1](#141-constants) |
+| `GENESIS_LEDGER_MAX_TX_SIZE` | 100 | Max txset size at genesis. | [14.1](#141-constants) |
+| `GENESIS_LEDGER_TOTAL_COINS` | 1000000000000000000 | Total coins at genesis. | [14.1](#141-constants) |
+| `SKIP_1` | 50 | First skip-list cadence. | [9.3](#93-skip-list-construction) |
+| `SKIP_2` | 5000 | Second skip-list cadence. | [9.3](#93-skip-list-construction) |
+| `SKIP_3` | 50000 | Third skip-list cadence. | [9.3](#93-skip-list-construction) |
+| `SKIP_4` | 500000 | Fourth skip-list cadence. | [9.3](#93-skip-list-construction) |
+| `LEDGER_ENTRY_BATCH_COMMIT_SIZE` | 4095 (0xfff) | Heuristic bulk-commit batch size (advisory). | [7](#7-ledgertxn-nested-transactional-state) |
+| `MAX_LEDGER_DEPENDENT_TX_CLUSTERS` | 128 | Upper bound on `ledgerMaxDependentTxClusters`. | [10.1](#101-setting-categories) |
+| `SOROBAN_PROTOCOL_VERSION` | 20 | First Soroban-enabled protocol. | [10](#10-soroban-network-configuration) |
+| `REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION` | 23 | First protocol with shared module cache. | [11.4](#114-module-cache) |
+| `PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION` | 23 | First protocol with parallel Soroban phase (and v2 meta). | [13.1](#131-selection) |
+| `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` | 23 | First protocol with hot-archive eviction. | [12.2](#122-persistent-state-and-has) |
+
+The Soroban network-configuration constants in §10 (minimums, initial
+values, P23-upgraded values) are RECOMMENDED defaults defined in
+`InitialSorobanNetworkConfig`, `MinimumSorobanNetworkConfig`,
+`MaximumSorobanNetworkConfig`, and `Protcol23UpgradedConfig` of the
+reference implementation. Networks MUST satisfy the minimums via
+`isValidConfigSettingEntry` during upgrades.
 
 ---
 
 ## 17. References
 
 | Reference | Description |
-|-----------|-------------|
-| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
-| [stellar-core] | stellar-core v25.2.2 source code, `src/ledger/`, `src/herder/`. |
-| [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
-| [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
-| [TX Spec] | Stellar Transaction Processing Specification (companion document). |
-| [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
-| [CAP-0046] | Soroban Smart Contracts proposal. |
-| [CAP-0076] | P23 State Archival bug remediation. |
+|---|---|
+| [1] | CAP-0046 "Soroban Smart Contracts" |
+| [2] | CAP-0046-12 "Soroban Resource Fees" |
+| [3] | CAP-0057 "Hot Archive and Restoration" |
+| [4] | CAP-0063 "Parallel Soroban Transaction Apply" |
+| [5] | stellar-core v26.0.1 source: `src/ledger/`, `src/main/` |
+| [6] | XDR: `Stellar-ledger.x`, `Stellar-ledger-entries.x`, `Stellar-internal.x` |
+| [7] | HERDER_SPEC §6 — Transaction set construction and apply ordering |
+| [8] | TX_SPEC §6, §7, §11 — Transaction lifecycle, fee processing, parallel apply |
+| [9] | BUCKETLISTDB_SPEC §6, §10 — Live bucket list and hot archive |
+| [10] | CATCHUP_SPEC §6 — LedgerApplyManager and catchup integration |
+| [11] | RFC 2119, RFC 8174 — Key words for use in RFCs |
 
 ---
 
-## 18. Appendices
+## Appendix A: LedgerTxn Entry Merge Matrix
 
-### Appendix A: Ledger Close Pipeline Sequence Diagram
+When `commitChild` merges a child entry at key `K` into a parent's entry
+map, the resulting state is determined by the existing parent state and
+the child's state. Below: rows are the parent's current state at `K`;
+columns are the child's incoming state. An empty parent (no entry at `K`)
+results in insertion of the child entry as-is.
 
-```mermaid
-sequenceDiagram
-    participant SCP
-    participant Herder
-    participant LedgerMgr as Ledger Manager
-    participant LTxn as LedgerTxn
-    participant BL as BucketList
-    participant DB as Database
+| Parent / Child | INIT | LIVE | DELETED |
+|---|---|---|---|
+| **(none)** | insert INIT | insert LIVE | insert DELETED |
+| **INIT** | impossible (`create` would have thrown) | parent becomes LIVE | parent entry **annihilated** (erased from map) |
+| **LIVE** | THROW (`cannot commit a child init entry into a parent live entry`) | parent becomes LIVE (entry overwritten) | parent becomes DELETED |
+| **DELETED** | parent becomes LIVE (entry restored) | THROW (`cannot set deleted entry to live`) | THROW (`cannot delete deleted entry`) |
 
-    SCP->>Herder: valueExternalized(slot, value)
-    Herder->>Herder: construct LedgerCloseData
-    Herder->>LedgerMgr: valueExternalized(ledgerCloseData)
-    LedgerMgr->>LedgerMgr: applyLedger()
+Notes:
 
-    Note over LedgerMgr: Phase: READY_TO_APPLY → APPLYING
+- The annihilation case (Parent INIT + Child DELETED) is essential to
+  bucket-list correctness: an entry created and immediately destroyed
+  within a single closer transaction MUST leave no trace in the bucket
+  batch.
+- The "DELETED + INIT -> LIVE" case occurs when an earlier sibling
+  transaction deleted an existing entry (so it must have existed prior)
+  and a later sibling re-creates it via `create`. The merged state is
+  `LIVE` because the entry pre-existed.
+- All "THROW" cases trigger `printErrorAndAbort` at the commit site,
+  treating them as fatal logic errors.
 
-    LedgerMgr->>LTxn: open top-level LedgerTxn
-    LedgerMgr->>LTxn: increment ledgerSeq, set previousLedgerHash
-    LedgerMgr->>LTxn: processFeesSeqNums()
+---
 
-    loop For each transaction
-        LedgerMgr->>LTxn: open nested LedgerTxn
-        LedgerMgr->>LTxn: transaction.apply()
-        LedgerMgr->>LTxn: commit or rollback
-    end
-
-    LedgerMgr->>LedgerMgr: compute txSetResultHash
-
-    Note over LedgerMgr: Phase: APPLYING → COMMITTING
-
-    loop For each upgrade
-        LedgerMgr->>LTxn: open nested LedgerTxn
-        LedgerMgr->>LTxn: apply upgrade
-        LedgerMgr->>LTxn: commit
-    end
-
-    LedgerMgr->>LTxn: seal (getAllEntries)
-    LedgerMgr->>BL: addLiveBatch(init, live, dead)
-    LedgerMgr->>BL: snapshot → bucketListHash
-    LedgerMgr->>LTxn: unsealHeader(set bucketListHash)
-    LedgerMgr->>DB: store HAS, header, LCL hash
-    LedgerMgr->>LTxn: commit top-level → DB
-
-    Note over LedgerMgr: Phase: COMMITTING → READY_TO_APPLY
-
-    LedgerMgr->>LedgerMgr: advance LCL
-    LedgerMgr->>Herder: ledgerCloseComplete
-```
-
-### Appendix B: LedgerTxn Entry Lifecycle State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> INIT: create()
-    [*] --> LIVE: load()
-
-    INIT --> INIT: modify
-    LIVE --> LIVE: modify
-
-    INIT --> [*]: erase() [annihilation]
-    LIVE --> DELETED: erase()
-
-    INIT --> CommitAsINIT: commit to parent
-    LIVE --> CommitAsLIVE: commit to parent
-    DELETED --> CommitAsDELETED: commit to parent
-
-    state "Parent Merge" as merge {
-        CommitAsINIT --> ParentINIT: parent absent
-        CommitAsINIT --> ParentLIVE: parent DELETED
-        CommitAsLIVE --> ParentLIVE: parent LIVE
-        CommitAsLIVE --> ParentINIT: parent INIT
-        CommitAsDELETED --> ParentDELETED: parent LIVE
-        CommitAsDELETED --> Annihilate: parent INIT
-    }
-```
-
-### Appendix C: Apply State Phase Machine
-
-```mermaid
-stateDiagram-v2
-    SETTING_UP_STATE --> READY_TO_APPLY: markEndOfSetupPhase()
-    READY_TO_APPLY --> APPLYING: markStartOfApplying()
-    APPLYING --> COMMITTING: markStartOfCommitting()
-    COMMITTING --> READY_TO_APPLY: markEndOfCommitting()
-    READY_TO_APPLY --> SETTING_UP_STATE: resetToSetupPhase()
-```
-
-### Appendix D: Transaction Application Phase Ordering
+## Appendix B: Ledger Close Pipeline Flowchart
 
 ```mermaid
 flowchart TD
-    A[Transaction Set] --> B{Has Classic Phase?}
-    B -->|Yes| C[Phase 0: Classic Sequential]
-    B -->|No| D{Has Soroban Phase?}
-    C --> D
-    D -->|Yes, p23+| E[Phase 1: Soroban Parallel]
-    D -->|Yes, pre-p23| F[Phase 1: Soroban Sequential]
-    D -->|No| G[Done]
-    E --> G
-    F --> G
+  start([valueExternalized]) --> LAM{LAM.processLedger:<br/>contiguous?}
+  LAM -- yes --> applyLedger[applyLedger called]
+  LAM -- no --> catchup[Trigger catchup<br/>state := LM_CATCHING_UP_STATE]
 
-    subgraph "Parallel Phase Detail"
-        E --> H[Stage 1]
-        H --> I[Stage 2]
-        I --> J[Stage N]
-
-        subgraph "Stage"
-            H --> K[Cluster A: parallel]
-            H --> L[Cluster B: parallel]
-            H --> M[Cluster C: parallel]
-        end
-    end
+  applyLedger --> finishComp[Finish pending<br/>module compilation]
+  finishComp --> startApply[markStartOfApplying]
+  startApply --> openLtx[Open LedgerTxn ltx]
+  openLtx --> hdrSetup[Increment ledgerSeq;<br/>set previousLedgerHash;<br/>set scpValue]
+  hdrSetup --> validate{Validate:<br/>version OK?<br/>txSet rooted?<br/>txSet hash OK?}
+  validate -- no --> abort[THROW]
+  validate -- yes --> fees[processFeesSeqNums]
+  fees --> apply[applyTransactions:<br/>sequential + parallel]
+  apply --> resHash[txSetResultHash :=<br/>SHA-256 of txResultSet]
+  resHash --> startCommit[markStartOfCommitting]
+  startCommit --> upgrades[For each upgrade:<br/>validate, apply,<br/>capture meta]
+  upgrades --> seal[sealLedgerTxnAndStoreInBucketsAndDB]
+  seal --> finalize[finalizeLedgerTxnChanges:<br/>eviction, hot archive,<br/>state-size snapshot,<br/>getAllEntries,<br/>addLiveBatch,<br/>updateInMemorySorobanState]
+  finalize --> unseal[unsealHeader:<br/>snapshotLedger,<br/>store HAS+header]
+  unseal --> hashCheck{expectedHash<br/>matches?}
+  hashCheck -- no --> abort
+  hashCheck -- yes --> emitMeta[Emit LedgerCloseMeta]
+  emitMeta --> step1[Queue history checkpoint]
+  step1 --> step2[ltx.commit]
+  step2 --> step3[maybeCheckpointComplete]
+  step3 --> step4[Start next eviction scan]
+  step4 --> step5[markEndOfCommitting;<br/>snapshot invariant state]
+  step5 --> postMain[advanceLedgerStateAndPublish on main thread]
+  postMain --> step6[publishQueuedHistory]
+  step6 --> step7[forgetUnreferencedBuckets]
+  step7 --> step8[ledgerCloseComplete:<br/>maybe synced,<br/>notify Herder,<br/>invariant snapshot]
+  step8 --> done([Ready for next ledger])
 ```
 
-### Appendix E: Commit Sequence Detail
+---
 
-The 8-step commit sequence from Section 4.2, Step 17:
+## Appendix C: Skip-List Construction Example
 
-```
-Step 1: Queue history checkpoint (within current DB transaction)
-Step 2: Commit LedgerTxn (flush offers to DB, commit SQL transaction)
-Step 3: Finalize checkpoint files
-Step 4: Start background eviction scan for the next ledger
-Step 5: Exit COMMITTING phase: COMMITTING → READY_TO_APPLY
-Step 6: Copy Soroban state for invariant check (if enabled)
-Step 7: Advance LCL, publish queued history, GC buckets  ← MUST run on main thread
-        7a. Swap in new CompleteConstLedgerState as LCL
-        7b. Publish Soroban metrics
-        7c. Kick off queued history publishing
-        7d. GC unreferenced buckets (under ledger state mutex)
-Step 8: Notify herder and run invariant snapshot check
-```
+Suppose `bucketListHash` is freshly computed for each closing ledger. The
+skip-list values immediately after `snapshotLedger` are:
 
-[rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
+| ledgerSeq | Trigger | `skipList[0]` | `skipList[1]` | `skipList[2]` | `skipList[3]` |
+|---|---|---|---|---|---|
+| 49 | none (49 mod 50 != 0) | (unchanged) | (unchanged) | (unchanged) | (unchanged) |
+| 50 | seq mod 50 = 0 | `H_50` | (unchanged) | (unchanged) | (unchanged) |
+| 100 | seq mod 50 = 0 | `H_100` | (unchanged) | (unchanged) | (unchanged) |
+| 5000 | seq mod 50 = 0; v1 = 4950, 4950 mod 5000 != 0 | `H_5000` | (unchanged) | (unchanged) | (unchanged) |
+| 5050 | seq mod 50 = 0; v1 = 5000, 5000 mod 5000 = 0; v2 = 0, halt | `H_5050` | `H_5000` (shifted from slot 0) | (unchanged) | (unchanged) |
+| 50050 | seq mod 50 = 0; v1 = 50000, 50000 mod 5000 = 0; v2 = 45000, 45000 mod 50000 != 0 | `H_50050` | shifted | (unchanged) | (unchanged) |
+| 55050 | seq mod 50 = 0; v1 = 55000, 55000 mod 5000 = 0; v2 = 50000, 50000 mod 50000 = 0; v3 = 0, halt | `H_55050` | shifted | shifted | (unchanged) |
+| 555050 | all three cadence levels divisible; v3 = 500000, 500000 mod 500000 = 0 | `H_555050` | shifted | shifted | shifted |
+
+The exact crossings depend on the precise sequence numbers; the point is
+that `skipList[k]` slot is advanced **only** when the running difference
+remains a positive multiple of `SKIP_{k+1}`.
+
+Use cases: skip-list slots enable fast historic verification. Slot 0
+provides a `bucketListHash` every 50 ledgers, slot 1 every 5050 ledgers,
+slot 2 every 55050 ledgers, slot 3 every 555050 ledgers, allowing
+logarithmic skip-back traversal of the historic chain.
+
+---
+
+[CAP-0046]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046.md
+[CAP-0057]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0057.md
+[CAP-0063]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0063.md
+[RFC-2119]: https://www.rfc-editor.org/rfc/rfc2119
+[RFC-8174]: https://www.rfc-editor.org/rfc/rfc8174
+[stellar-core]: https://github.com/stellar/stellar-core

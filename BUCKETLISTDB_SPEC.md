@@ -1,6 +1,6 @@
 # Stellar BucketList and BucketListDB Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
 **Date:** 2026-05-13
 
@@ -9,23 +9,25 @@
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
-2. [Architecture Overview](#2-architecture-overview)
-3. [Data Types and Encoding](#3-data-types-and-encoding)
+2. [Architecture](#2-architecture)
+3. [Data Types](#3-data-types)
 4. [BucketList Structure](#4-bucketlist-structure)
 5. [Bucket Lifecycle](#5-bucket-lifecycle)
 6. [Merge Algorithm](#6-merge-algorithm)
-7. [Asynchronous Merge Management](#7-asynchronous-merge-management)
+7. [Asynchronous Merges and FutureBucket](#7-asynchronous-merges-and-futurebucket)
 8. [BucketManager](#8-bucketmanager)
 9. [Indexing](#9-indexing)
 10. [Snapshot and Query Layer](#10-snapshot-and-query-layer)
 11. [Hot Archive BucketList](#11-hot-archive-bucketlist)
 12. [Eviction](#12-eviction)
-13. [Catchup and State Reconstruction](#13-catchup-and-state-reconstruction)
-14. [Serialization and Persistence](#14-serialization-and-persistence)
+13. [Catchup Integration](#13-catchup-integration)
+14. [Serialization](#14-serialization)
 15. [Invariants and Safety Properties](#15-invariants-and-safety-properties)
 16. [Constants](#16-constants)
 17. [References](#17-references)
-18. [Appendices](#18-appendices)
+18. [Appendix A — Merge Equal-Key Decision Matrix](#appendix-a--merge-equal-key-decision-matrix)
+19. [Appendix B — BucketList State Diagram](#appendix-b--bucketlist-state-diagram)
+20. [Appendix C — Eviction Scan Walkthrough](#appendix-c--eviction-scan-walkthrough)
 
 ---
 
@@ -33,308 +35,221 @@
 
 ### 1.1 Purpose and Scope
 
-This document specifies the BucketList and BucketListDB subsystem as
-implemented in stellar-core v25.2.2. The BucketList is a hierarchical,
-append-structured data store that maintains a cumulative, hash-verified
-snapshot of all ledger state. BucketListDB is the query layer built on
-top of the BucketList that supports point lookups and bulk key loads
-without requiring a separate relational database.
+This document specifies the BucketList and BucketListDB subsystem of the
+Stellar network. The BucketList is a temporally-stratified, log-structured
+merge (LSM) data structure that provides two observable properties:
 
-This specification covers:
+- a single cryptographic hash (`bucketListHash`) that uniquely identifies
+  the set of all live ledger entries at a given ledger close, and
+- a compact "delta" representation of the global ledger state that
+  enables fast catchup via history archives.
 
-- The BucketList data structure: levels, buckets, spill mechanics, and
-  hash computation.
-- Bucket file format: entry encoding, metadata records, and sort order.
-- The merge algorithm: entry lifecycle (INIT/LIVE/DEAD), merge
-  semantics across protocol versions, shadow elision, tombstone
-  elimination, and in-memory merge optimization.
-- Asynchronous merge management: the FutureBucket state machine, merge
-  key deduplication, and merge-map tracking.
-- BucketManager: bucket adoption, garbage collection, directory
-  management, and eviction scheduling.
-- Indexing: disk-based range indexes with bloom filters, in-memory
-  indexes, and entry caching.
-- The snapshot and query layer: thread-safe snapshots, point lookups,
-  bulk loads, pool share queries, and eviction scanning.
-- The Hot Archive BucketList: persistent Soroban entry archival
-  (protocol 23+).
-- Eviction: background scanning for expired Soroban entries.
-- Catchup and state reconstruction: applying bucket files to restore
-  ledger state.
-- Serialization: HistoryArchiveState integration and bucket file
-  persistence.
+BucketListDB extends the BucketList to act as a key-value store, replacing
+the auxiliary SQL database for `LedgerEntry` lookup with per-bucket
+indexes and Bloom filters.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2).
-Any conforming
-implementation that produces identical bucket hashes, BucketList hashes,
-and query results for all valid inputs is considered correct. Internal
-details such as threading models, specific file system layouts, and
-caching strategies are out of scope except where they affect
-deterministic hash computation or observable query semantics.
+exclusively from the vetted stellar-core C++ implementation (v26.0.1).
+Any conforming implementation that produces an identical
+`bucketListHash` for the same input sequence of ledger close batches,
+and that returns identical query results for any `LedgerKey`, is
+considered correct.
+
+Out of scope:
+
+- on-disk file formats (.xdr bucket file layout, .index index-file
+  layout, gzip framing);
+- bucket directory locking and process-level mutual exclusion;
+- threading model, worker-thread scheduling, and lock ordering;
+- in-memory cache sizing heuristics and eviction policy for the
+  per-bucket entry cache;
+- metric and log instrumentation;
+- garbage-collection scheduling and reference-count plumbing.
 
 ### 1.2 Conventions and Terminology
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
-document are to be interpreted as described in [RFC 2119][rfc2119].
+document are to be interpreted as described in RFC 2119.
 
 | Term | Definition |
 |------|------------|
-| **BucketList** | A hierarchical data structure of 11 levels, each containing two buckets (`curr` and `snap`), that stores cumulative ledger state with temporal ordering. |
-| **Bucket** | An immutable, content-addressed file containing sorted, XDR-encoded ledger entries. Identified by the SHA-256 hash of its contents. |
-| **Level** | One of the 11 tiers (numbered 0 through 10) in the BucketList hierarchy. Each level stores progressively older and larger sets of entries. |
-| **curr bucket** | The bucket at a given level that accumulates recent entries. Updated every `bucketUpdatePeriod` ledgers for that level. |
-| **snap bucket** | The bucket at a given level holding the previous contents of `curr` after a spill event. Merges asynchronously with the next level's `curr`. |
-| **Spill** | The event where a level's `curr` is moved to `snap` and a new empty `curr` is started, triggering a merge of the old `snap` with the next level's `curr`. |
-| **Merge** | The process of combining two sorted bucket files into a single bucket, applying entry lifecycle rules (Section 6). |
-| **FutureBucket** | A state machine that tracks an in-progress or completed asynchronous merge (Section 7). |
-| **INITENTRY** | A bucket entry type indicating the first appearance of a ledger entry in the BucketList since its creation or last deletion. Introduced in protocol 11. |
-| **LIVEENTRY** | A bucket entry type containing a live ledger entry (creation or update). |
-| **DEADENTRY** | A bucket entry type (tombstone) indicating deletion of a ledger entry. |
-| **METAENTRY** | A bucket entry containing protocol version metadata. Always the first record in a bucket file (protocol 11+). |
-| **Shadow** | A higher-level bucket used during merges (pre-protocol 12) to elide entries that have been superseded. |
-| **Tombstone** | A DEADENTRY record. Tombstones are preserved at all levels except the deepest (level 10), where they are elided during merges. |
-| **BucketListDB** | The indexed query layer over the BucketList that supports point lookups and bulk loads. |
-| **Hot Archive** | A secondary BucketList (protocol 23+) that stores evicted persistent Soroban entries for later restoration. |
-| **Eviction** | The process of scanning the BucketList for expired Soroban entries and removing them from the live state. |
-| **BucketManager** | The central orchestrator responsible for bucket file lifecycle, merge scheduling, garbage collection, and snapshot management. |
-| **HistoryArchiveState (HAS)** | A JSON structure describing the complete state of a BucketList at a given ledger, including all bucket hashes and in-progress merge state. |
-| **MergeKey** | A unique identifier for a merge operation, composed of the `keepTombstones` flag, input bucket hashes, and shadow bucket hashes. |
-| **Record-mark framing** | The XDR encoding scheme where each entry is preceded by a 4-byte big-endian length prefix. |
-| **Stroop** | The smallest unit of XLM: 1 XLM = 10,000,000 stroops. |
+| BucketList | The distinguished ordered collection of levels, each containing two `Bucket`s, that summarizes the live ledger state. |
+| Bucket | An immutable, sorted, content-addressed sequence of bucket entries identified by a SHA-256 hash. |
+| Level | A pair `(curr, snap)` of `Bucket`s at a given depth in the BucketList. Levels are numbered 0 (youngest, smallest) through `kNumLevels-1` (oldest, largest). |
+| `curr` | The active half of a level into which incoming spills are merged. |
+| `snap` | The half of a level that has been frozen and is awaiting promotion to the next level. |
+| Spill | The event in which a level's `curr` becomes `snap` and the previous `snap` is merged into the next level's `curr`. |
+| Tombstone | An entry that represents the deletion of a `LedgerKey`. For `LiveBucket` this is `DEADENTRY`; for `HotArchiveBucket` this is `HOT_ARCHIVE_LIVE`. |
+| Shadow | A bucket from a younger level that elides keywise-equal entries in older-level merges, under the pre-protocol-12 algorithm. |
+| FutureBucket | A wrapper around a pending or completed merge that supports serialization in a `HistoryArchiveState` and re-attachment to running merges. |
+| HAS | `HistoryArchiveState` — the serializable description of a BucketList at a specific ledger. |
+| Hot Archive | A second BucketList that records evicted persistent Soroban entries. |
+| Eviction | The protocol-23+ process of removing expired Soroban entries from the live state and (for persistent entries) archiving them. |
 
 ### 1.3 Notation
 
-This specification uses the following notation conventions:
+Algorithms in this document use:
 
-- `levelSize(L)` denotes the number of ledgers in a complete cycle at
-  level L.
-- `levelHalf(L)` denotes half the cycle at level L.
-- `oldestLedgerInCurr(L, seq)` denotes the oldest ledger whose entries
-  may reside in the curr bucket of level L at ledger sequence `seq`.
-- `SHA256(data)` denotes the SHA-256 hash function.
-- Bit operations: `>>` (right shift), `<<` (left shift), `&`
-  (bitwise AND).
-- Protocol version comparisons use inclusive ranges unless stated
-  otherwise.
+- `camelCase` for variables and function names;
+- `SCREAMING_SNAKE_CASE` for XDR enum values and constants;
+- `@version(≥N)` / `@version(<N)` annotations on protocol-version-gated
+  behavior;
+- Mermaid for diagrams.
+
+Cross-references to companion specifications use the plain-text form
+`SPEC_NAME §N.N`.
 
 ### 1.4 Relationship to Other Specifications
 
-This specification is a companion to:
-
-- **Transaction Processing Specification** (`TX_SPEC.md`): defines how
-  transactions produce the ledger entry changes that feed into
-  `addBatch`.
-- **Ledger Specification** (`LEDGER_SPEC.md`): defines the ledger close
-  pipeline that drives BucketList updates and reads the BucketList hash.
-- **Catchup Specification** (`CATCHUP_SPEC.md`): defines how bucket
-  files are downloaded, verified, and applied during history catchup.
-- **SCP Specification** (`SCP_SPEC.md`): consensus drives ledger close,
-  which drives BucketList updates.
+| Specification | Relationship |
+|---------------|--------------|
+| LEDGER_SPEC | The ledger close pipeline produces the per-ledger `(initEntries, liveEntries, deadEntries)` and `(archivedEntries, restoredEntries)` batches consumed by this subsystem. Eviction (`§12`) feeds back into the ledger close as part of the seal-and-store step. |
+| TX_SPEC | Soroban execution uses BucketListDB lookups for `getNewestVersion` semantics on persistent entries. State archival and restoration produced by `RestoreFootprint` and TTL expiry interact with the Hot Archive. |
+| CATCHUP_SPEC | Catchup downloads buckets via the History Archive, reassembles a BucketList using `assumeState` (`§13`), and applies live buckets to reconstruct ledger state. |
+| HERDER_SPEC | The bucketList hash produced by this subsystem feeds the `LedgerHeader` that is externalized through consensus (`SCP_SPEC`). |
 
 ---
 
-## 2. Architecture Overview
+## 2. Architecture
 
-### 2.1 Design Goals
+The BucketList is a sequence of levels, each composed of two `Bucket`s
+(`curr` and `snap`). Each level `i` is conceptually four times the size
+of level `i-1`. Entries enter at level 0 in batches every ledger and
+migrate downward via periodic spills. There are two BucketLists in the
+system:
 
-The BucketList is designed to serve three primary purposes:
+- **LiveBucketList** — canonical live ledger state. Entries are of XDR
+  type `BucketEntry` (`INITENTRY` / `LIVEENTRY` / `DEADENTRY` /
+  `METAENTRY`).
+- **HotArchiveBucketList** — recently evicted persistent Soroban
+  entries. Entries are of XDR type `HotArchiveBucketEntry`
+  (`HOT_ARCHIVE_ARCHIVED` / `HOT_ARCHIVE_LIVE` / `HOT_ARCHIVE_METAENTRY`).
+  Present from protocol 23 onward.
 
-1. **Cumulative state hashing**: produce a single hash that
-   deterministically summarizes all live ledger state, for inclusion in
-   each ledger header.
-2. **Efficient state queries**: support O(log n) point lookups and
-   efficient bulk loads without a separate relational database.
-3. **Archival state transfer**: enable nodes joining the network to
-   download a complete state snapshot and verify it cryptographically.
+```mermaid
+graph TD
+    subgraph Application
+        LM[LedgerManager<br/>close pipeline]
+    end
+    subgraph BucketManager
+        LBL[LiveBucketList<br/>kNumLevels = 11]
+        HBL[HotArchiveBucketList<br/>kNumLevels = 11]
+        FM[Merge-future map<br/>MergeKey -&gt; shared_future]
+        BM[Finished-merge map<br/>weak input -&gt; output]
+        SBM[BucketSnapshotManager]
+    end
+    subgraph Storage
+        BD[(Bucket directory<br/>bucket-&lt;hash&gt;.xdr<br/>bucket-&lt;hash&gt;.index)]
+        HA[(History Archives)]
+    end
+    subgraph Queries
+        SLSnap[SearchableLiveBucketListSnapshot]
+        SHSnap[SearchableHotArchiveBucketListSnapshot]
+    end
 
-### 2.2 High-Level Architecture
-
+    LM -- addLiveBatch --> LBL
+    LM -- addHotArchiveBatch --> HBL
+    LBL -- merges --> FM
+    HBL -- merges --> FM
+    FM -. adopt .-> BM
+    LBL --- BD
+    HBL --- BD
+    BD --- HA
+    SBM -- snapshots --> SLSnap
+    SBM -- snapshots --> SHSnap
+    LBL --- SBM
+    HBL --- SBM
+    LM -- lookup --> SLSnap
+    LM -- lookup --> SHSnap
 ```
-Ledger Close
-    |
-    v
-addBatch(initEntries, liveEntries, deadEntries)
-    |
-    v
-+------------------------------------------+
-|              BucketList                  |
-|  Level 0: [curr_0] [snap_0]             |
-|  Level 1: [curr_1] [snap_1]             |
-|  ...                                     |
-|  Level 10: [curr_10] [snap_10]           |
-+------------------------------------------+
-    |                    |
-    v                    v
-BucketList Hash     BucketListDB
-(in LedgerHeader)   (point/bulk queries)
-```
 
-At each ledger close, changed entries are added to level 0 via
-`addBatch`. Periodically, entries "spill" from level L to level L+1
-through a merge process. Each bucket is an immutable, sorted,
-content-addressed file. The BucketList hash is a SHA-256 digest of
-the concatenation of all level hashes, which are themselves derived
-from the hashes of each level's `curr` and `snap` buckets (see
-Section 4.6 for the precise computation).
+The architectural goals are:
 
-### 2.3 Entry Flow
-
-1. Transactions execute and produce three vectors of changes:
-   - **initEntries**: newly created ledger entries (INITENTRY)
-   - **liveEntries**: modified ledger entries (LIVEENTRY)
-   - **deadEntries**: deleted ledger keys (DEADENTRY)
-
-2. These are combined into a sorted vector of `BucketEntry` records
-   (Section 5.2) and merged into level 0's `curr` bucket.
-
-3. At specific ledger boundaries (determined by `levelShouldSpill`),
-   entries cascade to deeper levels via merge operations.
-
-4. The BucketList hash is recomputed and written to the ledger header.
+1. **Deterministic hash.** A single `bucketListHash` summarizes the
+   entire live ledger state and is recorded in the `LedgerHeader`.
+2. **Bounded write amplification.** A given entry is rewritten on
+   average `kNumLevels` times over its lifetime, regardless of how
+   often it is modified.
+3. **Background merging.** Merges of all levels above 0 occur on
+   worker threads while the main thread continues to close ledgers.
+4. **Catchup-friendly deltas.** A peer can fetch the difference
+   between two BucketLists by transferring at most the buckets that
+   differ.
+5. **Key-value store.** Per-bucket indexes and Bloom filters make
+   point lookups against the BucketList efficient enough to serve as
+   the primary ledger-entry store, eliminating the auxiliary SQL
+   database for entry lookup.
 
 ---
 
-## 3. Data Types and Encoding
+## 3. Data Types
 
-### 3.1 BucketEntry (Live BucketList)
+### 3.1 BucketEntry (LiveBucket)
 
-A `BucketEntry` is the fundamental record type in the Live BucketList.
-It is an XDR union discriminated on `BucketEntryType`:
+`BucketEntry` is a tagged union with four cases used in `LiveBucket`s:
 
-```
-enum BucketEntryType {
-    METAENTRY    = -1,
-    LIVEENTRY    =  0,
-    DEADENTRY    =  1,
-    INITENTRY    =  2
-};
+| Tag | Field | Semantics |
+|-----|-------|-----------|
+| `METAENTRY` | `metaEntry` of type `BucketMetadata` | Per-file header; appears at most once and only as the first entry. `@version(≥11)`. |
+| `INITENTRY` | `liveEntry` of type `LedgerEntry` | Entry that was newly created in this batch; predecessor state is DEAD or nonexistent. `@version(≥11)`. |
+| `LIVEENTRY` | `liveEntry` of type `LedgerEntry` | Entry that exists, regardless of whether it was just created or modified. Pre-protocol-11 buckets use `LIVEENTRY` for both create and update. |
+| `DEADENTRY` | `deadEntry` of type `LedgerKey` | Tombstone marking deletion of a key. |
 
-union BucketEntry switch (BucketEntryType type) {
-case LIVEENTRY:
-case INITENTRY:
-    LedgerEntry liveEntry;
-case DEADENTRY:
-    LedgerKey deadEntry;
-case METAENTRY:
-    BucketMetadata metaEntry;
-};
-```
+`BucketMetadata` carries:
 
-**Invariants:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledgerVersion` | `uint32` | Protocol version at which the bucket was written. |
+| `ext` | union | `v == 0` (unused) or `v == 1` with `bucketListType` set to `LIVE` or `HOT_ARCHIVE`. The `v == 1` form is REQUIRED from `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (protocol 23) onward. |
 
-- A bucket file MUST contain at most one METAENTRY. A second METAENTRY,
-  or a METAENTRY appearing after any non-meta entry, is a fatal parse
-  error and the bucket SHALL be rejected.
-- If a METAENTRY is present, it MUST be the first record in the file.
-- For Hot Archive buckets, the METAENTRY's `ext.v()` MUST be 1 and
-  `ext.bucketListType` MUST be `HOT_ARCHIVE`; a parser that encounters
-  any other value SHALL reject the bucket.
-- In the absence of any METAENTRY (legacy pre-protocol-11 buckets), a
-  reader SHALL treat the bucket's protocol version as 0 (the genesis
-  lower bound). This avoids spurious "attempted downgrade" errors when
-  comparing protocol versions during merges.
-- INITENTRY records MUST NOT appear in buckets with protocol version
-  before 11.
-- The `ledgerVersion` in METAENTRY records the maximum protocol version
-  of any entry that contributed to this bucket.
+### 3.2 HotArchiveBucketEntry
 
-### 3.2 BucketMetadata
+`HotArchiveBucketEntry` is a tagged union with three cases:
 
-```
-struct BucketMetadata {
-    uint32 ledgerVersion;
-    union switch (int v) {
-    case 0:
-        void;
-    case 1:
-        BucketListType bucketListType;
-    } ext;
-};
+| Tag | Field | Semantics |
+|-----|-------|-----------|
+| `HOT_ARCHIVE_METAENTRY` | `metaEntry` of type `BucketMetadata` (with `ext.v() == 1`, `bucketListType() == HOT_ARCHIVE`) | Per-file header. |
+| `HOT_ARCHIVE_ARCHIVED` | `archivedEntry` of type `LedgerEntry` | Full snapshot of a persistent Soroban `LedgerEntry` evicted from the live state. |
+| `HOT_ARCHIVE_LIVE` | `key` of type `LedgerKey` | Marks an archived key as having been restored (back to live state); acts as the Hot Archive's tombstone. |
 
-enum BucketListType {
-    LIVE        = 0,
-    HOT_ARCHIVE = 1
-};
-```
+A conforming implementation MUST reject any `HOT_ARCHIVE_ARCHIVED` entry
+whose payload is not a persistent Soroban entry, and any
+`HOT_ARCHIVE_LIVE` entry whose key is not for a persistent Soroban
+type.
 
-For the Live BucketList, `ext.v()` is 0 for protocol versions before 23.
-For protocol 23 and later, `ext.v()` MUST be 1 and
-`ext.bucketListType()` MUST be `LIVE`. For the Hot Archive BucketList,
-`ext.v()` MUST be 1 and `ext.bucketListType()` MUST be `HOT_ARCHIVE`.
+### 3.3 Sort Order
 
-### 3.3 HotArchiveBucketEntry
+Entries within a bucket file are written in ascending order under a
+comparator that:
 
-For the Hot Archive BucketList (protocol 23+):
+1. Treats `METAENTRY` (or `HOT_ARCHIVE_METAENTRY`) as strictly less than
+   every other entry type. The metadata entry — if present — MUST
+   therefore be the first record.
+2. Compares non-metadata entries by their associated `LedgerKey`
+   ("identity"), independent of the entry tag (`INIT` / `LIVE` / `DEAD`
+   for `LiveBucket`, `ARCHIVED` / `LIVE` for `HotArchiveBucket`).
+3. Compares `LedgerKey` lexicographically by `LedgerEntryType` first,
+   then by the type-specific identifier: `accountID` for `ACCOUNT`;
+   `(accountID, asset)` for `TRUSTLINE`; `(sellerID, offerID)` for
+   `OFFER`; `(accountID, dataName)` for `DATA`; `balanceID` for
+   `CLAIMABLE_BALANCE`; `liquidityPoolID` for `LIQUIDITY_POOL`;
+   `(contract, key, durability)` for `CONTRACT_DATA`; `hash` for
+   `CONTRACT_CODE`; `configSettingID` for `CONFIG_SETTING`; `keyHash`
+   for `TTL`.
 
-```
-enum HotArchiveBucketEntryType {
-    HOT_ARCHIVE_METAENTRY = -1,
-    HOT_ARCHIVE_ARCHIVED  =  0,
-    HOT_ARCHIVE_LIVE      =  1
-};
+A conforming implementation MUST produce, for any input, a byte-for-byte
+identical bucket-file content under this ordering, so that the
+content-addressed SHA-256 hash matches stellar-core.
 
-union HotArchiveBucketEntry switch (HotArchiveBucketEntryType type) {
-case HOT_ARCHIVE_ARCHIVED:
-    LedgerEntry archivedEntry;
-case HOT_ARCHIVE_LIVE:
-    LedgerKey key;
-case HOT_ARCHIVE_METAENTRY:
-    BucketMetadata metaEntry;
-};
-```
+### 3.4 BucketEntryCounters
 
-Only persistent Soroban entries (persistent CONTRACT_DATA,
-CONTRACT_CODE) MAY appear in Hot Archive buckets. TTL entries MUST NOT
-appear in Hot Archive buckets. Attempting to store non-Soroban entries
-or TTL entries SHALL cause an error.
-
-### 3.4 Entry Sort Order
-
-All entries within a bucket file MUST be sorted by their identity key
-using the following lexicographic ordering:
-
-1. **Primary**: `LedgerEntryType` (numeric value, ascending).
-2. **Secondary**: type-specific fields in the following order:
-
-| Entry Type | Sort Fields |
-|-----------|-------------|
-| ACCOUNT | `accountID` |
-| TRUSTLINE | `accountID`, then `asset` |
-| OFFER | `sellerID`, then `offerID` |
-| DATA | `accountID`, then `dataName` |
-| CLAIMABLE_BALANCE | `balanceID` |
-| LIQUIDITY_POOL | `liquidityPoolID` |
-| CONTRACT_DATA | `contract`, then `key`, then `durability` |
-| CONTRACT_CODE | `hash` |
-| CONFIG_SETTING | `configSettingID` |
-| TTL | `keyHash` |
-
-METAENTRY records sort before all other entry types (type value -1).
-
-Within a merge, when two entries have the same identity key, the entry
-from the **newer** (lower-numbered level or curr vs snap) bucket takes
-precedence.
-
-### 3.5 Bucket File Format
-
-A bucket file is a sequence of record-mark framed XDR records:
-
-```
-[4-byte big-endian length][XDR-encoded BucketEntry]
-[4-byte big-endian length][XDR-encoded BucketEntry]
-...
-```
-
-The SHA-256 hash of a bucket is computed over the entire file contents
-(all length-prefixed records concatenated). The empty bucket has a
-well-known all-zero hash.
-
-Each bucket file is named with a random UUID to avoid collisions during
-concurrent operations. The file is written to a temporary path and then
-adopted by the BucketManager with its content hash as the canonical
-identifier.
+For each bucket, a per-type counter table is maintained recording the
+count and aggregate byte-size of entries by `LedgerEntryTypeAndDurability`
+(which splits `CONTRACT_DATA` into `TEMPORARY` and `PERSISTENT`
+variants). Counters are summed across the BucketList for reporting.
+These counts are observable through the snapshot query layer and MUST
+be deterministic given the BucketList contents.
 
 ---
 
@@ -342,1076 +257,807 @@ identifier.
 
 ### 4.1 Levels
 
-The BucketList consists of exactly **11 levels**, numbered 0 through 10.
-Each level L contains two buckets:
+A BucketList has a fixed depth of `kNumLevels = 11` for both
+`LiveBucketList` and `HotArchiveBucketList`. The depth is wired into
+the protocol: any change to it would alter the `bucketListHash`.
 
-- `curr`: accumulates entries from higher (lower-numbered) levels.
-- `snap`: holds the previous contents of `curr` after a spill, pending
-  merge with the next level.
+Each level holds:
+
+- `curr` — the active half;
+- `snap` — the frozen half awaiting promotion;
+- `next` — a `FutureBucket` (or in-memory bucket, for level 0)
+  representing the merge that will replace `curr` at the next spill of
+  the level above.
+
+The last level (`level == kNumLevels - 1`) has no `next`; it accumulates
+all older state and never spills.
 
 ### 4.2 Level Sizing
 
-Level sizes follow a geometric progression:
+For algorithmic-boundary purposes the idealized size of level `i`, in
+ledgers, is
 
 ```
-levelSize(L)  = 1 << (2 * (L + 1))    // in ledgers
-levelHalf(L)  = levelSize(L) >> 1
+levelSize(i)  = 1 << (2 * (i + 1))
+levelHalf(i)  = levelSize(i) / 2
 ```
 
-| Level | levelSize | levelHalf | Approximate time (5s close) |
-|-------|-----------|-----------|---------------------------|
-| 0     | 4         | 2         | 20 seconds |
-| 1     | 16        | 8         | 80 seconds |
-| 2     | 64        | 32        | ~5 minutes |
-| 3     | 256       | 128       | ~21 minutes |
-| 4     | 1,024     | 512       | ~85 minutes |
-| 5     | 4,096     | 2,048     | ~5.7 hours |
-| 6     | 16,384    | 8,192     | ~22.8 hours |
-| 7     | 65,536    | 32,768    | ~3.8 days |
-| 8     | 262,144   | 131,072   | ~15.2 days |
-| 9     | 1,048,576 | 524,288   | ~60.7 days |
-| 10    | 4,194,304 | 2,097,152 | ~242.8 days |
+This yields the following idealized sizes:
 
-### 4.3 Bucket Update Period
+| level | levelSize | levelHalf |
+|------:|----------:|----------:|
+| 0 | 4 | 2 |
+| 1 | 16 | 8 |
+| 2 | 64 | 32 |
+| 3 | 256 | 128 |
+| 4 | 1024 | 512 |
+| 5 | 4096 | 2048 |
+| 6 | 16384 | 8192 |
+| 7 | 65536 | 32768 |
+| 8 | 262144 | 131072 |
+| 9 | 1048576 | 524288 |
+| 10 | 4194304 | 2097152 |
 
-The `bucketUpdatePeriod` for level L determines how often (in ledger
-closes) new entries are added to that level:
+The actual size and ledger range of `curr` and `snap` at a given ledger
+`k` follow the recursive `sizeOfCurr(k, level)` and `sizeOfSnap(k, level)`
+functions. While the idealized sizes are powers of four, every level's
+range carries an "initial skew" introduced while the BucketList is
+filling up. This skew is observable but does not affect determinism:
+the hash depends only on the contents of `curr` and `snap`, not on the
+ledger range they cover.
 
-```
-bucketUpdatePeriod(L, isCurr):
-    if not isCurr:
-        return bucketUpdatePeriod(L + 1, true)
-    if L == 0: return 1
-    return 1 << (2 * L - 1)    // equivalently: levelHalf(L - 1)
-```
+### 4.3 Spill Condition
 
-The `isCurr` parameter distinguishes between curr and snap buckets. Snap
-buckets update at the rate of the next level's curr bucket.
-
-Level 0 curr is updated every ledger. Level 1 curr is updated every 2
-ledgers. Level 2 curr every 8 ledgers, and so on.
-
-### 4.4 Spill Condition
-
-A level L spills (moves `curr` to `snap` and starts a fresh `curr`)
-when:
+A level `i` spills (its `curr` becomes `snap` and the next level's
+`curr` absorbs the prior `snap`) precisely at the ledger boundaries:
 
 ```
-levelShouldSpill(seq, L):
-    if L == kNumLevels - 1: return false    // deepest level never spills
-    return (seq & (levelHalf(L) - 1)) == 0
-    // equivalently: seq mod levelHalf(L) == 0
+levelShouldSpill(ledger, level) :=
+    level != kNumLevels - 1
+    AND ( ledger == roundDown(ledger, levelHalf(level))
+          OR ledger == roundDown(ledger, levelSize(level)) )
 ```
 
-When level L spills, the old `snap` at level L is merged with `curr`
-at level L+1. This merge runs asynchronously and MUST complete before
-the next spill of level L.
+where `roundDown(v, m) = v & ~(m - 1)`. The last level never spills.
 
-### 4.5 Oldest Ledger Tracking
+For each ledger `k`, the function `getMaxMergeLevel(k)` is the largest
+level for which `levelShouldSpill(k, level)` holds; spills are
+processed in descending order from that level down to level 1 (see
+`§5.3`).
 
-The oldest ledger whose entries may reside in a given bucket is
-computable from the current sequence number:
+### 4.4 Update Period
 
-```
-oldestLedgerInCurr(L, seq):
-    if L == 0: return seq
-    let step = levelHalf(L - 1)
-    // How many steps since last spill of this level
-    let stepsInCycle = ((seq - 1) / step) mod (levelSize(L) / step)
-    if stepsInCycle == 0:
-        // Just spilled, curr has exactly one batch
-        return seq
-    return seq - stepsInCycle * step
-
-oldestLedgerInSnap(L, seq):
-    if L == 0: return seq    // level 0 snap mirrors curr
-    let step = levelHalf(L - 1)
-    let stepsInCycle = ((seq - 1) / step) mod (levelSize(L) / step)
-    if stepsInCycle == 0:
-        // Just spilled; snap contains the old curr, which is half a cycle
-        return seq - levelHalf(L) + step
-    // Not just spilled; snap was set at last spill
-    let lastSpill = seq - stepsInCycle * step
-    return lastSpill - levelHalf(L) + step
-```
-
-### 4.6 BucketList Hash
-
-The BucketList hash is computed differently depending on the
-protocol version:
-
-**Before protocol 23:**
-```
-bucketListHash = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
-```
-
-**Protocol 23 and later** (CAP-0062):
-```
-liveHash       = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
-hotArchiveHash = SHA256(level_0_hash || level_1_hash || ... || level_10_hash)
-bucketListHash = SHA256(liveHash || hotArchiveHash)
-```
-
-The `liveHash` is computed over the Live BucketList levels and the
-`hotArchiveHash` is computed over the Hot Archive BucketList levels.
-Each BucketList has its own independent set of 11 levels.
-
-In both cases, each level hash is:
+For metrics and eviction-scan validity, each bucket has a
+`bucketUpdatePeriod(level, isCurr)`:
 
 ```
-level_hash(L) = SHA256(curr_hash(L) || snap_hash(L))
+bucketUpdatePeriod(level, true)  = (level == 0) ? 1 : 1 << (2 * level - 1)
+bucketUpdatePeriod(level, false) = bucketUpdatePeriod(level + 1, true)
 ```
 
-and `curr_hash(L)` and `snap_hash(L)` are the SHA-256 content hashes of
-the respective bucket files. An empty bucket has hash `0x0000...0000`
-(32 zero bytes).
+Equivalently, the `curr` of level `i > 0` is rewritten every
+`2^(2i - 1)` ledgers; level 0's `curr` is rewritten every ledger; and
+each `snap` inherits the update period of the `curr` of the level below.
 
-This hash is included in the `LedgerHeader.bucketListHash` field and is
-part of the consensus-critical state.
+### 4.5 Tombstone Retention
 
-### 4.7 Tombstone Retention
-
-Tombstones (DEADENTRY records) MUST be retained at all levels except
-level 10 (the deepest). At level 10, tombstones SHALL be elided during
-merges because there are no deeper levels where stale versions could be
-revived.
+The function `keepTombstoneEntries(level)` returns `true` for every
+level except the last:
 
 ```
-keepTombstoneEntries(L):
-    return L < kNumLevels - 1    // true for levels 0..9, false for level 10
+keepTombstoneEntries(level) := level < kNumLevels - 1
 ```
+
+When the result is `true`, tombstone entries (`DEADENTRY` for
+`LiveBucket`, `HOT_ARCHIVE_LIVE` for `HotArchiveBucket`) MUST be
+written to the output bucket. When the result is `false` (i.e. the
+merge writes the deepest level), tombstones MUST be elided. Elision at
+the deepest level is the mechanism by which deleted entries are
+garbage-collected; for any shallower level, tombstones MUST be
+preserved so they can continue to shadow older versions of the same
+key.
+
+### 4.6 Oldest Ledger Tracking
+
+`oldestLedgerInCurr(k, level)` and `oldestLedgerInSnap(k, level)` are
+defined recursively in terms of `sizeOfCurr` and `sizeOfSnap`. These
+quantities are observable through the publishing pipeline
+(`CATCHUP_SPEC`), but the BucketList hash depends only on contents,
+not on ledger ranges.
+
+### 4.7 BucketList Hash Computation
+
+The BucketList hash is computed as the SHA-256 of the concatenation of
+each level's hash, in order from level 0 to level `kNumLevels - 1`:
+
+```
+levelHash(i)  := SHA256( curr(i).hash || snap(i).hash )
+listHash      := SHA256( levelHash(0) || levelHash(1) || ... || levelHash(kNumLevels - 1) )
+```
+
+Each bucket's own hash is the SHA-256 of its on-disk byte content as
+written by the deterministic output iterator (see `§5.4`). An empty
+bucket has hash `0000...`.
+
+The `bucketListHash` recorded in the `LedgerHeader` is computed from
+both BucketLists from protocol 23 onward:
+
+```
+@version(≥23)
+bucketListHash := SHA256( liveBucketList.hash || hotArchiveBucketList.hash )
+
+@version(<23)
+bucketListHash := liveBucketList.hash
+```
+
+A conforming implementation MUST reproduce this hash exactly.
+
+### 4.8 LedgerHeader Skip List
+
+When the ledger sequence is a multiple of `SKIP_1`, the BucketList hash
+just computed is propagated into a four-element `skipList` maintained
+in the `LedgerHeader`. With `SKIP_1 = 50`, `SKIP_2 = 5_000`,
+`SKIP_3 = 50_000`, `SKIP_4 = 500_000`, the shift cascade is:
+
+1. If `ledgerSeq % SKIP_1 == 0`, then set `skipList[0] := bucketListHash`.
+2. If additionally `(ledgerSeq - SKIP_1) > 0`
+   and `(ledgerSeq - SKIP_1) % SKIP_2 == 0`, then shift
+   `skipList[0]` into `skipList[1]` before step 1.
+3. If additionally `(ledgerSeq - SKIP_2 - SKIP_1) > 0`
+   and `(ledgerSeq - SKIP_2 - SKIP_1) % SKIP_3 == 0`, then shift
+   `skipList[1]` into `skipList[2]` first.
+4. If additionally `(ledgerSeq - SKIP_3 - SKIP_2 - SKIP_1) > 0`
+   and `(ledgerSeq - SKIP_3 - SKIP_2 - SKIP_1) % SKIP_4 == 0`, then
+   shift `skipList[2]` into `skipList[3]` first.
+
+The skip list is a consensus-deterministic field of the `LedgerHeader`
+and MUST be reproduced exactly.
 
 ---
 
 ## 5. Bucket Lifecycle
 
-### 5.1 Bucket Creation
+### 5.1 Entry Conversion
 
-New buckets are created via the `BucketOutputIterator`, which:
+Before being written, a per-ledger LiveBucketList batch
+`(initEntries, liveEntries, deadEntries)` is converted into a sorted
+`vector<BucketEntry>` as follows:
 
-1. Opens a temporary file with a random name in the bucket directory.
-2. If the protocol version supports METAENTRY (>= 11), writes a
-   METAENTRY as the first record containing the bucket's protocol
-   version.
-3. Accepts entries via `put()`, maintaining a single-entry buffer to
-   deduplicate consecutive entries with the same identity key (only the
-   last entry for a given key is written).
-4. On finalization (`getBucket()`), flushes the buffer, closes the file,
-   computes the SHA-256 hash, and hands the file to the BucketManager
-   for adoption.
+1. Each `e` in `initEntries` becomes a `BucketEntry` of type
+   `INITENTRY` (`@version(≥11)`) or `LIVEENTRY` (`@version(<11)`) with
+   `liveEntry == e`.
+2. Each `e` in `liveEntries` becomes `LIVEENTRY` with `liveEntry == e`.
+3. Each `k` in `deadEntries` becomes `DEADENTRY` with `deadEntry == k`.
+4. The combined vector is sorted by `BucketEntryIdCmp`. The caller
+   MUST ensure no two input entries refer to the same `LedgerKey`; any
+   duplicates detected during the sort assertion MUST cause the batch
+   to be rejected.
 
-If the output contains zero non-meta entries, the temporary file is
-deleted and the empty bucket (all-zero hash) is returned.
+For the Hot Archive, conversion is analogous: each `archivedEntries`
+element becomes `HOT_ARCHIVE_ARCHIVED`, and each `restoredEntries`
+element becomes `HOT_ARCHIVE_LIVE`. Both kinds MUST refer exclusively
+to persistent Soroban ledger entries.
 
-### 5.2 Entry Conversion (addBatch Input)
+### 5.2 Creation: `fresh`
 
-When `addBatch` is called with init, live, and dead entry vectors, the
-entries are converted to `BucketEntry` records and sorted:
+`fresh(bucketManager, protocolVersion, ...)` creates a new bucket from
+a converted entry vector:
 
-```
-convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries):
-    result = []
-    for entry in initEntries:
-        result.append(BucketEntry{
-            type = useInit ? INITENTRY : LIVEENTRY,
-            liveEntry = entry })
-    for entry in liveEntries:
-        result.append(BucketEntry{type=LIVEENTRY, liveEntry=entry})
-    for key in deadEntries:
-        result.append(BucketEntry{type=DEADENTRY, deadEntry=key})
-    sort result by BucketEntryIdCmp
-    require no two entries in result share the same identity key
-    return result
-```
+1. Build a `BucketMetadata` with `ledgerVersion := protocolVersion`. For
+   `@version(≥23)` set `ext.v(1)` and `ext.bucketListType()` to `LIVE`
+   or `HOT_ARCHIVE` as appropriate. For `HotArchiveBucket`, the
+   metadata extension MUST be present (the Hot Archive only exists at
+   protocol ≥23).
+2. Open a `BucketOutputIterator` with `keepTombstoneEntries = true`.
+3. If `protocolVersion >= 11`, write a `METAENTRY` first.
+4. Write each entry in sorted order via `put()`.
+5. Close the output, compute the SHA-256 of the byte stream, and adopt
+   the file into `BucketManager` (`§8.1`).
 
-The `useInit` flag is true for protocol versions
->= `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (11) and false
-before that. Pre-protocol-11, init entries from the ledger MUST be
-written as LIVEENTRY records (since INITENTRY did not yet exist).
+A "level −1 snap" variant `freshInMemoryOnly` constructs a transient
+in-memory `LiveBucket` for the immediate level-0 merge path (`§5.5`);
+it skips the on-disk write and hash computation.
 
-The deduplication check is a fatal invariant: a single ledger close
-SHALL NOT produce two BucketList changes that share an identity key.
-A violation indicates upstream corruption and the batch MUST be
-rejected.
+### 5.3 addBatch — Per-Ledger Update Sequence
 
-For the Hot Archive BucketList, the analogous conversion accepts
-`archivedEntries` and `restoredEntries` and emits
-`HOT_ARCHIVE_ARCHIVED` / `HOT_ARCHIVE_LIVE` records. Each entry MUST
-be a persistent Soroban type; non-persistent entries SHALL cause
-an error.
+For each ledger `currLedger > 0`, `addBatchInternal` performs the
+following steps. The ordering is normative.
 
-### 5.3 Level 0 Update (addBatchInternal)
+1. **Shadow gathering.** Collect a list of all current `(curr, snap)`
+   pointers from every level into `shadows`, then pop the last two
+   elements (the level being merged into does not shadow itself, nor
+   does its immediate predecessor).
+2. **Spill propagation, descending order.** For `i` from
+   `kNumLevels - 1` down to `1`:
+   1. Pop the next two `shadows` entries (so that at iteration `i`,
+      only levels `0..i-2` remain as shadows).
+   2. If `levelShouldSpill(currLedger, i - 1)`, then:
+      - `snap := levels[i - 1].snap()` — promotes level `i-1`'s
+        `curr` to its `snap`, resetting `curr` to empty.
+      - `levels[i].commit()` — resolves any `next` from a prior
+        ledger, replacing `curr` with the merge output.
+      - `levels[i].prepare(app, currLedger, currLedgerProtocol, snap,
+        shadows, countMergeEvents = true)` — kicks off a new merge
+        for level `i`.
+3. **Level 0 update.** Call `prepareFirstLevel(app, currLedger,
+   currLedgerProtocol, ...)`, then `levels[0].commit()` to install
+   the new level-0 `curr`.
+4. **Resolve ready futures.** Walk every level and, for any
+   `FutureBucket` whose merge has finished, eagerly resolve it. This
+   step MAY be skipped under test configuration but SHALL run in
+   production for deterministic publishing behavior.
 
-On every ledger close, `addBatch` is called with the changes from that
-ledger. The process for each level is:
+The shadow popping in step 2.1 implements the rule that level `i`'s
+merge MUST NOT shadow against itself or the level whose `snap` it is
+absorbing.
 
-```
-addBatchInternal(seq, initEntries, liveEntries, deadEntries):
-    // Process levels from deepest to shallowest (reverse order).
-    // This is critical: it ensures curr is snapped before anything
-    // is added to it from above.
-    for L = kNumLevels - 1 downto 1:
-        if bucketUpdatePeriod(L, true) does not divide seq:
-            continue   // this level is not updated this ledger
+### 5.4 prepare and shouldMergeWithEmptyCurr
 
-        if levelShouldSpill(seq, L):
-            level[L].snap()       // move curr → snap
-            level[L].prepare(...)  // start merge with next level
+`prepare(app, currLedger, currLedgerProtocol, snap, shadows, ...)`
+builds the `FutureBucket` that will become level `i`'s new `curr` at
+the next spill event:
 
-    // Level 0: create fresh bucket from sorted entries
-    prepareFirstLevel(entries, seq)
-    if levelShouldSpill(seq, 0):
-        level[0].snap()
-        level[0].prepare(...)
-```
+1. Choose the `curr` input: if
+   `shouldMergeWithEmptyCurr(currLedger, i)` is true, use an empty
+   bucket; otherwise use the current level `i` `curr`.
+2. Compute the effective shadow vector based on the `snap`'s protocol
+   version: if `snap.bucketVersion >= FIRST_PROTOCOL_SHADOWS_REMOVED`
+   (protocol 12), use an empty shadow vector; otherwise use the
+   caller-provided shadows.
+3. Construct `FutureBucket(app, curr, snap, shadows, protocol, level)`
+   which begins the merge on a worker thread.
 
-For level 0 specifically, an **in-memory merge** optimization MAY be
-used: the new entries and the existing level 0 `curr` are merged in
-memory without writing intermediate bucket files. The merged result is
-then written to a single output bucket.
+`shouldMergeWithEmptyCurr(ledger, level)` returns `true` when the
+level's `next` state is going to absorb only the prior level's `snap`
+without merging into existing `curr` content (the "snap-only" cases).
+This corresponds to ledgers that are one previous-level-half away from
+a snap of the current level.
 
-### 5.4 Level Prepare and Snap
+### 5.5 Level 0 In-Memory Merge (LiveBucket Only)
 
-When a level spills:
+For `LiveBucketList` level 0, an optimized in-memory path is used
+when both inputs have in-memory entry vectors. The procedure:
 
-```
-snap():
-    // Move curr to snap position
-    mSnap = mCurr
-    mCurr = emptyBucket
+1. Build a transient `freshInMemoryOnly` "level −1 snap" from the
+   per-ledger batch.
+2. If the current level-0 `curr` does not have in-memory entries (a
+   startup edge case), fall back to the regular `prepare` path, which
+   writes the snap to disk via `fresh` and starts a normal
+   `FutureBucket` merge.
+3. Otherwise call `LiveBucket::mergeInMemory(curr, snap, ...)`, which
+   merges the two in-memory entry vectors using the standard merge
+   algorithm (`§6`) and writes the result both to disk (so it can be
+   served from a file like any other bucket) and to memory (so the
+   next ledger's level-0 merge can also avoid disk I/O).
+4. Store the result in the level's `next` slot as a direct
+   `shared_ptr<LiveBucket>` (not a `FutureBucket`).
+5. `levels[0].commit()` then installs that `LiveBucket` as the new
+   `curr`.
 
-prepare(app, nextLevel, shadows, maxProtocol, countEvents):
-    // mSnap now holds the old curr, which needs to merge with
-    // the next level's curr
-    nextLevel.setNext(
-        FutureBucket(app, nextLevel.curr, mSnap, shadows,
-                     maxProtocol, countEvents, nextLevel.index))
-```
+`HotArchiveBucket` does NOT support in-memory merges; its level 0 uses
+the standard `prepare` path.
 
-After snapping, the old `snap` of this level has been passed to the
-next level's merge via FutureBucket. The next level's `curr` is
-replaced with the merge result when the FutureBucket resolves.
+### 5.6 snap and commit
 
-### 5.5 Level Commit
+- `snap()` on a level returns the current `curr`, installs it as the
+  new `snap`, and resets `curr` to an empty bucket.
+- `commit()` resolves the level's `next` and installs it as the new
+  `curr`. For an in-memory `next` (level 0 only), this unwraps the
+  `shared_ptr<BucketT>`. For a `FutureBucket`, this calls `resolve()`
+  to obtain the merged bucket. After commit, `next` is cleared.
 
-When a FutureBucket merge completes (the `next` field resolves), the
-result replaces the level's `curr`:
-
-```
-commit():
-    if mNext is resolved:
-        mCurr = mNext.resolve()
-        mNext.clear()
-```
-
-**Implementation note**: In stellar-core, `mNextCurr` is a
-`std::variant` that can hold either a `FutureBucket` (for async merges
-at levels 1+) OR a direct `shared_ptr<BucketT>` (for in-memory merges
-at level 0). At level 0, the merge result is computed synchronously and
-stored directly as a bucket pointer, bypassing the FutureBucket state
-machine.
+A pending merge MUST NOT be in progress when `setNext` is called for
+the same level; the implementation MUST detect this and abort.
 
 ---
 
 ## 6. Merge Algorithm
 
-### 6.1 Overview
+### 6.1 Effective Protocol Version
 
-A merge combines two input buckets (`old` and `new`, where `new` is
-from a shallower level) into a single output bucket. The merge is a
-sorted merge-join that respects entry lifecycle semantics.
-
-### 6.2 Protocol Version Calculation
-
-The output bucket's protocol version is the maximum of:
-- The `new` bucket's protocol version
-- The `old` bucket's protocol version
-- The protocol versions of any shadow buckets whose own version is
-  strictly less than `FIRST_PROTOCOL_SHADOWS_REMOVED` (12).
+For a merge of `old` and `new` (and, for `LiveBucket`, a vector of
+shadows), the effective protocol version is computed by
+`calculateMergeProtocolVersion`:
 
 ```
-calculateMergeProtocolVersion(new, old, shadows):
-    version = max(new.protocolVersion, old.protocolVersion)
-    for s in shadows:
-        if s.protocolVersion < FIRST_PROTOCOL_SHADOWS_REMOVED:
-            version = max(version, s.protocolVersion)
-    return version
+protocolVersion := max( old.metadata.ledgerVersion,
+                        new.metadata.ledgerVersion )
+
+for each shadow s:
+    if s.metadata.ledgerVersion < FIRST_PROTOCOL_SHADOWS_REMOVED:
+        protocolVersion := max(protocolVersion, s.metadata.ledgerVersion)
+
+if protocolVersion > maxProtocolVersion:
+    throw "bucket protocol version exceeds maxProtocolVersion"
 ```
 
-The shadow cutoff is required for determinism: once any newer bucket
-level has cut over to the INITENTRY-supporting merge algorithm, INIT
-plus DEAD mutual annihilations can occur that would revive entry state
-on older levels if a shadow at a newer protocol were allowed to raise
-the merge's protocol version. The computed `version` MUST NOT exceed
-`maxProtocolVersion`; otherwise the merge SHALL fail.
+The maximum-over-inputs rule (and the conditional inclusion of
+pre-protocol-12 shadows) ensures that the moment a single new-protocol
+bucket enters the BucketList, every merge it participates in upgrades
+its shadow semantics. This guarantees correctness when
+`INITENTRY`/`DEADENTRY` pairwise annihilation interacts with shadows in
+older levels.
 
-The output bucket's metadata extension MUST also be propagated:
+The output bucket's metadata `ledgerVersion` equals the effective
+protocol version. If any input has `metadata.ext.v() == 1`, the output
+MUST also use `ext.v(1)` with the appropriate `bucketListType`; this
+requires the resolved `protocolVersion` to be at least
+`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION`.
 
-```
-if new.metadata.ext.v() == 1:
-    require maxProtocolVersion >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-    out.metadata.ext = new.metadata.ext
-else if old.metadata.ext.v() == 1:
-    require maxProtocolVersion >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-    out.metadata.ext = old.metadata.ext
-```
+### 6.2 Merge Loop
 
-This ensures that once a bucket has been written with `ext.v() == 1`
-(carrying the `bucketListType` discriminator), every merge that
-consumes it produces an output bucket with the same extension.
-
-### 6.3 Merge Loop
-
-The core merge operates on two `BucketInputIterator` streams (`ni` for
-new, `oi` for old) and one `BucketOutputIterator` output:
+The merge proceeds as a single linear pass over `old` and `new`
+(supplied either as file-backed iterators or as in-memory
+`vector<EntryT>`s). The driver is `mergeInternal`:
 
 ```
-merge(old, new, shadows, keepTombstones):
-    mergeProtocol = calculateMergeProtocolVersion(new, old, shadows)
-    ni = BucketInputIterator(new)
-    oi = BucketInputIterator(old)
-    out = BucketOutputIterator(keepTombstones, metadata(mergeProtocol))
-
-    while ni is valid AND oi is valid:
-        cmp = compare(ni.entry, oi.entry)
-        if cmp < 0:
-            // New entry comes first (no equal key in old)
-            maybePut(out, ni.entry, shadows)
-            advance(ni)
-        else if cmp > 0:
-            // Old entry comes first (no equal key in new)
-            maybePut(out, oi.entry, shadows)
-            advance(oi)
-        else:
-            // Same key: apply lifecycle merge rules
-            mergeCasesWithEqualKeys(out, ni.entry, oi.entry, shadows)
-            advance(ni)
-            advance(oi)
-
-    // Drain remaining entries
-    while ni is valid:
-        maybePut(out, ni.entry, shadows)
-        advance(ni)
-    while oi is valid:
-        maybePut(out, oi.entry, shadows)
-        advance(oi)
-
-    return out.getBucket()
+while !inputSource.isDone():
+    if not mergeCasesWithDefaultAcceptance(...):
+        mergeCasesWithEqualKeys(...)
 ```
 
-### 6.4 Shadow Elision (Pre-Protocol 12)
+`mergeCasesWithDefaultAcceptance` handles the four "easy" cases:
 
-Before protocol 12, shadow buckets are used to elide entries that have
-been superseded by shallower levels. When outputting an entry, the merge
-checks if the entry's key exists in any shadow bucket:
+| Case | Action |
+|------|--------|
+| `new` exhausted, or `old < new` | Emit `old`, advance `old` |
+| `old` exhausted, or `new < old` | Emit `new`, advance `new` |
+| both exhausted | Loop exits |
+| equal keys | Defer to `mergeCasesWithEqualKeys` |
+
+Before emission, each entry is checked for protocol legality
+(`checkProtocolLegality`) and then passed through `maybePut`, which
+applies shadow elision (`§6.3`) and optionally writes the entry to the
+output iterator. The output iterator deduplicates same-key emissions
+via a one-element lookahead buffer.
+
+### 6.3 Shadow Elision (LiveBucket Only)
+
+For each candidate entry produced by the merge loop, `LiveBucket::maybePut`
+decides whether to write it based on the effective protocol version and
+the entry type.
+
+@version(<11) — pre-`INITENTRY`:
+
+`keepShadowedLifecycleEntries` is `false`. Every candidate is checked
+against every shadow iterator and dropped if a keywise-equal shadow
+exists, regardless of the candidate's type. This is the original shadow
+algorithm.
+
+@version(≥11, <12) — `INITENTRY` introduced, shadows still permitted:
+
+`keepShadowedLifecycleEntries` is `true`. `INITENTRY` and `DEADENTRY`
+candidates are NEVER dropped due to shadows. Only `LIVEENTRY`
+candidates are subject to shadow elision. The asymmetric rule prevents
+the following anti-pattern:
 
 ```
-maybePut(out, entry, shadows, keepShadowedLifecycleEntries):
-    if protocol >= FIRST_PROTOCOL_SHADOWS_REMOVED (12):
-        out.put(entry)
-        return
-
-    if entry is METAENTRY:
-        out.put(entry)
-        return
-
-    // Protocol 11+: never elide INIT or DEAD entries via shadows.
-    // Only LIVE entries may be shadow-elided.
-    if keepShadowedLifecycleEntries
-       AND (entry.type == INITENTRY OR entry.type == DEADENTRY):
-        out.put(entry)
-        return
-
-    for shadow in shadows:
-        if shadow.contains(entry.key):
-            // Entry is shadowed, skip it
-            record shadow elision metric
-            return
-
-    out.put(entry)
+lev1:DEAD, lev2:INIT, lev3:DEAD, lev4:INIT
 ```
 
-The `keepShadowedLifecycleEntries` flag is true for merges at protocol
-versions >= `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (11)
-and false before that. In protocol 11 and later (but still pre-protocol
-12), INITENTRY and DEADENTRY records MUST NOT be elided by shadow
-matching, because eliminating an INITENTRY or DEADENTRY could revive a
-stale state from a deeper level or break the INIT/DEAD annihilation
-contract. Only LIVEENTRY records may be removed by shadow matching in
-that window.
+from collapsing to `lev4:INIT` and "reviving" an older state via the
+pairwise `INIT + DEAD => empty` rule.
 
-From protocol 12 onward, shadows are removed entirely. Instead, the
-INIT/DEAD lifecycle (Section 6.5) prevents stale entry revival.
+@version(≥12) — `FIRST_PROTOCOL_SHADOWS_REMOVED`:
 
-### 6.5 Equal-Key Merge Rules (Live BucketList)
+Shadows are forbidden. If a merge constructed under this protocol is
+asked to consider a non-empty shadow vector, the implementation MUST
+abort. `FutureBucket` construction enforces this at the call site.
 
-When two entries with the same identity key meet during a merge, the
-result depends on their types. The `new` entry is always from the
-shallower (more recent) bucket.
+The shadow scan is implemented as a parallel advance over the shadow
+iterators using `BucketEntryIdCmp`: each shadow iterator is advanced
+forward while strictly less than the candidate; equality at any shadow
+indicates a hit.
 
-#### Pre-INITENTRY Protocol (before protocol 11)
+### 6.4 Equal-Key Merge Rules (LiveBucket)
 
-Only LIVE and DEAD types exist. The new entry always wins:
+When `old` and `new` have keywise-equal entries, `mergeCasesWithEqualKeys`
+applies the following rules:
 
-| New \ Old | LIVE | DEAD |
-|-----------|------|------|
-| **LIVE**  | emit LIVE (new) | emit LIVE (new) |
-| **DEAD**  | emit DEAD (new) | emit DEAD (new) |
+| old | new | result |
+|-----|-----|--------|
+| `INIT` | `INIT` | error — malformed |
+| `LIVE` | `INIT` | error — malformed |
+| `DEAD` | `INIT = x` | emit `LIVE = x` |
+| `INIT = x` | `LIVE = y` | emit `INIT = y` |
+| `INIT` | `DEAD` | emit nothing (annihilation) |
+| `LIVE`/`DEAD` | `LIVE`/`DEAD` (no INIT in pair) | emit `new` |
 
-#### Post-INITENTRY Protocol (protocol 11+)
+Both `old` and `new` iterators advance unconditionally. The emitted
+output (if any) is passed through `maybePut` (`§6.3`).
 
-The INIT type enables tracking whether an entry was freshly created
-(INIT) or merely updated (LIVE). This allows safe tombstone elimination
-at the deepest level without risking entry revival.
+Two invariants are preserved by this table:
 
-| New \ Old | INIT | LIVE | DEAD |
-|-----------|------|------|------|
-| **INIT**  | error (invalid) | error (invalid) | emit LIVE (new data) |
-| **LIVE**  | emit INIT (new data, INIT type) | emit LIVE (new) | emit LIVE (new) |
-| **DEAD**  | annihilate (emit nothing) | emit DEAD (new) | emit DEAD (new) |
+- **Invariant V (value):** A reader of the merged bucket sees the
+  same value for the key as it would if the two pre-merge entries were
+  read in order.
+- **Invariant L (lifecycle):** Whenever an entry is in `INIT` state,
+  the chronological state immediately preceding it is `DEAD` or
+  nonexistent. This justifies the `INIT + DEAD => empty` annihilation:
+  the predecessor of the merged-away `INIT` is necessarily `DEAD` or
+  nonexistent, so the deletion of the pair preserves the externally
+  visible state.
 
-Key rules:
+`@version(<11)`: `INITENTRY` does not exist. Equal-key merges always
+keep `new`. The implementation MUST reject any attempt to write
+`INITENTRY` or `METAENTRY` to a pre-protocol-11 output (enforced by
+`checkProtocolLegality`).
 
-- **Old=INIT, New=DEAD → nothing**: An entry that was created (INIT)
-  and then deleted (DEAD) within the same merge window annihilates —
-  neither record is emitted. This is the critical optimization that
-  enables tombstone elimination at the deepest level.
+### 6.5 Equal-Key Merge Rules (HotArchiveBucket)
 
-- **Old=DEAD, New=INIT=x → LIVE=x**: A deletion followed by
-  re-creation merges to a LIVE entry with the new data. The INIT is
-  converted to LIVE because the explicit DEAD predecessor already
-  serves as the deletion boundary — the entry does not need the INIT
-  marker to protect against revival of a stale version below.
+For the Hot Archive, the rule is trivial: emit `new`, advance both.
+There is no `INIT`/annihilation logic, because the Hot Archive only
+holds full snapshots (`HOT_ARCHIVE_ARCHIVED`) and restoration
+tombstones (`HOT_ARCHIVE_LIVE`), and a newer occurrence of either
+strictly supersedes any older one for the same key.
 
-- **Old=INIT=x, New=LIVE=y → INIT=y**: An update to an entry that was
-  originally created preserves the INIT marker with the new data. This
-  ensures future merges know the entry has no older version below.
+### 6.6 Tombstone Elision at the Deepest Level
 
-- **Old=INIT, New=INIT** and **Old=LIVE, New=INIT**: These
-  combinations violate the lifecycle invariant (an INIT must be
-  preceded by DEAD or absence) and indicate a bug. An implementation
-  MUST signal an error.
+Independent of shadows, when a merge produces the deepest level
+(`level == kNumLevels - 1`), the output iterator is constructed with
+`keepTombstoneEntries = false`. Each candidate entry is then tested by
+`BucketT::isTombstoneEntry(e)`:
 
-### 6.6 Tombstone Elision at Deepest Level
+- `LiveBucket`: `e.type() == DEADENTRY`;
+- `HotArchiveBucket`: `e.type() == HOT_ARCHIVE_LIVE`.
 
-At level 10 (the deepest level), `keepTombstoneEntries` is false. The
-`BucketOutputIterator` SHALL skip any entry for which
-`isTombstoneEntry()` returns true:
+If true, the entry is dropped before being buffered. This is the only
+mechanism by which tombstones are removed from the BucketList; it
+operates independently of protocol version and shadow rules.
 
-- For the Live BucketList: DEADENTRY records are tombstones.
-- For the Hot Archive BucketList: HOT_ARCHIVE_LIVE records are
-  tombstones (they indicate an entry was restored from archive).
+### 6.7 In-Memory Merge
 
-This is safe because there are no deeper levels where a stale version
-could be accidentally revived.
+`LiveBucket::mergeInMemory` performs the same merge algorithm against
+two `MemoryMergeInput` sources (vectors of `BucketEntry`). It is used
+only for level-0 merges where both inputs are in-memory. The result is
+written to disk (so the bucket is content-addressed and indexable like
+any other) and additionally retained in memory so the next ledger's
+level-0 merge can again skip disk I/O.
 
-### 6.7 In-Memory Merge (Level 0 Optimization)
+### 6.8 Output Bucket Identity
 
-For level 0, where buckets are typically small, an in-memory merge
-optimization MAY be used:
-
-1. The existing `curr` bucket's entries are loaded into memory (or
-   retained from a previous in-memory creation).
-2. The new entries from `addBatch` are merged with the in-memory entries
-   using the same merge rules as the file-based merge.
-3. The result is written to a new bucket file via `BucketOutputIterator`,
-   and the in-memory state is preserved for the next merge.
-
-This avoids the overhead of reading the existing `curr` from disk for
-every ledger close. The in-memory state MUST be discarded when level 0
-spills (the entries move to `snap`).
-
-### 6.8 Output Deduplication
-
-The `BucketOutputIterator` maintains a single-entry buffer. When `put()`
-is called:
-
-1. If the buffer is empty, the entry is buffered.
-2. If the buffer contains an entry with a **different** key (less than
-   the new entry), the buffered entry is flushed to disk and the new
-   entry replaces it.
-3. If the buffer contains an entry with the **same** key, the new entry
-   replaces the buffer without flushing. This handles the case where
-   merge rules produce a replacement rather than an additional entry.
-
-Entries MUST be presented to `put()` in sorted order. If an entry
-compares less than the buffered entry, it indicates out-of-order input,
-which is a fatal error.
+Two merges with identical `(keepTombstoneEntries, currHash, snapHash,
+shadowHashes)` produce buckets with identical on-disk content and
+therefore identical hashes. If a merge produces an empty output (zero
+entries written after all elisions), the temporary file is deleted, no
+bucket is adopted, and an empty bucket sentinel (hash `0000...`) is
+returned.
 
 ---
 
-## 7. Asynchronous Merge Management
+## 7. Asynchronous Merges and FutureBucket
 
 ### 7.1 FutureBucket State Machine
 
-The `FutureBucket` manages the lifecycle of an asynchronous merge. It
-has five states:
+A `FutureBucket` cycles through the following observable states:
 
-```
-FB_CLEAR        No inputs, no outputs, no hashes.
-FB_HASH_INPUTS  Input hashes known (deserialized from HAS), no live values.
-FB_HASH_OUTPUT  Output hash known (deserialized from HAS), no live values.
-FB_LIVE_INPUTS  Live input buckets present, merge running (future valid).
-FB_LIVE_OUTPUT  Merge complete, output bucket available.
-```
+| State | Meaning |
+|-------|---------|
+| `FB_CLEAR` | No inputs, no output, no hashes. |
+| `FB_LIVE_INPUTS` | A merge is running on a worker thread; inputs are alive, output is a pending `shared_future`. |
+| `FB_LIVE_OUTPUT` | The merge has completed; the output bucket is held by `shared_ptr`. |
+| `FB_HASH_INPUTS` | Deserialized from a HAS: input hashes only, no live inputs and no output. |
+| `FB_HASH_OUTPUT` | Deserialized from a HAS: output hash only, no live inputs/output. |
 
-State transitions:
+Permitted transitions:
 
-```
-                           +-----------+
-         Construction      |           |
-     +---(with inputs)---->| LIVE_     |---resolve()-->+
-     |                     | INPUTS    |               |
-     |                     +-----------+               v
-     |                                           +-----------+
-     |                                           | LIVE_     |
-     |                                           | OUTPUT    |
-     |                                           +-----------+
-     |
-+----+----+   deserialized   +-----------+   makeLive()
-|  CLEAR  |----------------->| HASH_     |----------->+
-+----+----+   (with inputs)  | INPUTS    |            |
-     |                       +-----------+            v
-     |                                          +-----------+
-     |       deserialized    +-----------+      | LIVE_     |
-     +---------------------> | HASH_     |      | INPUTS    |
-          (with output)      | OUTPUT    |      +-----------+
-                             +-----------+
-                                  |
-                          makeLive() (lookup)
-                                  |
-                                  v
-                             +-----------+
-                             | LIVE_     |
-                             | OUTPUT    |
-                             +-----------+
+```mermaid
+stateDiagram-v2
+    [*] --> FB_CLEAR
+    FB_CLEAR --> FB_LIVE_INPUTS: construct(curr, snap, shadows, ...)
+    FB_LIVE_INPUTS --> FB_LIVE_OUTPUT: resolve()
+    FB_HASH_INPUTS --> FB_LIVE_INPUTS: makeLive — restart merge
+    FB_HASH_OUTPUT --> FB_LIVE_OUTPUT: makeLive — bind existing bucket
+    FB_LIVE_OUTPUT --> FB_CLEAR: clear()
+    FB_LIVE_INPUTS --> FB_CLEAR: clear()
+    FB_HASH_INPUTS --> FB_CLEAR: clear()
+    FB_HASH_OUTPUT --> FB_CLEAR: clear()
 ```
 
-### 7.2 FutureBucket Construction
+A `FutureBucket` MUST NOT be transitioned directly between
+`FB_HASH_INPUTS` and `FB_HASH_OUTPUT`, nor directly between either
+`FB_LIVE_*` state and the opposite-direction `FB_HASH_*` state. The
+state-validity checks (in `checkState`) enforce these constraints.
 
-When a merge is needed (during `prepare`), a FutureBucket is constructed
-with live input buckets:
+### 7.2 Construction and Merge Start
 
-```
-FutureBucket(app, curr, snap, shadows, maxProtocol, countEvents, level):
-    state = FB_LIVE_INPUTS
-    inputCurrBucket = curr
-    inputSnapBucket = snap
-    inputShadowBuckets = shadows
-    // Record hashes for serialization
-    inputCurrBucketHash = hex(curr.hash)
-    inputSnapBucketHash = hex(snap.hash)
-    for s in shadows: inputShadowBucketHashes.append(hex(s.hash))
-    // Start the merge immediately
-    startMerge(app, maxProtocol, countEvents, level)
-```
+Constructing a `FutureBucket` with live inputs immediately:
 
-**Shadow validation**: If the snap bucket's protocol version is >= 12
-(FIRST_PROTOCOL_SHADOWS_REMOVED), the shadows list MUST be empty.
+1. Records `curr.hash`, `snap.hash`, and each shadow's hash in
+   parallel string fields (these are what get serialized).
+2. Rejects construction if `snap.bucketVersion >=
+   FIRST_PROTOCOL_SHADOWS_REMOVED` and any shadows are present.
+3. For `HotArchiveBucket`, rejects construction if `snap` is non-empty
+   and `snap.bucketVersion <
+   FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION`.
+4. Calls `startMerge(app, maxProtocolVersion, countMergeEvents, level)`.
 
-**Hot Archive validation**: For a HotArchiveBucket FutureBucket, if the
-snap bucket is non-empty its protocol version MUST be >=
-`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (23). Constructing a
-Hot Archive merge with an earlier-protocol snap bucket SHALL cause an
-error.
+### 7.3 Merge Deduplication via MergeKey
 
-### 7.3 Merge Start and Deduplication
+`MergeKey` is the tuple
+`(keepTombstoneEntries, currHash, snapHash, shadowHashes)`.
+`startMerge` first calls `bucketManager.getMergeFuture(mk)`:
 
-When starting a merge, the FutureBucket first checks the BucketManager's
-merge future cache for an existing merge with the same `MergeKey`:
+- If a `shared_future` for `mk` is already registered (because an
+  identical merge is already in flight, or one recently completed and
+  has not yet been GC'd), the `FutureBucket` re-attaches to it
+  instead of starting a duplicate worker task.
+- Otherwise a new packaged task is posted to a worker thread; the
+  task's `shared_future` is registered under `mk` via
+  `bucketManager.putMergeFuture(mk, future)`.
 
-```
-startMerge(app, maxProtocol, countEvents, level):
-    mk = MergeKey(keepTombstoneEntries(level), curr.hash, snap.hash,
-                  shadowHashes)
-
-    // Check for existing merge
-    f = bucketManager.getMergeFuture(mk)
-    if f is valid:
-        outputBucketFuture = f    // re-attach to existing merge
-        return
-
-    // Start new merge on background thread
-    task = async {
-        BucketT.merge(bucketManager, maxProtocol, curr, snap, shadows,
-                      keepTombstoneEntries(level), countEvents)
-    }
-    outputBucketFuture = task.future
-    bucketManager.putMergeFuture(mk, outputBucketFuture)
-    postToBackgroundThread(task)
-```
+The `BucketMergeMap` (`§8.2`) maintains a complementary _weak_
+mapping from `MergeKey` to output hash. When an in-flight future
+completes and its output is adopted, the entry in the strong
+`mLiveBucketFutures` / `mHotArchiveBucketFutures` map can be removed
+because subsequent re-attachment requests can synthesize a
+pre-resolved future from the bucket already in the shared map.
 
 ### 7.4 Resolution
 
-When a merge result is needed (during `commit`), the FutureBucket is
-resolved:
+`resolve()` is callable only in `FB_LIVE_INPUTS` or `FB_LIVE_OUTPUT`:
 
-```
-resolve():
-    assert state is LIVE_INPUTS or LIVE_OUTPUT
-    if state == LIVE_OUTPUT: return outputBucket
+- In `FB_LIVE_OUTPUT`, it returns the already-resolved bucket.
+- In `FB_LIVE_INPUTS`, it blocks on the output future, records the
+  output hash, clears the input buckets, and transitions to
+  `FB_LIVE_OUTPUT`.
 
-    // Wait for merge to complete
-    clearInputs()
-    outputBucket = outputBucketFuture.get()
-    outputBucketHash = hex(outputBucket.hash)
-    outputBucketFuture = invalid    // release shared state
-    state = FB_LIVE_OUTPUT
-    return outputBucket
-```
+Inputs are released as soon as resolution completes to enable
+upstream GC.
 
-### 7.5 Serialization (HAS Integration)
+### 7.5 HAS Integration: makeLive
 
-FutureBuckets are serialized to the HistoryArchiveState to support
-crash recovery and history publishing:
+A `FutureBucket` in a deserialized `HistoryArchiveState` is in
+`FB_HASH_INPUTS` or `FB_HASH_OUTPUT`. `makeLive(app, maxProtocolVersion,
+level)` materializes the live buckets:
 
-**Saving**: LIVE_INPUTS and HASH_INPUTS serialize as HASH_INPUTS (input
-hashes only). LIVE_OUTPUT and HASH_OUTPUT serialize as HASH_OUTPUT
-(output hash only). CLEAR serializes as CLEAR.
+- `FB_HASH_OUTPUT`: look up the output bucket by hash in the
+  `BucketManager` and bind it as the live output (`FB_LIVE_OUTPUT`).
+- `FB_HASH_INPUTS`: look up `curr`, `snap`, and each shadow by hash
+  and restart the merge via `startMerge` (`FB_LIVE_INPUTS`).
+  Re-attachment to an in-flight merge happens here too if applicable.
 
-**Loading**: Deserializes into HASH_INPUTS or HASH_OUTPUT state.
-
-**makeLive()**: Transitions from HASH_ states to LIVE_ states by looking
-up bucket files by hash in the BucketManager and either setting the
-output directly (HASH_OUTPUT) or starting the merge (HASH_INPUTS).
-
-### 7.6 MergeKey
-
-A MergeKey uniquely identifies a merge operation:
-
-```
-MergeKey:
-    keepTombstoneEntries: bool
-    inputCurrBucket: Hash (32 bytes)
-    inputSnapBucket: Hash (32 bytes)
-    inputShadowBuckets: [Hash] (0+ entries)
-```
-
-Two MergeKeys are equal if all fields match. The hash of a MergeKey
-(for use in hash maps) is computed by concatenating the string
-representations of all fields.
-
-### 7.7 Merge-Map
-
-The BucketManager maintains a merge-map that records which output bucket
-was produced from which inputs:
-
-```
-MergeMap: Map<MergeKey, Hash>   // input key → output hash
-```
-
-When a merge completes with a non-empty result, the mapping is recorded.
-When a merge produces an empty result, a special "empty merge" mapping
-is recorded. This allows the BucketManager to avoid re-running merges
-whose outputs are already known, even if the in-progress future has been
-discarded.
+When `restartMerges(app, maxProtocolVersion, ledger)` runs on startup
+(e.g., during catchup state adoption), for each level it either calls
+`makeLive` (if the level has stored hashes) or, for shadowless
+protocol-12+ buckets where no output hash was stored, reconstructs the
+merge inputs from the level above's `snap` and starts the merge afresh.
+A clear `next` slot on a level with an empty `snap` is treated as an
+untouched level; a clear `next` on a level whose `snap` is from a
+pre-protocol-12 bucket without recorded inputs/outputs MUST cause an
+error, because there is insufficient information to reproduce the
+merge.
 
 ---
 
 ## 8. BucketManager
 
-### 8.1 Responsibilities
+### 8.1 Adoption
 
-The BucketManager is the central orchestrator for bucket file lifecycle:
+`adoptFileAsBucket(filename, hash, mergeKey, index, inMemoryState)`
+moves a freshly written bucket file from a temporary directory into
+the `BucketManager`'s bucket directory under the canonical name
+`bucket-<hex(hash)>.xdr`. If a bucket with the same hash already
+exists, the temporary file is discarded and the existing bucket is
+returned. The returned `shared_ptr<Bucket>` is recorded in the shared
+bucket map keyed by hash.
 
-1. **Bucket directory management**: maintains a directory of bucket
-   files, tracks which files are referenced by the current BucketList
-   or in-progress merges.
-2. **Bucket adoption**: accepts newly-created bucket files, renames
-   them from temporary paths to canonical paths based on content hash,
-   and deduplicates (if a bucket with the same hash already exists, the
-   new file is deleted and the existing bucket is returned).
-3. **Garbage collection**: periodically removes unreferenced bucket
-   files from the bucket directory.
-4. **Merge future management**: maintains a cache of in-progress and
-   completed merge futures (keyed by `MergeKey`) to enable merge
-   deduplication and re-attachment.
-5. **Snapshot management**: coordinates with the
-   `BucketSnapshotManager` to provide thread-safe read snapshots.
-6. **Eviction scheduling**: initiates background eviction scans and
-   manages the eviction iterator state.
-7. **Bucket entry metrics**: tracks entry counts and sizes by type.
+Two buckets MUST NOT exist in memory with the same hash but distinct
+backing files; this invariant is enforced by `adoptFileAsBucket`.
 
-### 8.2 Bucket Adoption
+When `mergeKey != nullptr`, the merge map records the
+`mergeKey -> hash` relation. When the output of a merge is empty (no
+file written), `noteEmptyMergeOutput(mergeKey)` records that fact
+instead, removing the in-flight `shared_future` so that future merges
+of the same inputs can be skipped (they would also produce empty).
 
-When a merge or `fresh` operation produces a bucket file:
+### 8.2 Garbage Collection
 
-```
-adoptFileAsBucket(filename, hash, mergeKey, index):
-    canonicalPath = bucketDir / hexEncode(hash) / ".xdr"
+`forgetUnreferencedBuckets(has)` reclaims storage for buckets that are
+no longer required:
 
-    if bucket with hash already exists in memory:
-        delete filename    // duplicate
-        if bucket has no index and index is provided:
-            bucket.setIndex(index)
-        if mergeKey is provided:
-            noteEmptyMergeOutput(mergeKey)   // if applicable
-        return existing bucket
+1. Compute the set of "referenced" hashes as the union of:
+   - all `curr`, `snap`, and `next` hashes in both BucketLists,
+   - all hashes returned by `has.allBuckets()` (the LCL HAS),
+   - all hashes referenced by anything in the publish queue, and
+     transitively, via the `BucketMergeMap`, all merge outputs whose
+     inputs are referenced.
+2. For each entry in the shared bucket map: if its hash is not in
+   the referenced set _and_ its `shared_ptr` use-count is `1` (i.e.,
+   only the BucketManager holds it), drop it from the map and remove
+   the file. Also drop the bucket's index file and forget any
+   merge-map entries whose output is the dropped hash.
 
-    rename filename to canonicalPath
-    create new Bucket(canonicalPath, hash, index)
-    register in live bucket map
-    if mergeKey is provided:
-        record in merge-map
-    return new bucket
-```
+`cleanupStaleFiles(has)` performs the file-system side of GC: it
+sweeps the bucket directory and unlinks any `bucket-<hash>.xdr` (and
+its `.index` companion) whose hash is not in the referenced set.
 
-### 8.3 Garbage Collection
+The implementation rules above are observable only in that they
+preserve the invariant that the canonical bucket directory contains
+exactly the buckets needed to reconstruct the BucketList, the LCL
+HAS, and the publish queue.
 
-Bucket files that are no longer referenced by any level's `curr`,
-`snap`, or in-progress FutureBucket are candidates for garbage
-collection. The BucketManager:
+### 8.3 Statistics
 
-1. Collects all hashes referenced by the current BucketList state
-   (including FutureBucket inputs and outputs).
-2. Removes any tracked bucket whose hash is not in the referenced set.
-3. Optionally removes orphaned files from the bucket directory that
-   are not tracked at all.
-
-GC runs after each BucketList update (ledger close) unless disabled
-by configuration.
-
-### 8.4 Bucket Size and Level Statistics
-
-The BucketManager tracks the total size of the BucketList:
-
-```
-getSize():
-    total = 0
-    for L = 0 to kNumLevels - 1:
-        total += level[L].curr.size + level[L].snap.size
-    return total
-```
-
-This is used for fee calculations (the BucketList size window in
-Soroban fee computation) and eviction heuristics.
+For each bucket, observable counters per `LedgerEntryTypeAndDurability`
+record entry counts and aggregate byte sizes (see `§3.4`). These
+counters MUST be derivable from the bucket contents alone, ensuring
+deterministic reporting.
 
 ---
 
 ## 9. Indexing
 
-### 9.1 Overview
+### 9.1 Lookup Semantics
 
-Each non-empty bucket MAY have an associated index that enables O(log n)
-point lookups and efficient key scanning. Two index types exist:
+Every non-empty bucket has an associated index that, given a
+`LedgerKey k`, returns one of:
 
-- **In-Memory Index**: a sorted set of all keys, used for small buckets.
-- **Disk Index**: a range-based page index with a bloom filter, used for
-  large buckets.
+- `CACHE_HIT(entry)` — the entry is in the bucket's in-memory entry
+  cache; the result is exact (the entry may be a tombstone).
+- `FILE_OFFSET(off)` — the entry, if present, is at file offset
+  `off`; the caller MUST read the bucket file at that offset and
+  scan for an exact match within a single page.
+- `NOT_FOUND` — the key is provably not in the bucket.
 
-The choice is determined by a configurable size cutoff.
+The choice between cache, file offset, and not-found is an
+implementation detail; observable behavior is that the lookup either
+returns the correct entry or `NOT_FOUND`.
 
-### 9.2 Index Selection
+### 9.2 InMemoryIndex
 
-```
-createIndex(bucket, config):
-    if bucket.size <= config.BUCKETLIST_DB_INDEX_CUTOFF:
-        return InMemoryIndex(bucket)
-    else:
-        return DiskIndex(bucket, config.pageSize)
-```
+For small buckets (below the configured cutoff), the index keeps the
+full set of `BucketEntry`s in memory. Lookups therefore never return
+`FILE_OFFSET` for an in-memory-indexed bucket; the result is either
+`CACHE_HIT` or `NOT_FOUND`.
 
-The default cutoff is typically set so that level 0 and level 1 buckets
-use in-memory indexes while deeper levels use disk indexes.
+### 9.3 DiskIndex
 
-### 9.3 In-Memory Index
+For large buckets, the index is page-based. The bucket file is
+logically divided into pages of size
+`2^BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` bytes (default
+configuration). For each page, the index records:
 
-The in-memory index stores all bucket entries in a hash set
-(`unordered_set`) keyed by `LedgerKey`. Each element wraps a
-`shared_ptr<BucketEntry const>`, so lookups return the full entry
-directly from memory without any disk I/O. This makes the in-memory
-index inherently a **cached mode** — it is never persisted to disk and
-is always recreated on startup.
+- the `(lowerBound, upperBound)` `LedgerKey` pair covered by the page;
+- the file offset of the page;
+- a Binary-Fuse-16 filter (a Bloom-filter variant) over all keys in
+  the bucket.
 
-**Lookup**: O(1) hash-based lookup for the key. Returns the entry
-directly (cache hit), avoiding disk reads.
+A lookup performs a binary search over the page ranges, then
+consults the Bloom filter. If the filter says "absent",
+`NOT_FOUND` is returned; otherwise the file offset of the page is
+returned for caller-side scan. The filter's false-positive rate is
+bounded below 1/1000; false-positive scans MUST still yield the
+correct answer.
 
-**Bulk scan**: Supports iteration for multi-key lookups by performing
-individual lookups per key.
+### 9.4 Type Range Map
 
-The in-memory index also maintains auxiliary data:
-- An asset-to-pool-ID mapping for liquidity pool queries. Only
-  `INITENTRY` records of type `LIQUIDITY_POOL` contribute to this
-  mapping; `LIVEENTRY` and `DEADENTRY` records do not. This is
-  consistent because a liquidity pool's asset pair is fixed at
-  creation, so the mapping is exhaustive over pool lifetimes.
-- Entry counters and type-range offsets for compatibility with
-  disk-based operations.
+The disk and in-memory indexes both maintain a map from
+`LedgerEntryType` to a `(lowFileOffset, highFileOffset)` pair giving
+the range within the bucket file that contains entries of that type.
+This map is used by the bucket-applicator OFFER scan (`§13.1`) and by
+the type-scan query (`§10.6`). For page-based indexes the range is
+inclusive of any adjacent entries that happen to share the start or
+end page.
 
-### 9.4 Disk Index
+### 9.5 AssetPoolIDMap
 
-The disk index divides the bucket file into fixed-size **pages**
-(configurable, typically 2^14 = 16,384 bytes) and stores:
+`LiveBucket` indexes additionally maintain an
+`AssetPoolIDMap : Asset -> [PoolID]` derived from the bucket's
+`LIQUIDITY_POOL` entries. This map enables the pool-share trustline
+query (`§10.4`).
 
-1. **Page boundaries**: for each page, the first and last key, plus
-   the file offset.
-2. **Bloom filter**: a binary fuse filter (XOR+ filter) that provides
-   probabilistic membership testing with very low false positive rates.
-3. **Entry counters**: counts and sizes of entries by type.
-4. **Pool ID index** (Live BucketList only): a mapping from Asset to
-   the set of PoolIDs that reference that asset, built from
-   `INITENTRY` records of type `LIQUIDITY_POOL` encountered during
-   indexing. Non-INIT liquidity pool entries do not contribute.
-5. **Type boundaries**: file offset ranges for each `LedgerEntryType`,
-   enabling efficient type-restricted scans.
+### 9.6 Entry Cache
 
-**Lookup**:
+Each large `LiveBucket` MAY maintain a per-bucket
+`RandomEvictionCache<LedgerKey, BucketEntry>` for `ACCOUNT` lookups.
+The cache is sized as a fraction of the configured total cache budget
+proportional to the bucket's share of total `ACCOUNT` bytes in the
+BucketList. The cache is consulted only by the snapshot query layer
+(`§10`); cache contents do not affect the deterministic BucketList
+hash or its merge outputs.
 
-```
-lookup(key):
-    1. Check bloom filter. If key is definitely absent, return NOT_FOUND.
-    2. Binary search page boundaries to find the page containing the key.
-    3. Return the page's file offset for disk read.
-```
+### 9.7 Persistence
 
-**Scan**:
-
-```
-scan(startIter, key):
-    1. Advance from startIter to find the page containing key.
-    2. Check bloom filter. If absent, return NOT_FOUND.
-    3. Return page file offset.
-```
-
-### 9.5 Bloom Filter
-
-The bloom filter is a **binary fuse filter** (also known as XOR+ filter)
-that provides:
-- Space efficiency: approximately 9 bits per element.
-- Query time: O(1) with 3 hash lookups.
-- False positive rate: < 0.4% (approximately 2^-8).
-
-The filter is constructed during index creation by hashing all keys
-in the bucket. It is checked before every disk read to avoid unnecessary
-I/O for keys that are not present.
-
-Bloom misses (false positives causing unnecessary disk reads) are tracked
-via metrics.
-
-### 9.6 Entry Cache (Live BucketList Only)
-
-For disk-indexed live buckets, a **random-eviction cache** MAY be
-maintained that stores recently-accessed entries in memory:
-
-- The cache stores shared references to immutable `BucketEntry` values,
-  keyed by `LedgerKey`.
-- When a point lookup or scan finds an entry via disk I/O, the entry
-  is added to the cache.
-- Only **ACCOUNT** entries are cached in the index. Cache size per
-  bucket is proportional to the bucket's fraction of total ACCOUNT
-  entries in the BucketList.
-- The total cache memory budget is configurable
-  (`BUCKETLIST_DB_MEMORY_FOR_CACHING`).
-
-Cache lookups return `CACHE_HIT` with the entry directly, avoiding
-disk I/O entirely.
-
-### 9.7 Index Persistence
-
-Bucket indexes MAY be persisted to disk to avoid reindexing on restart:
-
-```
-indexFilename = bucketHash + ".index"
-```
-
-The persisted index includes a version number. On load, if the version
-does not match the current software version, the index is discarded and
-rebuilt. Index persistence is controlled by the
-`BUCKETLIST_DB_PERSIST_INDEX` configuration option.
+A non-validator node MAY persist index files to disk to avoid
+re-indexing on restart. Validators MUST NOT persist indexes; on
+restart the index is rebuilt from the bucket file. Index files have a
+versioned header (`BUCKET_INDEX_VERSION`) and a page size; if either
+disagrees with the running configuration on load, the persisted
+index MUST be discarded and rebuilt.
 
 ---
 
 ## 10. Snapshot and Query Layer
 
-### 10.1 Overview
+### 10.1 BucketSnapshotManager
 
-The snapshot and query layer provides thread-safe, read-only access to
-the BucketList state.
+The `BucketSnapshotManager` holds the immutable `BucketListSnapshotData`
+for the most recent ledger (one per BucketList) plus up to
+`QUERY_SNAPSHOT_LEDGERS` historical snapshots. On every successful
+ledger close, the snapshot manager publishes a fresh snapshot pair.
 
-**OFFER exclusion**: OFFER entries are the only `LedgerEntryType` NOT
-supported by BucketListDB queries. OFFER entries exist in the BucketList
-(they participate in merges and hash computation) but are NOT looked up
-via the BucketList index. Instead, OFFER entries are stored in and
-queried from SQL (SQLite), which supports the complex order book queries
-(e.g., best offers by trading pair) that BucketListDB's key-value
-lookup model cannot efficiently provide. During ledger close, only
-OFFER changes are written to SQL; all other entry types are served
-exclusively by BucketListDB. During catchup, the `BucketApplicator`
-applies only OFFER entries from buckets to SQL.
+A `BucketListSnapshotData` consists of:
 
-The snapshot and query layer is organized as:
+- a vector of `Level { curr, snap }` `shared_ptr`s, one per level;
+- the `LedgerHeader` of the snapshot.
 
-```
-BucketSnapshotManager
-    |
-    +-- BucketListSnapshot<LiveBucket>       (one per ledger)
-    |       +-- BucketLevelSnapshot[0..10]
-    |               +-- LiveBucketSnapshot (curr)
-    |               +-- LiveBucketSnapshot (snap)
-    |
-    +-- BucketListSnapshot<HotArchiveBucket> (one per ledger)
-    |       +-- BucketLevelSnapshot[0..10]
-    |               +-- HotArchiveBucketSnapshot (curr)
-    |               +-- HotArchiveBucketSnapshot (snap)
-    |
-    +-- Historical snapshots (for ledger N-1, N-2, ...)
-```
+Snapshots are deep-copy-cheap (they share bucket `shared_ptr`s) and
+are safe to read from multiple threads concurrently. The query layer
+takes the snapshot as input and exposes per-thread state (file
+streams) on top of it.
 
-### 10.2 BucketSnapshotManager
+Atomic dual-snapshot access returns a `(live, hotArchive)` pair both
+observed at the same ledger.
 
-The `BucketSnapshotManager` maintains the canonical snapshot of the
-BucketList on the main thread and provides copy-on-read access for
-query threads:
+### 10.2 Point Lookup
 
-- **updateCurrentSnapshot**: called by the main thread after each
-  BucketList update, replaces the canonical snapshot and pushes the
-  previous snapshot into the historical list.
-- **copySearchableLiveBucketListSnapshot**: creates a deep copy of the
-  current live snapshot for use by a query thread.
-- **copySearchableHotArchiveBucketListSnapshot**: same for the hot
-  archive.
-- **maybeCopy...**: refreshes a thread-local snapshot only if a newer
-  canonical snapshot is available.
+`SearchableBucketListSnapshot::load(k)`:
 
-Historical snapshots are retained for a configurable number of ledgers,
-enabling historical state queries (e.g., for the Soroban `getLedgerEntries`
-RPC endpoint).
+1. For each non-empty bucket in iteration order from level 0 `curr`,
+   level 0 `snap`, level 1 `curr`, level 1 `snap`, … down to level
+   `kNumLevels - 1`:
+   1. Query the index for `k`.
+   2. If `CACHE_HIT`, return the entry (resolving tombstone → null).
+   3. If `FILE_OFFSET`, read up to one page at that offset and scan
+      for the key. If found, return it; otherwise (Bloom-filter false
+      positive) continue.
+   4. If `NOT_FOUND`, continue.
+2. If no bucket matches, return null.
 
-Access to the canonical snapshot is protected by a shared mutex:
-writes (from the main thread) take an exclusive lock; reads (from query
-threads) take a shared lock.
+The result is `null` iff the key has no `LIVEENTRY`/`INITENTRY` in any
+bucket; the youngest matching entry wins. For Hot Archive lookups,
+the corresponding rule applies with `HOT_ARCHIVE_ARCHIVED` and
+`HOT_ARCHIVE_LIVE`.
 
-### 10.3 Point Lookup
+### 10.3 Bulk Load
 
-A single-key lookup traverses all buckets from level 0 `curr` to
-level 10 `snap`, stopping at the first bucket that contains the key:
+`loadKeys(inKeys, label)` performs the same iteration as point load
+but, for each bucket, walks the index sequentially with the (sorted)
+input key set, removing each key from the set on a hit. The
+short-circuit applies: the routine returns as soon as the key set is
+empty.
 
-```
-load(key):
-    for level in 0..10:
-        for bucket in [curr, snap]:
-            (entry, bloomMiss) = bucket.getBucketEntry(key)
-            if entry is found:
-                if entry is tombstone:
-                    return null   // deleted
-                return entry.liveEntry
-    return null   // not found
-```
+`loadKeysFromLedger(inKeys, ledgerSeq)` walks the corresponding
+historical snapshot if available; otherwise returns `nullopt`. The
+ledger sequence is defined as "the state of the BucketList at the
+beginning of the ledger", so the maximum `lastModifiedLedgerSeq` of
+any returned entry is `ledgerSeq - 1`.
 
-The first match is authoritative because shallower levels contain
-more recent data that shadows deeper entries.
+### 10.4 Pool Share Trust Lines
 
-### 10.4 Bulk Load
+`loadPoolShareTrustLinesByAccountAndAsset(accountID, asset)`:
 
-For loading multiple keys:
+1. For each non-empty bucket, fetch the `AssetPoolIDMap` and read
+   `poolIDs := map[asset]`. Construct candidate `LedgerKey`s
+   `(TRUSTLINE, accountID, ASSET_TYPE_POOL_SHARE, poolID)` for each
+   `poolID`.
+2. Bulk-load the candidate set as in `§10.3`.
 
-```
-loadKeys(inKeys):
-    keys = copy of inKeys (sorted by LedgerEntryIdCmp)
-    result = []
-    for level in 0..10:
-        for bucket in [curr, snap]:
-            bucket.loadKeys(keys, result)
-            // found keys — both live AND dead — are removed from 'keys'
-            if keys is empty: break
-    return result
-```
+### 10.5 Inflation Winners (Legacy)
 
-Within each bucket, the `loadKeys` method performs a merge-scan between
-the sorted key set and the bucket's index:
+`loadInflationWinners(maxWinners, minBalance)` walks every `LiveBucket`
+in BucketList order, iterating only over the `ACCOUNT` range. For each
+`LIVEENTRY` or `INITENTRY` `ACCOUNT`, if the `accountID` has not yet
+been seen (younger levels win), accumulate
+`voteCount[inflationDest] += balance` when `balance >= 1_000_000_000`
+and `inflationDest` is present. `DEADENTRY` `ACCOUNT`s mark the
+`accountID` as seen but contribute no votes. After the scan, return up
+to `maxWinners` accounts with the highest accumulated votes, where
+each winner's accumulated total is `>= minBalance`. Ordering follows
+the source key order.
 
-1. Start with the first key and the index iterator at the beginning.
-2. For each key, advance the index iterator to find a lower-bound match.
-3. If found and the entry is **live** (`LIVEENTRY` or `INITENTRY`), add
-   it to the result and remove the key from the search set.
-4. If found and the entry is a **tombstone** (`DEADENTRY`), do NOT add
-   it to the result but still remove the key from the search set. This
-   ensures the tombstone shadows any live entry for the same key at
-   deeper (older) levels (see Invariant 11, Section 15.11).
-5. Continue with the next key.
+### 10.6 Entry Type Scan
 
-**Implementation note — parallel / batched scanning**: An implementation
-that scans multiple levels in parallel (rather than sequentially) must
-collect dead keys from each level and propagate them into a global
-"seen" set during the merge phase. Dead keys at shallower levels must
-be registered before processing live entries from deeper levels;
-otherwise stale entries will leak into the result.
+`scanForEntriesOfType(type, callback)` walks every `LiveBucket`'s
+`type`-range. For each entry whose key is `<= type`, invoke
+`callback(entry)`; the callback may return `Loop::COMPLETE` to halt.
+This iterates over all `BucketEntry`s of the given type — including
+shadowed and tombstoned ones — and is intended for full table scans
+where the consumer applies its own freshness logic.
 
-This provides O(k log n) performance for loading k keys from a bucket
-of n entries.
-
-### 10.5 Pool Share Trust Line Query
-
-A specialized query for finding trust lines for liquidity pool shares:
-
-```
-loadPoolShareTrustLinesByAccountAndAsset(accountID, asset):
-    poolIDs = set()
-    // Step 1: collect all PoolIDs referencing the asset
-    for each bucket snapshot:
-        poolIDs.addAll(bucket.getPoolIDsByAsset(asset))
-
-    // Step 2: construct trust line keys and bulk load
-    trustlineKeys = set()
-    for poolID in poolIDs:
-        trustlineKeys.add(TrustlineKey(accountID, poolID))
-
-    return loadKeys(trustlineKeys)
-```
-
-The `getPoolIDsByAsset` query uses the disk index's pool-asset mapping,
-which is built during index construction by examining LIQUIDITY_POOL
-entries.
-
-### 10.6 Inflation Winners Query
-
-A legacy query that iterates all ACCOUNT entries across all buckets to
-compute inflation vote tallies:
-
-```
-loadInflationWinners(maxWinners, minBalance):
-    voteCount = Map<AccountID, int64>
-    seen = Set<AccountID>
-
-    for each bucket (from shallowest to deepest):
-        for entry in bucket:
-            if entry is DEADENTRY for ACCOUNT type:
-                seen.add(entry.accountID)
-            if entry is LIVEENTRY/INITENTRY for ACCOUNT type:
-                if entry.accountID not in seen:
-                    seen.add(entry.accountID)
-                    if entry has inflationDest and balance >= 1,000,000,000 stroops (100 XLM):
-                        voteCount[inflationDest] += balance
-
-    sort voteCount by balance descending
-    return top maxWinners
-```
-
-The minimum balance for vote counting is hardcoded at 100 XLM
-(1,000,000,000 stroops), independent of the `minBalance` parameter. The
-`minBalance` parameter is used only to filter the final winners list.
-
-This is a full-scan query and is only used during catchup for legacy
-protocol support.
-
-### 10.7 Entry Type Scan
-
-A targeted scan that reads only entries of a specific `LedgerEntryType`:
-
-```
-scanForEntriesOfType(type, callback):
-    for each bucket:
-        range = bucket.getRangeForType(type)
-        if no range: continue
-        seek to range.start
-        for each entry in range:
-            if entry.type > type: break
-            if callback(entry) == COMPLETE: return
-```
-
-This leverages the disk index's type boundary information to seek
-directly to the relevant section of the bucket file, avoiding a full
-scan. Used for the Soroban module cache compiler (CONTRACT_CODE entries).
+`SearchableHotArchiveBucketListSnapshot::scanAllEntries(callback)` is
+the analogous full scan for the Hot Archive.
 
 ---
 
@@ -1419,531 +1065,446 @@ scan. Used for the Soroban module cache compiler (CONTRACT_CODE entries).
 
 ### 11.1 Purpose
 
-The Hot Archive BucketList (introduced in protocol 23) stores evicted
-persistent Soroban entries. When a persistent CONTRACT_DATA or
-CONTRACT_CODE entry expires and is evicted from the Live BucketList,
-it is archived in the Hot Archive BucketList. This enables future
-restoration of the entry via the `RestoreFootprint` Soroban operation
-without requiring access to full history archives.
+The Hot Archive (introduced at
+`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION = 23`) records persistent
+Soroban entries that have been evicted from the live ledger state by
+TTL expiry, so they can be restored (`RestoreFootprint`) later.
+Temporary Soroban entries are simply deleted from live state and are
+NOT placed in the Hot Archive.
 
 ### 11.2 Structure
 
-The Hot Archive BucketList has the same 11-level hierarchical structure
-as the Live BucketList, with the same spill and merge mechanics. It
-differs in:
+The Hot Archive shares the same level layout (`kNumLevels = 11`),
+sizing formulas, spill schedule, and tombstone-retention semantics as
+the LiveBucketList. The differences are:
 
-- Entry types: uses `HotArchiveBucketEntry` instead of `BucketEntry`.
-- Merge semantics: different equal-key rules (Section 11.4).
-- No shadow buckets: hot archive was introduced in protocol 23, which
-  is well past the shadow removal in protocol 12.
-- No in-memory merge optimization (always file-based).
-- Metadata: `BucketMetadata.ext.v()` MUST be 1 with
-  `bucketListType = HOT_ARCHIVE`.
+- entries are of XDR type `HotArchiveBucketEntry`;
+- the per-file metadata `ext.v(1)` and `bucketListType() == HOT_ARCHIVE`
+  is REQUIRED on every Hot Archive bucket;
+- there is no level-0 in-memory merge path; the standard `prepare`
+  path is always used;
+- shadows are not supported.
 
-### 11.3 Entry Types
+### 11.3 Entry Types and Sort
 
-| Type | Meaning |
-|------|---------|
-| `HOT_ARCHIVE_ARCHIVED` | A persistent Soroban entry that was evicted and archived. Contains the full `LedgerEntry`. |
-| `HOT_ARCHIVE_LIVE` | A marker indicating an entry was restored from archive back to the live state. Contains only the `LedgerKey`. Acts as a tombstone. |
-| `HOT_ARCHIVE_METAENTRY` | Metadata record (same as Live BucketList METAENTRY). |
+| Entry | Carries | Semantics |
+|-------|---------|-----------|
+| `HOT_ARCHIVE_ARCHIVED` | `LedgerEntry` (persistent Soroban) | A full snapshot of an entry that was evicted at the recording ledger. |
+| `HOT_ARCHIVE_LIVE` | `LedgerKey` (persistent Soroban) | A restoration marker; acts as the Hot Archive's tombstone, dropped only at the deepest level. |
+| `HOT_ARCHIVE_METAENTRY` | `BucketMetadata` | First-record metadata, REQUIRED. |
+
+Sort order follows the rule in `§3.3`.
 
 ### 11.4 Merge Rules
 
-The Hot Archive merge follows strict "newest wins" semantics with no
-annihilation cases. When two entries with the same key meet during a
-merge, the newer entry is always emitted regardless of the entry types:
+For the Hot Archive, the equal-key rule is simply "take new" (`§6.5`).
+There is no INIT/annihilation logic. The level-0 `prepare` always uses
+the on-disk merge path. Tombstone elision applies at the deepest
+level (dropping `HOT_ARCHIVE_LIVE`).
 
-| New \ Old | ARCHIVED | LIVE |
-|-----------|----------|------|
-| **ARCHIVED** | emit ARCHIVED (new) | emit ARCHIVED (new) |
-| **LIVE** | emit LIVE (new) | emit LIVE (new) |
-
-There is no pairwise annihilation in the Hot Archive merge (unlike the
-Live BucketList's INIT/DEAD annihilation). The only filtering occurs at
-the output stage: at level 10 (the deepest level), HOT_ARCHIVE_LIVE
-tombstone entries are elided by the output iterator (Section 11.5).
-
-### 11.5 Tombstone Semantics
-
-HOT_ARCHIVE_LIVE entries function as tombstones in the Hot Archive
-BucketList. They are elided at level 10 (just like DEAD entries in the
-Live BucketList).
-
-### 11.6 Protocol Legality
-
-Hot Archive bucket entries MUST NOT appear in buckets with protocol
-version before `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (23).
-Only persistent Soroban entry types (persistent CONTRACT_DATA,
-CONTRACT_CODE) are permitted in Hot Archive buckets. TTL entries MUST
-NOT appear in Hot Archive buckets.
-
-### 11.7 Indexing
-
-Hot Archive buckets use `DiskIndex` exclusively (no in-memory index
-option, no entry cache). The default page size for hot archive indexes
-is 16,384 bytes (2^14).
+A Hot Archive batch consists of `(archivedEntries, restoredEntries)`.
+The implementation MUST reject any batch added at a protocol version
+below `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION`.
 
 ---
 
 ## 12. Eviction
 
-### 12.1 Overview
+Eviction is the @version(≥23) process of detecting and removing
+expired Soroban entries from live state. The scan runs on a background
+thread, against an LCL snapshot, in parallel with regular ledger close
+work.
 
-Eviction is the process of scanning the Live BucketList for expired
-Soroban entries and removing them from live state. Evicted temporary
-entries are deleted; evicted persistent entries are archived to the Hot
-Archive BucketList.
+### 12.1 Eviction Iterator
 
-Eviction runs as a background scan between ledger closes and produces
-a set of **eviction candidates** that are validated and applied during
-the next ledger close.
+`EvictionIterator` records the scan's persistent cursor across ledgers:
 
-### 12.2 Eviction Iterator
+| Field | Description |
+|-------|-------------|
+| `bucketListLevel` | Level currently being scanned. |
+| `isCurrBucket` | `true` for `curr`, `false` for `snap`. |
+| `bucketFileOffset` | Byte offset within the bucket file. |
 
-The eviction scan position is tracked by an `EvictionIterator`:
+The iterator is stored as part of the `SorobanNetworkConfig` and is
+updated each ledger.
 
-```
-struct EvictionIterator {
-    uint32 bucketListLevel;
-    uint64 bucketFileOffset;
-    bool   isCurrBucket;
-};
-```
+### 12.2 Starting Position
 
-The iterator advances through the BucketList in order:
-`level 0 curr → level 0 snap → level 1 curr → level 1 snap → ...`
-and wraps around from level 10 snap back to the starting level.
+Before each scan, `updateStartingEvictionIterator(iter, firstScanLevel,
+ledgerSeq)` adjusts the iterator:
 
-### 12.3 Starting Position
+1. If `iter.bucketListLevel < firstScanLevel` (the network config has
+   raised the starting level), reset to
+   `{firstScanLevel, isCurrBucket = true, bucketFileOffset = 0}`.
+2. If the bucket pointed at by `iter` was changed by a spill on the
+   previous ledger, reset `bucketFileOffset = 0`. The check examines:
+   - `levelShouldSpill(ledgerSeq - 1, bucketListLevel - 1)` if
+     pointing at `curr` (which receives a spill from the level above);
+   - `levelShouldSpill(ledgerSeq - 1, bucketListLevel)` if pointing at
+     `snap` (which is replaced when its own level spills).
 
-The eviction iterator's starting position is repositioned at the
-start of each scan when either (a) network configuration has lowered
-the starting level below the iterator's current position, or (b) the
-bucket the iterator was pointing at received an incoming spill on the
-previous ledger close (which would have invalidated its file offset):
+### 12.3 Scan Process
 
-```
-updateStartingEvictionIterator(iter, firstScanLevel, ledgerSeq):
-    // (a) Config change: starting level moved up the BucketList
-    if iter.bucketListLevel < firstScanLevel:
-        iter.bucketFileOffset = 0
-        iter.isCurrBucket = true
-        iter.bucketListLevel = firstScanLevel
+`scanForEviction(ledgerSeq, metrics, evictionIter, stats, sas,
+ledgerVers)`:
 
-    // (b) Spill on previous ledger may have invalidated the offset
-    if iter.isCurrBucket:
-        // A curr bucket is rewritten when the level above spills
-        require iter.bucketListLevel != 0
-        if levelShouldSpill(ledgerSeq - 1, iter.bucketListLevel - 1):
-            iter.bucketFileOffset = 0
-    else:
-        // A snap bucket is rewritten when its own level spills
-        if levelShouldSpill(ledgerSeq - 1, iter.bucketListLevel):
-            iter.bucketFileOffset = 0
-```
+1. Update the iterator's starting position (`§12.2`) and record
+   `startIter`. Set `bytesToScan := sas.evictionScanSize`.
+2. Loop:
+   1. Fetch the bucket pointed at by the iterator. Warn if the
+      bucket cannot be fully scanned within its update period.
+   2. Call `scanForEvictionInBucket(bucket, iter, bytesToScan,
+      ledgerSeq, evictableEntries, ledgerVers,
+      keysInEvictableEntries)` (`§12.4`).
+   3. If it returns `Loop::COMPLETE`, the byte budget is exhausted —
+      exit.
+   4. Otherwise advance the iterator with
+      `updateEvictionIterAndRecordStats(iter, startIter,
+      firstScanLevel, ledgerSeq, stats, metrics)`:
+      - first move from `curr` to `snap` within the same level
+        (skipped for the deepest level);
+      - then advance to the next level's `curr`;
+      - on overflowing `kNumLevels`, wrap around to `firstScanLevel`
+        and emit cycle metrics;
+      - if `iter` is now equal to `startIter`, exit.
 
-The `startingEvictionScanLevel` is a network configuration parameter
-that determines which level the eviction scan begins at. The iterator
-advances `curr → snap → next level → ...` and wraps from the deepest
-level back to `startingEvictionScanLevel`; on wrap, cycle metrics are
-submitted and a new cycle begins (Section 12.7).
+### 12.4 In-Bucket Scan
 
-### 12.4 Scan Process
+`scanForEvictionInBucket`:
 
-Each eviction scan reads `evictionScanSize` bytes from the BucketList,
-starting at the current iterator position:
+1. If the bucket is empty or has
+   `bucketVersion < SOROBAN_PROTOCOL_VERSION`, return
+   `Loop::INCOMPLETE` (skip to next bucket); buckets predating Soroban
+   contain no evictable entries.
+2. Open a fresh stream at `iter.bucketFileOffset`. Read entries
+   sequentially, advancing `iter.bucketFileOffset` after each read.
+   For each `INITENTRY`/`LIVEENTRY`:
+   - Determine evictable type. @version(<23): temporary entries
+     only. @version(≥23): every Soroban entry (persistent or
+     temporary).
+   - Skip if this key is already in `keysInEvictableEntries`.
+   - Append the `TTL` key to `keysToSearch` and (@version(≥24)
+     only, for persistent entries) the entry's own key, then push a
+     stub `EvictionResultEntry` onto `maybeEvictQueue`.
+3. After the byte budget is exhausted (or on EOF), perform a single
+   bulk `loadKeys(keysToSearch, "eviction")` over the snapshot. For
+   each candidate:
+   - If the TTL is still live (`liveUntilLedgerSeq >= ledgerSeq`),
+     drop the candidate.
+   - Otherwise mark as evictable and stash the TTL's
+     `liveUntilLedgerSeq` on the candidate.
+   - @version(≥24): for persistent entries, replace the candidate's
+     payload with the newest version of the entry (the one fetched
+     in the bulk load), to ensure that the archived snapshot is
+     the most recent version. @version(=23) has a known bug where
+     this check is not performed and an older version may be
+     archived; conforming implementations targeting protocol 23
+     MUST reproduce this behavior exactly to preserve determinism.
+4. Return `Loop::COMPLETE` when the byte budget is exhausted,
+   `Loop::INCOMPLETE` on EOF.
 
-```
-scanForEviction(iter, scanSize, ledgerSeq):
-    result = EvictionResultCandidates()
-    keysToEvict = set()
+### 12.5 Validity Check
 
-    while scanSize > 0:
-        bucket = getBucketAt(iter)
-        remainingInBucket = scanBucket(bucket, iter, scanSize, ...)
+`EvictionResultCandidates::isValid(currLedgerSeq, currLedgerVers, sas)`
+returns `false` if any of the following changed between scan start and
+scan use:
 
-        if reachedEndOfBucket:
-            advanceToNextBucket(iter)
-            if backToStartBucket: break
-        else:
-            break    // scan size exhausted
+- the ledger sequence;
+- `maxEntriesToArchive`, `evictionScanSize`, or
+  `startingEvictionScanLevel`;
+- the protocol crossing
+  `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (which fundamentally
+  changes evictable type).
 
-    return result
-```
+If invalid, the scan MUST be restarted with the new settings before
+its result is consumed.
 
-Within each bucket, the scan:
+### 12.6 Applying the Scan: EvictedStateVectors
 
-1. Reads entries sequentially from the current offset.
-2. For each INIT or LIVE entry containing an evictable Soroban type:
-   - Pre-protocol-23: evictable type = temporary Soroban entry.
-   - Protocol 23 and later: evictable type = any Soroban entry
-     (persistent or temporary).
-   - Records the entry's TTL key for a later bulk lookup.
-   - For protocol 24 and later, when the entry is persistent, also
-     records the entry's own `LedgerEntryKey` so the eviction step
-     can replace the scanned (possibly stale) version with the newest
-     version of the entry before archiving it.
-3. Tracks bytes read and decrements from `scanSize`.
+`resolveBackgroundEvictionScan(ltx, modifiedKeys)`:
 
-After the per-bucket-region scan completes, all recorded keys (TTL
-keys plus, when applicable, persistent entry keys) are bulk-loaded
-through the BucketListDB query layer. For each candidate, if the TTL
-lookup confirms the entry is expired, the entry becomes an eviction
-candidate; otherwise it is discarded. For protocol 24 and later
-persistent entries, the candidate emitted to the eligible list MUST
-be the newest version returned by the bulk load, with its
-`liveUntilLedgerSeq` taken from the TTL entry.
+1. Drop any candidate whose TTL has been modified in the current
+   ledger (`modifiedKeys.contains(getTTLKey(entry))`).
+2. The implementation MUST reject any candidate whose entry itself
+   has been modified in the current ledger; this represents a logic
+   bug, not a normal occurrence.
+3. For up to `maxEntriesToArchive` candidates in scan order:
+   - `ltx.erase(entryKey)` and `ltx.erase(ttlKey)`.
+   - For temporary entries, append `entryKey` to `deletedKeys`.
+   - For persistent entries, append the entry to `archivedEntries`.
+   - In both cases, append `ttlKey` to `deletedKeys`.
+   - Update `newEvictionIterator` to the candidate's recorded
+     iterator state.
+4. Persist `newEvictionIterator` back to the Soroban network config
+   in `ltx`. If fewer than `maxEntriesToArchive` were evicted (i.e.,
+   the scan region was fully consumed), the iterator is set to the
+   end of the scan region instead.
+5. Return `EvictedStateVectors { deletedKeys, archivedEntries }`.
 
-When the eviction candidates are applied during the next ledger
-close:
-
-1. Any candidate whose TTL key appears among the keys modified in the
-   current ledger MUST be removed from the eligible list before
-   applying. Concurrent modification (e.g., a transaction extending
-   the TTL) supersedes the eviction.
-2. The number of entries actually evicted SHALL be capped at
-   `sas.maxEntriesToArchive`.
-3. For each evicted entry:
-   - The entry key and its TTL key are both deleted from the live
-     state.
-   - If the entry is temporary, the entry key is added to the live
-     BucketList as a `DEADENTRY`.
-   - If the entry is persistent (protocol 23+), the entry is appended
-     to the Hot Archive BucketList as `HOT_ARCHIVE_ARCHIVED`. The TTL
-     key is NOT archived; only the data entry itself.
-4. The eviction iterator is advanced to the last evicted entry's
-   position when the cap is hit, or to the end of the scanned region
-   otherwise.
-
-### 12.5 Eviction Entry Types
-
-| Entry Durability | Protocol < 23 | Protocol 23 | Protocol >= 24 |
-|-----------------|----------------|-------------|----------------|
-| Temporary | Not evicted | Evicted (DEADENTRY in live BucketList) | Evicted (DEADENTRY in live BucketList) |
-| Persistent | Not evicted | Evicted (archived to Hot Archive), any version | Evicted (archived to Hot Archive), newest version only |
-
-Temporary entries that expire are simply deleted from the Live BucketList
-via a DEADENTRY tombstone. They are **never** added to the Hot Archive
-BucketList — only persistent entries are archived.
-
-Persistent entry eviction was introduced in protocol 23. In protocol 23,
-the eviction scan may archive a stale version of a persistent entry
-(whatever version happens to be scanned). Starting with protocol 24, the
-scan ensures it evicts the **newest version** of the entry (not a stale
-version from a deeper bucket) by performing an additional point lookup.
-
-### 12.6 Scan Validity
-
-An eviction scan is invalidated if network configuration changes between
-the scan and the ledger close. A protocol upgrade that crosses into
-`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` SHALL also invalidate
-any in-flight scan, since the set of evictable entry types changes.
-The specific fields of `StateArchivalSettings` that are checked for
-equality are `maxEntriesToArchive`, `evictionScanSize`, and
-`startingEvictionScanLevel`; other SAS fields do not invalidate a
-scan.
-
-```
-isValid(currLedgerSeq, currLedgerVers, currSas):
-    if initialLedgerVers < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-       AND currLedgerVers >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION:
-        return false
-    return initialLedgerSeq == currLedgerSeq
-       AND initialSas.maxEntriesToArchive
-           == currSas.maxEntriesToArchive
-       AND initialSas.evictionScanSize
-           == currSas.evictionScanSize
-       AND initialSas.startingEvictionScanLevel
-           == currSas.startingEvictionScanLevel
-```
-
-If the scan is invalid, it MUST be restarted before its results are
-applied.
-
-### 12.7 Eviction Cycle Metrics
-
-The system tracks:
-- **entriesEvicted**: count of entries evicted per ledger.
-- **bytesScannedForEviction**: total bytes scanned.
-- **incompleteBucketScan**: whether the scan wrapped around without
-  completing a full cycle.
-- **evictionCyclePeriod**: number of ledgers for a complete scan cycle.
-- **averageEvictedEntryAge**: average difference between an entry's
-  `liveUntilLedgerSeq` and the ledger at which it was evicted.
+The ledger close pipeline then feeds `archivedEntries` to the Hot
+Archive via `addHotArchiveBatch`, and the TTL/key deletions enter the
+LiveBucketList via the regular `addLiveBatch` `deadEntries` argument.
+The partitioning between `deletedKeys` and `archivedEntries` is a
+normative invariant (see `INV-B7`).
 
 ---
 
-## 13. Catchup and State Reconstruction
-
-The full catchup pipeline — including bucket download, verification,
-indexing, application, and post-apply state setup — is described in
-**CATCHUP_SPEC §10**. This section covers the BucketList-specific
-implementation details of bucket application.
+## 13. Catchup Integration
 
 ### 13.1 Bucket Application
 
-During catchup, bucket files downloaded from history archives are
-applied to reconstruct ledger state. The `BucketApplicator` reads
-through a bucket file and inserts entries into the SQL database.
-Only OFFER entries are applied via the BucketApplicator — all other
-entry types are served directly from the BucketList index
-(BucketListDB) and do not need SQL application.
+During catchup, the bucket-applicator applies the LiveBucketList to a
+fresh ledger state. For each bucket from level 0 down to level
+`kNumLevels - 1` (oldest last), the applicator walks the bucket's
+entries:
 
-```
-applyBucket(bucket, level, maxProtocolVersion, database):
-    // Reject buckets newer than the supported protocol
-    require bucket.metadata.ledgerVersion <= maxProtocolVersion
-
-    offsetRange = bucket.getRangeForType(OFFER)
-    iter = BucketInputIterator(bucket, offset=offsetRange.start)
-    while iter is valid AND within offsetRange:
-        entry = *iter
-        checkProtocolLegality(entry, maxProtocolVersion)
-
-        if entry is LIVEENTRY or INITENTRY:
-            if entry.key not in seenKeys:
-                seenKeys.add(entry.key)
-
-                @version(< FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY):
-                    // Pre-protocol 11 had no INITENTRY, so we must
-                    // distinguish create from update by checking
-                    // whether the entry already exists in the
-                    // accumulating ledger.
-                    if database.contains(entry.key):
-                        database.update(entry)
-                    else:
-                        database.create(entry)
-                @version(>= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY):
-                    if level == NUM_LEVELS - 1 AND entry.type == LIVEENTRY:
-                        // The deepest level has had its INIT entries
-                        // converted to LIVE by tombstone elision at
-                        // earlier merges; at apply time treat them
-                        // as fresh creates, because the earliest
-                        // state of every entry is INIT.
-                        database.create(entry)
-                    else if entry.type == LIVEENTRY:
-                        database.update(entry)
-                    else:
-                        database.create(entry)
-        else if entry is DEADENTRY:
-            // Record key as seen so deeper buckets don't revive it
-            seenKeys.add(entry.key)
-        advance(iter)
-```
-
-Bucket application is **chunked**: the applicator processes entries in
-batches of `LEDGER_ENTRY_BATCH_COMMIT_SIZE` (4095), yielding between
-batches to allow interleaving with other work (such as downloading
-more files).
+1. Reject any entry that violates `checkProtocolLegality` for the
+   current `maxProtocolVersion`.
+2. Skip entries whose `LedgerEntryType` is not supported via the
+   bucket-applicator path (currently only `OFFER` is applied through
+   this path; the remaining types live solely in the BucketList and
+   are served by the snapshot query layer).
+3. For OFFER entries:
+   - For `LIVEENTRY` / `INITENTRY`: insert the entry into the target
+     state, except that if the key has already been seen (i.e., is
+     present in `seenKeys`), it is skipped — only the youngest
+     occurrence wins.
+   - For `DEADENTRY`: simply record the key in `seenKeys`. Do not
+     touch the target state.
+   - For @version(<11) buckets where `INITENTRY` does not exist, the
+     applicator MUST consult the ledger-txn state to determine
+     whether the entry already exists and choose between `create` and
+     `update`.
+   - At the deepest level (`level == kNumLevels - 1`), any
+     `LIVEENTRY` MUST be treated as `INITENTRY` (a `create`), since
+     the deepest level reflects the oldest-known state and no
+     predecessor exists.
 
 ### 13.2 Application Order
 
-Buckets MUST be applied from the **shallowest level to the deepest**
-(level 0 curr, level 0 snap, level 1 curr, ..., level 10 snap).
-The applicator maintains a set of already-applied keys; entries
-whose keys have already been seen in higher-priority buckets are
-skipped. See CATCHUP_SPEC §10.2 Step 2 for the complete algorithm.
+Buckets are applied from youngest to oldest with respect to the
+content of the live state but, when applying to a fresh state during
+catchup, the applicator uses the `seenKeys` set to ensure only the
+newest occurrence of any key persists. The detailed scheduling across
+multiple buckets and apply-batches is the responsibility of the
+catchup pipeline (`CATCHUP_SPEC`).
 
-### 13.3 State Reconstruction from Buckets
+### 13.3 State Reconstruction: assumeState
 
-A node can reconstruct complete ledger state from buckets:
+`BucketManager::assumeState(app, has, maxProtocolVersion, restartMerges)`
+adopts a deserialized `HistoryArchiveState`:
 
-```
-rebuildLedgerFromBuckets():
-    for each level from 0 to 10:
-        for each bucket in [curr, snap]:
-            applicator = BucketApplicator(bucket)
-            while not applicator.done():
-                applicator.advance(batchSize)
-```
+1. For each level `i` and each BucketList type, look up the buckets
+   named in `has.currentBuckets[i].curr` and `.snap` (and analogously
+   for `has.hotArchiveBuckets`) by hash. All MUST exist in the
+   BucketManager.
+2. If `has.currentBuckets[i].next` has an output hash, look up that
+   bucket and bind it; otherwise the `FutureBucket` is in
+   `FB_HASH_INPUTS` state and will be restarted later.
+3. Each bound bucket MUST already be indexed.
+4. Install `(curr, snap, next)` on each level.
+5. If `restartMerges`, call `bl.restartMerges(app, maxProtocolVersion,
+   ledger)` for each list, which calls `makeLive` on every level's
+   `next` (`§7.5`).
 
-This produces a database equivalent to one maintained through
-incremental ledger closes.
-
-### 13.4 Merge Restart After Crash
-
-After a crash or restart, in-progress merges recorded in the HAS are
-restarted:
-
-```
-restartMerges(app, maxProtocolVersion):
-    for L = 0 to kNumLevels - 1:
-        level[L].next.makeLive(app, maxProtocolVersion, L)
-```
-
-Each FutureBucket transitions from HASH_INPUTS to LIVE_INPUTS (starting
-the merge) or from HASH_OUTPUT to LIVE_OUTPUT (looking up the completed
-output).
+After `assumeState` completes, the BucketList is functionally
+equivalent to the one that produced the HAS, and querying
+`liveBucketList.getHash()` MUST yield the same hash recorded in the
+HAS (and thus in the `LedgerHeader`'s `bucketListHash`).
 
 ---
 
-## 14. Serialization and Persistence
+## 14. Serialization
 
 ### 14.1 HistoryArchiveState
 
-The complete BucketList state is serialized as a JSON object called the
-HistoryArchiveState (HAS):
+`HistoryArchiveState` (HAS) is a serializable structure describing a
+complete BucketList state at a specific ledger. Its observable
+content is:
 
-```json
-{
-    "version": 1,
-    "server": "<implementation-defined version string>",
-    "currentLedger": 12345,
-    "currentBuckets": [
-        {
-            "curr": "<hex hash of curr bucket>",
-            "snap": "<hex hash of snap bucket>",
-            "next": {
-                "state": 2,
-                "curr": "<hex hash of merge input curr>",
-                "snap": "<hex hash of merge input snap>",
-                "shadow": []
-            }
-        },
-        // ... 11 levels total
-    ],
-    "networkPassphrase": "Public Global Stellar Network ; September 2015"
-}
-```
+| Field | Description |
+|-------|-------------|
+| `version` | HAS schema version. `1` for pre-Hot-Archive (`<23`); `2` for Hot-Archive-aware (`≥23`). |
+| `server` | Informational. |
+| `networkPassphrase` | Network identifier. REQUIRED at HAS version 2. |
+| `currentLedger` | Ledger sequence at which the snapshot was taken. |
+| `currentBuckets` | Vector of `HistoryStateBucket<LiveBucket>` of length `kNumLevels`. |
+| `hotArchiveBuckets` | Vector of `HistoryStateBucket<HotArchiveBucket>` of length `kNumLevels`. REQUIRED at HAS version 2. |
 
-Each level entry contains:
-- `curr`: hex-encoded SHA-256 hash of the curr bucket.
-- `snap`: hex-encoded SHA-256 hash of the snap bucket.
-- `next`: the serialized FutureBucket state (Section 7.5).
+Each `HistoryStateBucket<B>` carries:
+
+| Field | Description |
+|-------|-------------|
+| `curr` | Hex hash of level's `curr` bucket. |
+| `snap` | Hex hash of level's `snap` bucket. |
+| `next` | A `FutureBucket<B>`, serialized in either `FB_CLEAR`, `FB_HASH_INPUTS`, or `FB_HASH_OUTPUT` form (live forms collapse to their hash form on serialization). |
+
+`allBuckets()` returns the deduplicated set of every non-zero hash
+referenced by the HAS (across `curr`, `snap`, and every `next`'s
+input and output hashes). `differingBuckets(other)` returns the
+buckets present in `this` but not in `other`, ordered from largest /
+oldest level to smallest / youngest, with `snap` before `curr` at
+each level — this is the order in which a peer catching up from
+`other` applies fetched buckets.
+
+The maximum permitted bucket size in a history archive is
+`100 GiB`; downloads exceeding this size MUST be rejected as
+suspicious.
 
 ### 14.2 Bucket Directory Layout
 
-Bucket files are stored in a configurable directory
-(`BUCKET_DIR_PATH`). Each bucket file is named by its content hash:
-
-```
-<BUCKET_DIR_PATH>/bucket-<hex_hash>.xdr
-```
-
-Index files (when persistence is enabled):
-
-```
-<BUCKET_DIR_PATH>/bucket-<hex_hash>.index
-```
-
-Temporary files during merge:
-
-```
-<BUCKET_DIR_PATH>/tmp-bucket-<uuid>.xdr
-```
+Each bucket is stored as
+`<bucketDir>/bucket-<hex(hash)>.xdr`, optionally accompanied by a
+gzipped sibling `bucket-<hex(hash)>.xdr.gz` (used for archive transfer)
+and a `bucket-<hex(hash)>.index` index file. Filenames are the only
+observable association between a bucket and its hash; a conforming
+implementation MAY use any other on-disk layout provided it can
+reproduce the hash-content correspondence required by the HAS.
 
 ### 14.3 Checkpoint Alignment
 
-The BucketList state is published to history archives at **checkpoint
-ledgers**. A checkpoint occurs every 64 ledgers (the checkpoint
-frequency). At each checkpoint, the HAS is published along with any
-new bucket files that are not already in the archive.
+The publishing pipeline (`CATCHUP_SPEC`) snapshots HAS at checkpoint
+boundaries. The BucketList contract is that, at every ledger, the
+`bucketListHash` recorded in the `LedgerHeader` corresponds exactly
+to the SHA-256 of (live‖hotArchive) BucketLists as defined in `§4.7`.
+Publishing serializes the HAS at the checkpoint ledger; loading a
+HAS via `assumeState` (`§13.3`) recreates the same BucketList.
 
 ---
 
 ## 15. Invariants and Safety Properties
 
-### 15.1 Hash Determinism
+The following invariants are normative. A conforming implementation
+MUST preserve each one.
 
-**Invariant 1**: For any given sequence of `addBatch` calls with
-identical inputs in the same order, the resulting BucketList hash MUST
-be identical across all conforming implementations.
+- **INV-B1 — Deterministic BucketList hash.** For any sequence of
+  per-ledger batches, the `bucketListHash` recorded in the
+  `LedgerHeader` MUST equal the value computed in `§4.7`. Two
+  implementations applying the same batches MUST produce
+  byte-identical bucket files and therefore identical hashes.
 
-This requires that:
-- Entry sort order is deterministic (Section 3.4).
-- Merge rules are deterministic (Section 6).
-- The SHA-256 hash computation covers identical byte sequences.
+- **INV-B2 — Monotonic Level 0 update.** Each ledger close adds
+  exactly one batch to level 0 of each BucketList (subject to the
+  per-list protocol gate). The `curr` of level 0 of the
+  LiveBucketList MUST contain the entries of the most-recent
+  per-ledger batch, merged with any earlier level-0 content, sorted
+  by `BucketEntryIdCmp`.
 
-### 15.2 Entry Ordering
+- **INV-B3 — Spill schedule.** A level `i < kNumLevels - 1` spills
+  precisely at the ledgers identified by `levelShouldSpill(ledger,
+  i)`. The deepest level never spills. The set of spilled levels at
+  a given ledger MUST be processed in descending order.
 
-**Invariant 2**: All entries within a bucket file MUST be in strictly
-ascending order according to `BucketEntryIdCmp`, with the sole exception
-of the METAENTRY which precedes all other entries.
+- **INV-B4 — Effective merge protocol.** The protocol version used
+  by a merge MUST equal the maximum over the input buckets'
+  versions and any pre-`FIRST_PROTOCOL_SHADOWS_REMOVED` shadows'
+  versions. A merge MUST fail if this value exceeds the supplied
+  `maxProtocolVersion`.
 
-### 15.3 Bucket Immutability
+- **INV-B5 — Shadow elision pre/post INITENTRY.** Under
+  `@version(<11)`, shadow elision applies to all entry types. Under
+  `@version(≥11, <12)`, `INITENTRY` and `DEADENTRY` MUST NOT be
+  elided by shadow. Under `@version(≥12)`, merges MUST NOT receive
+  any non-empty shadow vector.
 
-**Invariant 3**: Once a bucket file is created and its hash computed,
-the file MUST NOT be modified. All bucket operations (merge, adoption)
-produce new bucket files.
+- **INV-B6 — INIT/DEAD annihilation.** Whenever an entry is in
+  `INIT` state, its chronological predecessor MUST be `DEAD` or
+  nonexistent. The `(INIT_x, LIVE_y) -> INIT_y`,
+  `(DEAD, INIT_x) -> LIVE_x`, and `(INIT, DEAD) -> empty` equal-key
+  merge rules MUST be applied exactly as in `§6.4`.
 
-### 15.4 Level Size Bounds
+- **INV-B7 — Eviction partitioning.** The output of
+  `resolveBackgroundEvictionScan` MUST partition evicted entries
+  such that:
+  - persistent Soroban entries appear in `archivedEntries`;
+  - temporary Soroban entries' keys appear in `deletedKeys`;
+  - every evicted entry's TTL key appears in `deletedKeys` exactly
+    once;
+  - no key appears in both `archivedEntries` and `deletedKeys`.
 
-**Invariant 4**: The entries in level L's `curr` bucket span at most
-`levelHalf(L)` ledgers. The entries in level L's `snap` bucket span
-at most `levelHalf(L)` ledgers. Together, a level spans at most
-`levelSize(L)` ledgers.
+- **INV-B8 — Tombstone elision only at deepest level.** Tombstone
+  entries (`DEADENTRY` or `HOT_ARCHIVE_LIVE`) MUST NOT be dropped
+  by any merge where `keepTombstoneEntries(level) == true`. They
+  MUST be dropped by any merge where this returns `false` (i.e., the
+  deepest level).
 
-### 15.5 Spill Completeness
+- **INV-B9 — Bucket immutability.** Once a bucket has been adopted
+  by the `BucketManager`, its file content MUST NOT change. A merge
+  producing a bucket with an already-known hash MUST reuse the
+  existing bucket and discard the temporary file.
 
-**Invariant 5**: A FutureBucket merge at level L+1 MUST be resolved
-before the next spill from level L occurs. If a merge is still pending
-when a spill is needed, the merge MUST be synchronously resolved before
-proceeding.
+- **INV-B10 — FutureBucket state invariants.** A `FutureBucket` MUST
+  satisfy the state-validity table in `§7.1`. In particular, an
+  `FB_LIVE_INPUTS` future MUST hold non-null `curr` and `snap`
+  inputs and a valid output future; an `FB_LIVE_OUTPUT` future MUST
+  hold a non-null output and no input pointers.
 
-### 15.6 Tombstone Safety
+- **INV-B11 — Merge identity.** Two merges with identical `MergeKey`
+  MUST produce buckets with identical hashes, and identical merge
+  re-attachment MUST yield the same output regardless of who started
+  the merge.
 
-**Invariant 6**: Tombstones (DEADENTRY for Live, HOT_ARCHIVE_LIVE for
-Hot Archive) MUST be retained at all levels except the deepest
-(level 10). Premature tombstone elimination could cause stale entries
-at deeper levels to become visible.
+- **INV-B12 — Last-level INIT correctness during apply.** When
+  applying a `LIVEENTRY` from the deepest BucketList level
+  (`kNumLevels - 1`) during catchup, the applicator MUST treat it
+  as `INITENTRY` (a `create`), since no older state precedes it.
 
-### 15.7 INIT/DEAD Annihilation Correctness
+- **INV-B13 — Hot Archive content constraint.** Every
+  `HOT_ARCHIVE_ARCHIVED` entry MUST carry a persistent Soroban
+  `LedgerEntry`; every `HOT_ARCHIVE_LIVE` entry MUST carry a
+  persistent Soroban `LedgerKey`. Adding any other type MUST be
+  rejected.
 
-**Invariant 7**: In the post-protocol-11 merge, when old=INIT and
-new=DEAD for the same key, annihilation MUST produce no output entry.
-This is the critical property that makes tombstone elimination at the
-deepest level safe: an entry that was created (INIT) and then deleted
-(DEAD) leaves no trace, so there is nothing for a deeper stale entry
-to shadow. Note that the reverse case (old=DEAD, new=INIT) does NOT
-annihilate — it produces a LIVE entry (see Section 6.5).
+- **INV-B14 — HAS round-trip.** Serializing a BucketList to a HAS
+  and then loading it via `assumeState` MUST yield a BucketList
+  with identical `bucketListHash`.
 
-### 15.8 Shadow Consistency
+- **INV-B15 — `bucketListHash` composition.** From protocol 23
+  onward, the `bucketListHash` MUST be
+  `SHA256(liveBucketList.hash || hotArchiveBucketList.hash)`; before
+  protocol 23, it MUST be `liveBucketList.hash`.
 
-**Invariant 8**: For protocol version >= 12, shadow bucket lists MUST
-be empty. The INIT/DEAD lifecycle replaces shadow-based elision entirely.
-
-### 15.9 Hot Archive Soroban-Only
-
-**Invariant 9**: The Hot Archive BucketList MUST contain only persistent
-Soroban entry types (persistent CONTRACT_DATA, CONTRACT_CODE). TTL
-entries MUST NOT appear in Hot Archive buckets. Non-Soroban entries in
-the Hot Archive are a fatal error.
-
-### 15.10 Eviction Version Safety
-
-**Invariant 10**: For protocol >= 24, persistent entry eviction MUST
-evict the newest version of the entry (as determined by a BucketListDB
-point lookup), not a stale version that happened to be scanned. This
-invariant was introduced in protocol 24 to fix a bug present in
-protocol 23, where persistent entry eviction could archive a stale
-version from a deeper bucket.
-
-### 15.11 Query Consistency
-
-**Invariant 11**: A point lookup for a key MUST return the entry from
-the shallowest bucket that contains that key (or its tombstone).
-Entries at deeper levels for the same key are shadowed and MUST NOT
-be returned.
-
-### 15.12 Snapshot Isolation
-
-**Invariant 12**: Query snapshots MUST reflect a consistent BucketList
-state at a specific ledger. A snapshot MUST NOT reflect a mix of
-states from different ledgers.
+- **INV-B16 — Metadata first.** A `METAENTRY` or `HOT_ARCHIVE_METAENTRY`,
+  if present, MUST be the first record in a bucket file and MUST NOT
+  recur. The corresponding `BucketInputIterator` enforces this on
+  read.
 
 ---
 
 ## 16. Constants
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `kNumLevels` | 11 | Number of levels in the BucketList hierarchy. |
-| `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` | 11 | Protocol version introducing INIT and META entries. |
-| `FIRST_PROTOCOL_SHADOWS_REMOVED` | 12 | Protocol version removing shadow bucket support. |
-| `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` | 23 | Protocol version introducing Hot Archive and persistent entry eviction. |
-| `CHECKPOINT_FREQUENCY` | 64 | Ledgers between history archive checkpoints. |
-| Default page size exponent | 14 | Default `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` (page size = 2^14 = 16,384 bytes). |
+### 16.1 Protocol Constants (MUST NOT vary)
+
+| Constant | Value | Description | Section |
+|----------|------:|-------------|---------|
+| `kNumLevels` | `11` | Number of levels in either BucketList. | [4.1](#41-levels) |
+| `levelSize(i)` | `1 << (2*(i+1))` | Idealized size of level `i` in ledgers. | [4.2](#42-level-sizing) |
+| `levelHalf(i)` | `levelSize(i) / 2` | Idealized half-size. | [4.2](#42-level-sizing) |
+| `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` | `11` | Protocol introducing `INITENTRY` and `METAENTRY`. | [3.1](#31-bucketentry-livebucket) |
+| `FIRST_PROTOCOL_SHADOWS_REMOVED` | `12` | Protocol from which merges MUST have no shadows. | [6.3](#63-shadow-elision-livebucket-only) |
+| `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` | `23` | Protocol from which the Hot Archive exists, persistent eviction is enabled, and `BucketMetadata.ext.v(1)` is REQUIRED. | [11.1](#111-purpose) |
+| `SOROBAN_PROTOCOL_VERSION` | (per LEDGER_SPEC) | Below this version, eviction scans skip the bucket. | [12.4](#124-in-bucket-scan) |
+| `SKIP_1` | `50` | Skip-list ledger period stage 1. | [4.8](#48-ledgerheader-skip-list) |
+| `SKIP_2` | `5_000` | Skip-list ledger period stage 2. | [4.8](#48-ledgerheader-skip-list) |
+| `SKIP_3` | `50_000` | Skip-list ledger period stage 3. | [4.8](#48-ledgerheader-skip-list) |
+| `SKIP_4` | `500_000` | Skip-list ledger period stage 4. | [4.8](#48-ledgerheader-skip-list) |
+| `MAX_HISTORY_ARCHIVE_BUCKET_SIZE` | `100 GiB` | Maximum bucket file size accepted from a history archive. | [14.1](#141-historyarchivestate) |
+| HAS version | `1` (pre-Hot-Archive) / `2` (≥23) | History Archive State schema version. | [14.1](#141-historyarchivestate) |
+
+### 16.2 Recommended Parameters
+
+| Constant | Default | Description | Section |
+|----------|---------|-------------|---------|
+| `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT` | impl-defined | `pageSize == 2^N` for the `RangeIndex`. | [9.3](#93-diskindex) |
+| `BUCKETLIST_DB_INDEX_CUTOFF` | `250 MB` | Buckets smaller than this size use the in-memory index. | [9.2](#92-inmemoryindex) |
+| `BUCKETLIST_DB_PERSIST_INDEX` | `true` (non-validators) | When `true`, indexes are persisted to disk. Validators ignore this and never persist. | [9.7](#97-persistence) |
+| `BUCKETLIST_DB_MEMORY_FOR_CACHING` | impl-defined | Total budget for the per-bucket entry cache used by large buckets. | [9.6](#96-entry-cache) |
+| `QUERY_SNAPSHOT_LEDGERS` | impl-defined | Number of historical BucketList snapshots retained for query. | [10.1](#101-bucketsnapshotmanager) |
+| `LEDGER_ENTRY_BATCH_COMMIT_SIZE` | impl-defined | Number of entries the bucket applicator commits per inner ledger-txn batch during catchup. | [13.1](#131-bucket-application) |
+
+These parameters affect performance and memory consumption only; they
+do not affect the `bucketListHash` or any other consensus-deterministic
+output.
 
 ---
 
@@ -1951,147 +1512,129 @@ states from different ledgers.
 
 | Reference | Description |
 |-----------|-------------|
-| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
-| [CAP-0020] | Stellar CAP-0020, "Bucket Merge Logic and INITENTRY", introduces INIT/DEAD annihilation semantics. |
-| [CAP-0035] | Stellar CAP-0035, "Asset Clawback", adds clawback-related entries. |
-| [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries. |
-| [CAP-0057] | Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction. |
-| [stellar-core] | stellar-core v25.2.2 source code, `src/bucket/` directory. |
+| LEDGER_SPEC | Stellar Ledger Close Pipeline Specification — defines the per-ledger batch formation that this subsystem consumes, and the `LedgerHeader` fields (`bucketListHash`, `skipList`) populated by this subsystem. |
+| TX_SPEC | Stellar Transactions Specification — defines `RestoreFootprint`, `ExtendFootprintTTL`, and the persistent / temporary distinction the Hot Archive depends on. |
+| CATCHUP_SPEC | Stellar Catchup, Replay, and History Publishing Specification — defines bucket download, application order, and HAS publishing. |
+| HERDER_SPEC | Stellar Herder Specification — describes how the `LedgerHeader` populated here becomes part of the consensus value. |
+| [CAP-0044] | Persistent Entry Eviction (protocol 23). |
+| [CAP-0046] | Soroban smart contract environment. |
+| RFC 2119 | Key words for use in RFCs to Indicate Requirement Levels. |
+| FIPS 180-4 | SHA-256 specification. |
 
 ---
 
-## 18. Appendices
+## Appendix A — Merge Equal-Key Decision Matrix
 
-### Appendix A: BucketList Spill Sequence (First 16 Ledgers)
+The following matrix is the normative table from `§6.4`, reproduced
+for ease of reference. `x` and `y` denote `LedgerEntry` values for the
+same `LedgerKey`. Bold entries are errors; the implementation MUST
+fail if encountered.
 
-```
-Ledger 1:  L0.curr = fresh([entries])
-Ledger 2:  L0 spills → L0.snap = old_L0.curr
-           L0.curr = fresh([entries])
-           L1.next = merge(L1.curr, L0.snap)
-Ledger 3:  L0.curr = merge(L0.curr, fresh([entries]))
-Ledger 4:  L0 spills → L0.snap = old_L0.curr
-           L0.curr = fresh([entries])
-           L1.next = merge(L1.curr, L0.snap)
-           L1 resolves next → L1.curr = resolved
-Ledger 5:  L0.curr = merge(L0.curr, fresh([entries]))
-Ledger 6:  L0 spills → L0.snap = old_L0.curr
-           L0.curr = fresh([entries])
-           L1.next = merge(L1.curr, L0.snap)
-Ledger 7:  L0.curr = merge(L0.curr, fresh([entries]))
-Ledger 8:  L0 spills → L0.snap = old_L0.curr
-           L0.curr = fresh([entries])
-           L1 spills → L1.snap = old_L1.curr
-           L1.next = merge(L1.curr, L0.snap)
-           L2.next = merge(L2.curr, L1.snap)
-...
-```
+| old \ new | INIT = y | LIVE = y | DEAD |
+|-----------|----------|----------|------|
+| INIT = x | **error: malformed** | emit INIT = y, advance both | emit nothing, advance both (annihilation) |
+| LIVE = x | **error: malformed** | emit LIVE = y, advance both | emit DEAD, advance both |
+| DEAD | emit LIVE = y, advance both | emit LIVE = y, advance both | emit DEAD, advance both |
 
-### Appendix B: Merge Decision Matrix (Live BucketList, Protocol 11+)
+For the Hot Archive (`§6.5`), every equal-key cell collapses to "emit
+new, advance both".
 
-```
-                        Old Entry
-                 INIT    LIVE    DEAD
-          +------+-------+-------+-------+
-    New   | INIT | ERROR | ERROR | LIVE* |
-    Entry | LIVE | INIT* | LIVE  | LIVE  |
-          | DEAD | ANNHI | DEAD  | DEAD  |
-          +------+-------+-------+-------+
+The four "easy" (non-equal-key) cases use the column corresponding to
+whichever iterator advances:
 
-    ANNHI = Annihilate (no output)
-    INIT* = INIT with new entry's data
-    LIVE* = LIVE with new entry's data (INIT converted to LIVE)
-    ERROR = Invalid state, implementation MUST signal error
-```
+| Condition | Action |
+|-----------|--------|
+| new exhausted, OR old < new | emit old, advance old |
+| old exhausted, OR new < old | emit new, advance new |
+| both exhausted | terminate |
+| keys equal, both live | use table above |
 
-### Appendix C: Hot Archive Merge Decision Matrix
+---
 
-```
-                        Old Entry
-                 ARCHIVED    LIVE
-          +---------+---------+------+
-    New   | ARCHIVED| ARCHIVED| ARCH |
-    Entry | LIVE    | LIVE    | LIVE |
-          +---------+---------+------+
-
-    All cells: newest entry always wins. No annihilation.
-    ARCH  = Emit ARCHIVED (new)
-    LIVE  = Emit LIVE (new)
-
-    Note: HOT_ARCHIVE_LIVE tombstones are elided only at level 10
-    by the output iterator, not during the merge itself.
-```
-
-### Appendix D: BucketList Level Update Flow
-
-```mermaid
-flowchart TD
-    A[Ledger Close: addBatch] --> B{Level 0}
-    B --> C[Create fresh bucket from entries]
-    C --> D{Level 0 should spill?}
-    D -->|No| E[In-memory merge with curr_0]
-    D -->|Yes| F[snap_0 = curr_0]
-    F --> G[Start merge: next_1 = merge curr_1, snap_0]
-    G --> H{Level 1 should spill?}
-    H -->|No| I[Done]
-    H -->|Yes| J[snap_1 = curr_1]
-    J --> K[Start merge: next_2 = merge curr_2, snap_1]
-    K --> L{Continue deeper...}
-```
-
-### Appendix E: FutureBucket State Machine
+## Appendix B — BucketList State Diagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> FB_CLEAR
-    FB_CLEAR --> FB_LIVE_INPUTS : construct with live buckets
-    FB_CLEAR --> FB_HASH_INPUTS : deserialize (inputs)
-    FB_CLEAR --> FB_HASH_OUTPUT : deserialize (output)
-    FB_HASH_INPUTS --> FB_LIVE_INPUTS : makeLive (start merge)
-    FB_HASH_OUTPUT --> FB_LIVE_OUTPUT : makeLive (lookup output)
-    FB_LIVE_INPUTS --> FB_LIVE_OUTPUT : resolve (merge complete)
-    FB_LIVE_OUTPUT --> FB_CLEAR : clear
-    FB_LIVE_INPUTS --> FB_CLEAR : clear
+    [*] --> Empty: BucketListBase()
+    Empty --> Filling: first addBatch
+    state Filling {
+        [*] --> L0Curr
+        L0Curr --> L0Snap: levelShouldSpill(_, 0)
+        L0Snap --> L1Merge: spill
+        L1Merge --> L1Curr: resolve
+        L1Curr --> L1Snap: levelShouldSpill(_, 1)
+        L1Snap --> Lk: ...
+    }
+    Filling --> Steady: BucketList full (ledger > levelSize(kNumLevels-1))
+    Steady --> Steady: addBatch each ledger
 ```
 
-### Appendix F: Point Lookup Flow
+The "Empty" state is the initial state of a fresh `BucketListBase`
+with all `curr` and `snap` set to empty buckets. The "Filling" period
+covers ledgers `1..levelSize(kNumLevels - 1) - 1` during which the
+oldest level has not yet reached its idealized size; the offset (skew)
+introduced here persists indefinitely into the "Steady" state.
 
-```mermaid
-flowchart TD
-    A[load key] --> B[Level 0 curr]
-    B --> C{Found?}
-    C -->|Yes - tombstone| D[Return null]
-    C -->|Yes - live| E[Return entry]
-    C -->|No| F[Level 0 snap]
-    F --> G{Found?}
-    G -->|Yes| H[Check tombstone/live]
-    G -->|No| I[Level 1 curr]
-    I --> J[... continue through all levels ...]
-    J --> K{Found at any level?}
-    K -->|No| L[Return null]
-```
+Each ledger in the "Steady" state performs the following work:
 
-### Appendix G: Eviction Scan Flow
+- level 0 ingests the new batch;
+- for each spilling level `i > 0`, the prior merge is committed,
+  `curr` is promoted to `snap`, and a new merge is started against the
+  prior level's `snap`.
 
-```mermaid
-flowchart TD
-    A[Start eviction scan] --> B[Read entries from current position]
-    B --> C{Entry is Soroban INIT/LIVE?}
-    C -->|No| D[Skip, advance]
-    C -->|Yes| E[Collect TTL key for bulk lookup]
-    D --> F{Scan size exhausted?}
-    E --> F
-    F -->|No| B
-    F -->|Yes| G[Bulk load all TTL keys]
-    G --> H{For each candidate}
-    H --> I{TTL expired?}
-    I -->|No| J[Skip]
-    I -->|Yes| K{Persistent entry?}
-    K -->|No| L[Add to delete list]
-    K -->|Yes| M[Verify newest version, add to archive list]
-    J --> N{More candidates?}
-    L --> N
-    M --> N
-    N -->|Yes| H
-    N -->|No| O[Return eviction candidates]
-```
+---
+
+## Appendix C — Eviction Scan Walkthrough
+
+This appendix illustrates a single eviction tick at a protocol-23+
+node. Constants like `scanSize` and `maxEntriesToArchive` are taken
+from the active `SorobanNetworkConfig`. The walkthrough is for
+explanation only; the body of `§12` is normative.
+
+1. **Start of ledger N.** Main thread starts a background eviction
+   scan against the LCL snapshot. The scan's
+   `evictionIter = {level = 6, isCurr = false, offset = 0x40_000}`
+   was persisted at the end of ledger N-1.
+2. **Background scan begins.**
+   `updateStartingEvictionIterator(iter, firstScanLevel, ledgerSeq)`
+   confirms no upgrade or recent spill has invalidated the cursor.
+3. **First bucket pulled.** The scan reads up to `evictionScanSize`
+   bytes from level 6 `snap`, starting at `offset = 0x40_000`. For
+   each Soroban-typed `LIVEENTRY`, it records the corresponding TTL
+   key in `keysToSearch` and (for persistent entries under
+   protocol-24+) the entry's own key.
+4. **TTL bulk load.** After the byte budget is exhausted (or EOF is
+   hit), the scan calls `loadKeys(keysToSearch, "eviction")` against
+   the snapshot. For each candidate:
+   - if the TTL is missing or live (`liveUntilLedger >= ledgerSeq`),
+     the candidate is dropped;
+   - otherwise the candidate is added to `eligibleEntries`, and for
+     protocol-24+ persistent entries its payload is replaced with
+     the newest version returned by the bulk load.
+5. **End of bucket.** If the byte budget is not exhausted but the
+   bucket ends, `updateEvictionIterAndRecordStats` advances to the
+   next bucket (here: level 7 `curr`).
+6. **Main-thread resolution.** When ledger N's apply phase begins,
+   `resolveBackgroundEvictionScan(ltx, modifiedKeys)`:
+   - drops candidates whose TTL was modified in this ledger;
+   - evicts up to `maxEntriesToArchive` candidates from `ltx`;
+   - partitions the evicted set into `deletedKeys` (TTL keys plus
+     all temporary entry keys) and `archivedEntries` (persistent
+     entries);
+   - updates the network-config eviction iterator with the new
+     position.
+7. **Feeding the BucketLists.** The seal-and-store step of the
+   ledger close pipeline feeds `archivedEntries` to
+   `addHotArchiveBatch` and includes `deletedKeys` in
+   `addLiveBatch`'s `deadEntries` argument, where they enter level 0
+   of the respective BucketLists as `HOT_ARCHIVE_ARCHIVED` and
+   `DEADENTRY` entries.
+
+The cycle continues each ledger, with the iterator wrapping back to
+`firstScanLevel` after sweeping past the deepest level. A complete
+eviction cycle covers every byte of every eligible bucket exactly
+once, at which point `EvictionStatistics::submitMetricsAndRestartCycle`
+is called.
+
+[CAP-0044]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0044.md
+[CAP-0046]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046.md

@@ -1,6 +1,6 @@
 # Stellar Transaction Processing Specification
 
-**Version:** 25 (stellar-core v25.2.2 / Protocol 25)
+**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Status:** Informational
 **Date:** 2026-05-13
 
@@ -9,21 +9,24 @@
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
-2. [Processing Overview](#2-processing-overview)
-3. [Data Types and Encoding](#3-data-types-and-encoding)
-4. [Transaction Validation](#4-transaction-validation)
-5. [Fee Framework](#5-fee-framework)
-6. [Transaction Application Pipeline](#6-transaction-application-pipeline)
-7. [Operation Execution](#7-operation-execution)
-8. [Soroban Execution](#8-soroban-execution)
-9. [State Management](#9-state-management)
-10. [Metadata Construction](#10-metadata-construction)
-11. [Event Emission](#11-event-emission)
-12. [Error Handling](#12-error-handling)
-13. [Invariants and Safety Properties](#13-invariants-and-safety-properties)
-14. [Constants](#14-constants)
-15. [References](#15-references)
-16. [Appendices](#16-appendices)
+2. [Architecture](#2-architecture)
+3. [Data Types](#3-data-types)
+4. [Transaction Lifecycle](#4-transaction-lifecycle)
+5. [Transaction Validation](#5-transaction-validation)
+6. [Fee Framework](#6-fee-framework)
+7. [Transaction Application Pipeline](#7-transaction-application-pipeline)
+8. [Operation Execution](#8-operation-execution)
+9. [Sponsorship Framework](#9-sponsorship-framework)
+10. [DEX Conversion Engine](#10-dex-conversion-engine)
+11. [Soroban Execution](#11-soroban-execution)
+12. [State Management](#12-state-management)
+13. [Metadata Construction](#13-metadata-construction)
+14. [Event Emission](#14-event-emission)
+15. [Error Handling](#15-error-handling)
+16. [Invariants and Safety Properties](#16-invariants-and-safety-properties)
+17. [Constants](#17-constants)
+18. [References](#18-references)
+19. [Appendices](#19-appendices)
 
 ---
 
@@ -31,3221 +34,2352 @@
 
 ### 1.1 Purpose and Scope
 
-This document specifies the Stellar transaction processing subsystem as
-implemented in stellar-core v25.2.2. The transaction subsystem governs how
-transactions are validated, how fees are computed and charged, how
-operations mutate ledger state, how results and metadata are constructed,
-and how Soroban smart contract transactions are executed.
+This document specifies the Stellar transaction processing subsystem: the
+parsing, validation, fee handling, signature checking, two-phase application,
+and result/metadata production logic that any conforming implementation MUST
+reproduce to maintain ledger consensus parity with stellar-core.
 
-This specification covers the complete processing pipeline: envelope
-validation, fee deduction, sequence number advancement, signature
-verification, operation dispatch, state management (nested ledger
-transactions with savepoint semantics), metadata construction, event
-emission, and error handling. The specification targets observable
-behavior and deterministic outcomes; internal implementation details
-such as threading models, caching strategies, and database schemas are
-out of scope except where they directly affect determinism or
-correctness.
-
-This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2).
-Any conforming
-implementation that produces identical observable behavior (transaction
-results, metadata, ledger state changes) for all valid inputs is
+This specification is **implementation agnostic**. It is derived exclusively
+from the vetted stellar-core C++ implementation (v26.0.1). Any conforming
+implementation that produces identical post-apply ledger state, transaction
+results, transaction meta, and emitted events for all valid inputs is
 considered correct.
+
+**In scope:**
+
+- The `TransactionFrame` and `FeeBumpTransactionFrame` validation and apply
+  pipelines.
+- The 25 classic and 3 Soroban operation types, including their structural
+  validation, semantic validation, and application logic in exact source
+  order.
+- The fee framework: full fee, inclusion fee, fee-bump semantics, surge
+  pricing inputs, Soroban resource fees, and refunds.
+- The signature checker weight-accumulation algorithm and signer consumption
+  semantics.
+- The sponsorship framework: numSponsoring / numSponsored counters, signer
+  sponsorship IDs, sponsorship transfer / establish / remove.
+- The DEX conversion engine: offer crossing order, rounding modes,
+  cross-self detection, liquidity-pool interaction.
+- The Soroban execution path: host-function invocation, footprint
+  accounting, parallel apply, refundable resources, autorestore.
+- Transaction meta construction, version selection, ledger-change ordering.
+- Event emission: classic SAC-style events, Soroban contract events,
+  XLM reconciliation, fee events.
+- Tx-level and op-level result codes.
+
+**Out of scope:**
+
+- Wire-level XDR framing (covered in `OVERLAY_SPEC §3`).
+- Transaction-set construction, surge pricing selection, broadcast, and
+  the mempool (covered in `HERDER_SPEC §4–§7`).
+- Ledger close coordination, header update, BucketList flushing
+  (covered in `LEDGER_SPEC §3–§5`).
+- BucketList persistence and snapshot semantics (covered in
+  `BUCKETLISTDB_SPEC`).
+- Catchup and replay (covered in `CATCHUP_SPEC`).
+- Implementation internals: caching, memory management, threading,
+  SQL schemas, metrics, logging.
 
 ### 1.2 Conventions and Terminology
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
-document are to be interpreted as described in [RFC 2119][rfc2119].
+document are to be interpreted as described in RFC 2119.
+
+**Glossary:**
 
 | Term | Definition |
 |------|------------|
-| **Transaction** | A signed request to mutate ledger state, containing one or more operations. |
-| **Operation** | A single atomic action within a transaction (e.g., payment, offer creation). |
-| **Envelope** | A signed container (`TransactionEnvelope`) carrying a transaction and its signatures. |
-| **Fee-bump transaction** | A wrapper transaction that replaces the fee source and increases the fee of an inner transaction. |
-| **Classic transaction** | A transaction containing only classic (non-Soroban) operations. |
-| **Soroban transaction** | A transaction containing exactly one Soroban operation (InvokeHostFunction, ExtendFootprintTTL, or RestoreFootprint). |
-| **Source account** | The account that initiated the transaction or operation. Each operation MAY override the transaction-level source. |
-| **Fee source** | The account charged the transaction fee. For regular transactions this is the source account; for fee-bump transactions it is the outer fee source. |
-| **Ledger transaction** | A nested, scoped view of ledger state that supports commit and rollback semantics (Section 9). |
-| **Inclusion fee** | The portion of the fee bid for transaction set inclusion (subject to surge pricing). |
-| **Resource fee** | The Soroban-specific fee covering compute, storage, and bandwidth resources. |
-| **Base fee** | The per-operation fee floor for the current ledger, determined by surge pricing or the ledger header minimum. |
-| **Footprint** | A Soroban transaction's declared set of ledger keys it will read and/or write. |
-| **TTL** | Time-to-live: the last ledger sequence at which a Soroban persistent or temporary entry remains live. |
-| **Stroop** | The smallest unit of XLM: 1 XLM = 10,000,000 stroops. All amounts in this specification are in stroops unless stated otherwise. |
-| **MuxedAccount** | An account identifier that may embed a 64-bit memo ID alongside the Ed25519 public key. |
+| Transaction | An indivisible, atomic unit of state change submitted to the network, consisting of a source account, sequence number, fee, optional preconditions, memo, and 1–100 operations. |
+| Fee-bump transaction | An outer transaction whose only purpose is to pay the fee for an enclosed inner transaction, allowing a different account to fund execution. |
+| Operation | A single primitive action (payment, offer, contract invocation, etc.); a transaction is a sequence of operations applied in order. |
+| Inner transaction | The `Transaction` wrapped inside a `FeeBumpTransaction`. |
+| Source account | The Stellar account against which a transaction's sequence number is consumed and whose signature authorizes the transaction. |
+| Fee source | The account that pays the transaction fee. Equal to the source for non-fee-bump transactions; equal to the fee-bump source for fee-bump transactions. |
+| Inclusion fee | The portion of the full fee used for inclusion-priority comparisons; full fee minus declared Soroban resource fee for Soroban txs. |
+| Full fee | The total fee declared in the envelope's `fee` field. |
+| Effective fee | The fee actually charged at apply time, after surge-pricing reductions. |
+| Threshold level | One of LOW / MEDIUM / HIGH determining the signer weight required to authorize an operation. |
+| commonValid | A composite validation predicate executed both at `checkValid` time and at apply time; produces one of four validation outcomes. |
+| LedgerTxn | A nested transactional view over ledger state; see `LEDGER_SPEC §6`. |
+| Signature checker | A stateful object that tracks which of the up to 20 envelope signatures have been consumed during weight accumulation. |
+| Footprint | The static set of `LedgerKey` entries a Soroban transaction declares it will read and/or write, split into `readOnly` and `readWrite` keysets. |
+| Refundable fee | The portion of a Soroban resource fee returned to the fee source after apply if not consumed by rent or events. |
+| Surge pricing | The mechanism by which lane-level demand raises the effective base fee per operation; see `HERDER_SPEC §6`. |
+| TTL | Time-to-live for Soroban entries, expressed as a `liveUntilLedgerSeq`. |
+| Hot Archive | Persistent storage of evicted Soroban entries; see `BUCKETLISTDB_SPEC §10`. |
+| Autorestore | Implicit restoration of archived persistent Soroban entries by an `InvokeHostFunction` op that marks them in `archivedSorobanEntries` (v23+). |
+
+#### Relationship to Other Specifications
+
+| Specification | Relationship |
+|---------------|--------------|
+| `LEDGER_SPEC` | TX is invoked from the apply pipeline; uses LedgerTxn and ledger header from LEDGER. |
+| `HERDER_SPEC` | HERDER constructs tx sets, surge-prices and validates txs via `checkValid` / `checkValidForOverlay`. |
+| `OVERLAY_SPEC` | OVERLAY framing carries `TRANSACTION` messages; overlay flooding calls `checkValidForOverlay`. |
+| `BUCKETLISTDB_SPEC` | TX reads state via LedgerTxn-backed BucketList snapshots; writes commit through LedgerTxn. |
+| `CATCHUP_SPEC` | Catchup replays transactions through the same `TransactionFrameBase::apply` entry point. |
+| `SCP_SPEC` | TX outcomes are not consensed directly; only the apply-ordered tx set is consensed. |
 
 ### 1.3 Notation
 
-This specification uses the following notation conventions:
+This document uses prose with embedded `camelCase` pseudocode. XDR result
+codes are written in `SCREAMING_SNAKE_CASE`. Protocol-version guards are
+annotated `@version(≥N)`, `@version(<N)`, or `@version(=N)`. Where the order
+of validation checks affects observable behavior (in particular, the result
+code returned for an invalid transaction), checks are listed in **exact
+source order**.
 
-- **XDR types**: Written in `monospace` and correspond to definitions
-  in the Stellar XDR schema files (`Stellar-transaction.x`,
-  `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`).
-- **Protocol version guards**: Written as `@version(≥N)` to indicate
-  behavior introduced at or after protocol version N. Behavior without
-  a version guard applies to all supported protocol versions (24+).
-- **Pseudocode**: Algorithm steps are written in language-agnostic
-  pseudocode. Variable names use `camelCase`. Functions use
-  `functionName()` notation.
-- **Result codes**: Written in `SCREAMING_SNAKE_CASE` matching the XDR
-  enum values (e.g., `txSUCCESS`, `opBAD_AUTH`).
+Cross-references to other specs use the form `SPEC_NAME §N.N`. References
+to XDR types use the type name without reproducing the full XDR definition;
+see `protocol-curr/xdr/Stellar-transaction.x` in the pinned stellar-core
+submodule.
 
 ---
 
-## 2. Processing Overview
+## 2. Architecture
 
-### 2.1 Transaction Lifecycle
+The transaction subsystem is invoked from two callers: the **apply
+pipeline** (driven by `LedgerManagerImpl` during ledger close) and the
+**validation pipeline** (driven by `HerderImpl` and overlay flooding).
+Both share the same `TransactionFrameBase` polymorphic interface; the two
+concrete implementations are `TransactionFrame` (envelope types
+`ENVELOPE_TYPE_TX_V0` and `ENVELOPE_TYPE_TX`) and
+`FeeBumpTransactionFrame` (envelope type `ENVELOPE_TYPE_TX_FEE_BUMP`).
 
-A transaction progresses through the following stages:
+```mermaid
+graph TD
+    subgraph Inputs
+        WIRE[Wire envelope<br/>TransactionEnvelope XDR]
+    end
 
-1. **Construction**: A client constructs a `TransactionEnvelope`
-   containing a transaction body and signatures.
+    subgraph FrameLayer[Frame Layer]
+        FRAME[TransactionFrameBase<br/>makeTransactionFromWire]
+        TF[TransactionFrame]
+        FB[FeeBumpTransactionFrame]
+        FRAME --> TF
+        FRAME --> FB
+        FB -. wraps .-> TF
+    end
 
-2. **Validation** (Section 4): The transaction is checked for
-   well-formedness and precondition satisfaction without mutating
-   ledger state.
+    subgraph ValidationPath
+        CV[checkValid /<br/>checkValidForOverlay]
+        XDR[XDR depth + fee check]
+        CVF[commonValid + signature check]
+        OCV[per-op doCheckValid]
+        SIGUSED[checkAllSignaturesUsed]
+    end
 
-3. **Fee and Sequence Number Processing** (Section 5.4): Before any
-   operations execute, the fee is deducted from the fee source account
-   and the sequence number is advanced. These changes are committed
-   regardless of whether the transaction's operations succeed.
+    subgraph ApplyPath
+        PFSN[processFeeSeqNum<br/>fee phase]
+        APPLY[apply<br/>application phase]
+        CPRE[commonPreApply]
+        APPOPS[applyOperations]
+        OPAPP[OperationFrame::apply]
+        DOAPPLY[doApply /<br/>doApplyForSoroban]
+        PPA[processPostApply<br/>refund + fee event]
+    end
 
-4. **Application** (Section 6): Operations are executed sequentially.
-   Each operation either succeeds (its state changes are committed) or
-   fails (its state changes are rolled back). A transaction succeeds
-   only if all operations succeed.
+    subgraph SupportingComponents[Supporting]
+        SIGCHK[SignatureChecker]
+        MTR[MutableTransactionResult]
+        MB[TransactionMetaBuilder]
+        EM[EventManager]
+        LTX[LedgerTxn<br/>see LEDGER_SPEC]
+    end
 
-5. **Post-Application** (Section 5.5): For Soroban transactions,
-   unused refundable fees are returned to the fee source account.
+    WIRE --> FRAME
+    TF --> CV
+    FB --> CV
+    CV --> XDR --> CVF --> OCV --> SIGUSED
+    TF --> PFSN --> APPLY
+    FB --> PFSN
+    APPLY --> CPRE --> APPOPS --> OPAPP --> DOAPPLY
+    APPLY --> PPA
+    CVF --> SIGCHK
+    APPOPS --> SIGCHK
+    APPLY --> MTR
+    APPLY --> MB
+    DOAPPLY --> EM
+    APPOPS --> LTX
+```
 
-6. **Result and Metadata** (Sections 10, 12): A `TransactionResult`
-   and `TransactionMeta` are produced recording the outcome and all
-   state changes.
+The frame layer provides exactly two entry points to the apply pipeline:
 
-### 2.2 Two-Phase Ledger Model
+- `processFeeSeqNum(ltx, baseFee)` — **fee phase**: deducts the effective
+  fee from the fee source, consumes the sequence number on protocols
+  before V_10 (for non-fee-bump txs), and returns a fresh
+  `MutableTransactionResult` initialized with the charged fee.
+- `apply(app, ltx, meta, txResult, sorobanConfig, prngSeed)` —
+  **application phase**: runs `commonValid` again under the live
+  `LedgerTxn`, consumes the sequence number on protocol V_10+, removes
+  one-time signers, validates and applies each operation, and processes
+  post-apply refunds.
 
-Transactions are applied to a ledger in two phases:
+For parallel Soroban transactions (`@version(≥23)`), the apply phase is
+split into `preParallelApply` (sequential pre-work under the apply ltx)
+and `parallelApply` (concurrent execution against a thread-local
+`ThreadParallelApplyLedgerState`). See `HERDER_SPEC §5` and §11.6 below.
 
-1. **Classic Phase**: Contains classic (non-Soroban) transactions.
-   Transactions are applied sequentially in the order determined by
-   the transaction set.
+The validation pipeline `checkValid` (and its overlay sibling
+`checkValidForOverlay`) is a pure read-only computation against a
+`LedgerSnapshot`; it does not mutate ledger state and is invoked from
+multiple contexts (the herder mempool, overlay flooding, RPC submission).
+It runs the same `commonValid` predicate as apply but with `applying=false`
+and `chargeFee=true`.
 
-2. **Soroban Phase**: Contains Soroban transactions. Prior to
-   `@version(≥23)`, Soroban transactions are applied sequentially.
-   From `@version(≥23)`, Soroban transactions MAY be applied in
-   parallel using a staged execution model (Section 8.7).
+A transaction's outputs are:
 
-Both phases share the same ledger state. The classic phase is always
-applied before the Soroban phase.
-
-### 2.3 Fee and Sequence Pre-Processing
-
-Before any operations in either phase are executed, the implementation
-MUST process fees and sequence numbers for **all** transactions in
-**both** phases. This pre-processing pass:
-
-1. Iterates all transactions in apply order (classic phase first, then
-   Soroban phase).
-2. For each transaction, deducts the computed fee from the fee source
-   account and advances the source account's sequence number.
-3. Commits these changes to ledger state.
-4. Records the state changes as `txChangesBefore` metadata.
-
-This ensures that fee deduction is irrevocable — even if a
-transaction's operations all fail, the fee is still charged.
-
-### 2.4 Transaction Set Structure
-
-A transaction set is organized into phases. Each phase contains
-transactions grouped for application:
-
-- **Classic phase**: A flat list of transactions applied sequentially.
-- **Soroban phase** `@version(<23)`: A flat list of transactions
-  applied sequentially.
-- **Soroban phase** `@version(≥23)`: A list of **stages**. Each stage
-  contains one or more **clusters**. Stages are applied sequentially.
-  Clusters within a stage MAY be applied in parallel because they are
-  guaranteed to have non-overlapping read-write footprints. Each
-  cluster contains one or more transactions applied sequentially
-  within that cluster.
+- A `TransactionResult` (the tx-level success/failure code plus a vector
+  of per-operation results).
+- A `TransactionMeta` (the ledger-entry changes produced).
+- A vector of emitted events (fee events at the tx level; classic SAC
+  events and Soroban contract events at the op level).
 
 ---
 
-## 3. Data Types and Encoding
+## 3. Data Types
 
-### 3.1 Transaction Envelope Types
+This section enumerates the XDR types observed by the transaction subsystem.
+Definitions are in `protocol-curr/xdr/Stellar-transaction.x` and
+`Stellar-ledger.x`; this section names types and their roles without
+reproducing the schemas.
 
-All transactions are submitted as `TransactionEnvelope`, a union with
-three variants:
+### 3.1 Envelope Types
 
-| Envelope Type | XDR Discriminant | Description |
-|---------------|-----------------|-------------|
-| `ENVELOPE_TYPE_TX_V0` | 0 | Legacy format (pre-protocol 13). Source is raw `uint256` Ed25519 key. No preconditions beyond `TimeBounds`. |
-| `ENVELOPE_TYPE_TX` | 2 | Current format. Source is `MuxedAccount`. Supports full `Preconditions` and Soroban extensions. |
-| `ENVELOPE_TYPE_TX_FEE_BUMP` | 5 | Fee-bump wrapper. Contains an inner `TransactionV1Envelope` plus an outer fee source and fee. |
+| XDR type | Envelope tag | Description |
+|----------|--------------|-------------|
+| `TransactionV0Envelope` | `ENVELOPE_TYPE_TX_V0` | Legacy pre-V_13 envelope with raw `ed25519` source account bytes; rejected at protocol V_13+. |
+| `TransactionV1Envelope` | `ENVELOPE_TYPE_TX` | Current envelope using `MuxedAccount` source. Required for protocol V_13+. |
+| `FeeBumpTransactionEnvelope` | `ENVELOPE_TYPE_TX_FEE_BUMP` | Fee-bump wrapper; supported from protocol V_13. |
 
-An implementation MUST support all three envelope types.
+An envelope contains a `Transaction` (or `FeeBumpTransaction`) plus an
+`xdr::xvector<DecoratedSignature, 20>` of up to 20 signatures.
 
 ### 3.2 Transaction Body
 
-A V1 transaction (`Transaction`) contains:
+A `Transaction` carries:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `sourceAccount` | `MuxedAccount` | Transaction source account. |
-| `fee` | `uint32` | Maximum total fee in stroops. |
-| `seqNum` | `SequenceNumber` (`int64`) | Source account sequence number. |
-| `cond` | `Preconditions` | Validity preconditions (Section 4.3). |
-| `memo` | `Memo` | Attached memo (none, text, id, hash, or return). |
-| `operations` | `Operation<MAX_OPS_PER_TX>` | One or more operations (max 100). |
-| `ext` | union | Extension: `v=0` (none) or `v=1` (`SorobanTransactionData`). |
+| `sourceAccount` | `MuxedAccount` | Source / sequence-bearing account. |
+| `fee` | `uint32` | Full fee in stroops. |
+| `seqNum` | `int64` (`SequenceNumber`) | Sequence number; MUST equal `account.seqNum + 1` (or relaxed per `minSeqNum`). |
+| `cond` | `Preconditions` | Time / ledger / sequence / signer preconditions. |
+| `memo` | `Memo` | Up to 32 bytes of memo (text/id/hash/return). |
+| `operations` | `xvector<Operation,100>` | 1–100 operations. |
+| `ext` | union | Carries `SorobanTransactionData` when present (v1). |
 
-A V0 transaction is identical except: the source is a raw `uint256`
-Ed25519 key (no muxed account support), preconditions are limited to
-an optional `TimeBounds`, and no extension is supported.
-
-### 3.3 Fee-Bump Transaction
-
-A `FeeBumpTransaction` contains:
+A `FeeBumpTransaction` carries:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `feeSource` | `MuxedAccount` | Account paying the fee (may differ from inner source). |
-| `fee` | `int64` | Total fee for the fee-bump envelope. MUST be ≥ inner transaction fee. |
-| `innerTx` | `TransactionV1Envelope` | The wrapped inner transaction (must be `ENVELOPE_TYPE_TX`). |
+| `feeSource` | `MuxedAccount` | Account paying the fee. |
+| `fee` | `int64` | Full fee in stroops (signed, MUST be ≥ 0). |
+| `innerTx` | union | Wraps an inner `TransactionV1Envelope`. |
+| `ext` | union | Reserved. |
 
-The inner transaction's operations, sequence number, and source account
-are preserved. Only the fee source and fee amount are replaced.
+### 3.3 Preconditions
+
+`Preconditions` is a union over `PRECOND_NONE`, `PRECOND_TIME`, and
+`PRECOND_V2`. The V2 form contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timeBounds` | optional `TimeBounds` | `minTime` / `maxTime` close-time bounds. |
+| `ledgerBounds` | optional `LedgerBounds` | `minLedger` / `maxLedger` sequence bounds. |
+| `minSeqNum` | optional `SequenceNumber` | If set, relaxes the strict `seq = current+1` check. |
+| `minSeqAge` | `Duration` | Required age of source account's `seqTime` (V3 ext). |
+| `minSeqLedgerGap` | `uint32` | Required gap from source account's `seqLedger` (V3 ext). |
+| `extraSigners` | `xvector<SignerKey,2>` | Up to 2 additional signers whose signatures MUST be present. |
+
+`PRECOND_V2` is rejected for protocol `<V_19`.
 
 ### 3.4 Operations
 
-Each `Operation` contains an optional `sourceAccount` override and a
-`body` union discriminated by `OperationType`. The 27 operation types
-are:
+The body of an `Operation` is a tagged union over `OperationType`. The
+following 25 classic types and 3 Soroban types are supported by the
+current protocol:
 
-| Code | Name | Protocol | Description |
-|------|------|----------|-------------|
-| 0 | `CREATE_ACCOUNT` | All | Create a new account with a starting balance. |
-| 1 | `PAYMENT` | All | Send a payment in a specific asset. |
-| 2 | `PATH_PAYMENT_STRICT_RECEIVE` | All | Payment through DEX path; exact destination amount. |
-| 3 | `MANAGE_SELL_OFFER` | All | Create, update, or delete a sell offer. |
-| 4 | `CREATE_PASSIVE_SELL_OFFER` | All | Create a passive sell offer (does not cross equal-price offers). |
-| 5 | `SET_OPTIONS` | All | Configure account settings, signers, thresholds. |
-| 6 | `CHANGE_TRUST` | All | Create, update, or remove a trustline. |
-| 7 | `ALLOW_TRUST` | All | Authorize or deauthorize a trustline (issuer only). |
-| 8 | `ACCOUNT_MERGE` | All | Merge source account into destination. |
-| 9 | `INFLATION` | <12 | Distribute inflation (disabled from protocol 12). |
-| 10 | `MANAGE_DATA` | ≥2 | Create, update, or delete a data entry. |
-| 11 | `BUMP_SEQUENCE` | ≥10 | Bump source account sequence number. |
-| 12 | `MANAGE_BUY_OFFER` | ≥11 | Create, update, or delete a buy offer. |
-| 13 | `PATH_PAYMENT_STRICT_SEND` | ≥12 | Payment through DEX path; exact source amount. |
-| 14 | `CREATE_CLAIMABLE_BALANCE` | ≥14 | Create a claimable balance with claim predicates. |
-| 15 | `CLAIM_CLAIMABLE_BALANCE` | ≥14 | Claim a claimable balance. |
-| 16 | `BEGIN_SPONSORING_FUTURE_RESERVES` | ≥14 | Begin sponsoring reserves for another account. |
-| 17 | `END_SPONSORING_FUTURE_RESERVES` | ≥14 | End a sponsoring relationship. |
-| 18 | `REVOKE_SPONSORSHIP` | ≥14 | Transfer or remove entry/signer sponsorship. |
-| 19 | `CLAWBACK` | ≥17 | Claw back an asset from a trustline (issuer only). |
-| 20 | `CLAWBACK_CLAIMABLE_BALANCE` | ≥17 | Claw back a claimable balance (issuer only). |
-| 21 | `SET_TRUST_LINE_FLAGS` | ≥17 | Set or clear trustline flags (issuer only). |
-| 22 | `LIQUIDITY_POOL_DEPOSIT` | ≥18 | Deposit into a liquidity pool. |
-| 23 | `LIQUIDITY_POOL_WITHDRAW` | ≥18 | Withdraw from a liquidity pool. |
-| 24 | `INVOKE_HOST_FUNCTION` | ≥20 | Invoke a Soroban smart contract function. |
-| 25 | `EXTEND_FOOTPRINT_TTL` | ≥20 | Extend the TTL of Soroban ledger entries. |
-| 26 | `RESTORE_FOOTPRINT` | ≥20 | Restore archived Soroban ledger entries. |
+| `OperationType` | Threshold | First Supported | Description (see §8) |
+|-----------------|-----------|-----------------|----------------------|
+| `CREATE_ACCOUNT` | MEDIUM | V_1 | Create new account with starting balance. |
+| `PAYMENT` | MEDIUM | V_1 | Native or credit payment. |
+| `PATH_PAYMENT_STRICT_RECEIVE` | MEDIUM | V_1 | Path payment with fixed receive amount. |
+| `PATH_PAYMENT_STRICT_SEND` | MEDIUM | V_12 | Path payment with fixed send amount. |
+| `MANAGE_SELL_OFFER` | MEDIUM | V_1 | Create / update / delete sell offer. |
+| `MANAGE_BUY_OFFER` | MEDIUM | V_11 | Create / update / delete buy offer. |
+| `CREATE_PASSIVE_SELL_OFFER` | MEDIUM | V_1 | Sell offer that doesn't auto-fill on equal price. |
+| `SET_OPTIONS` | MEDIUM / HIGH | V_1 | Modify thresholds, flags, signers, home domain, inflation dest. HIGH if thresholds/signers are changed. |
+| `CHANGE_TRUST` | MEDIUM | V_1 | Create / update / delete trustline (or pool-share trustline). |
+| `ALLOW_TRUST` | LOW | V_1 | Issuer flips auth flags on a trustline. |
+| `ACCOUNT_MERGE` | HIGH | V_1 | Delete source account, transfer XLM to destination. |
+| `INFLATION` | LOW | V_1 (disabled in V_12+) | Distribute inflation; disabled at V_12+. |
+| `MANAGE_DATA` | MEDIUM | V_2 | Create / update / delete data entry. |
+| `BUMP_SEQUENCE` | LOW | V_10 | Bump source account's sequence number. |
+| `CREATE_CLAIMABLE_BALANCE` | MEDIUM | V_14 | Lock asset into a claimable balance entry. |
+| `CLAIM_CLAIMABLE_BALANCE` | LOW | V_14 | Claim and delete a claimable balance. |
+| `BEGIN_SPONSORING_FUTURE_RESERVES` | MEDIUM | V_14 | Mark next reserves as sponsored. |
+| `END_SPONSORING_FUTURE_RESERVES` | MEDIUM | V_14 | End sponsorship; consume sponsorship entry. |
+| `REVOKE_SPONSORSHIP` | MEDIUM | V_14 | Transfer / remove / establish sponsorship for an entry or signer. |
+| `CLAWBACK` | MEDIUM | V_17 | Issuer claws back asset from a trustline. |
+| `CLAWBACK_CLAIMABLE_BALANCE` | MEDIUM | V_17 | Issuer claws back a claimable balance. |
+| `SET_TRUST_LINE_FLAGS` | MEDIUM | V_17 | Issuer sets / clears auth flags on a trustline. |
+| `LIQUIDITY_POOL_DEPOSIT` | MEDIUM | V_18 | Add liquidity to constant-product pool. |
+| `LIQUIDITY_POOL_WITHDRAW` | MEDIUM | V_18 | Withdraw liquidity from pool. |
+| `INVOKE_HOST_FUNCTION` | MEDIUM | V_20 (SOROBAN) | Invoke Soroban contract / upload Wasm / create contract. |
+| `EXTEND_FOOTPRINT_TTL` | LOW | V_20 | Extend TTL of read-only footprint entries. |
+| `RESTORE_FOOTPRINT` | LOW | V_20 | Restore archived persistent Soroban entries. |
 
-An operation whose type is not supported at the current protocol version
-MUST fail with `opNOT_SUPPORTED`.
+A Soroban transaction MUST contain **exactly one** operation, and that
+operation MUST be one of the three Soroban types
+(see `validateSorobanOpsConsistency`, §5.2). Classic transactions MUST NOT
+mix Soroban and non-Soroban operations.
 
-### 3.5 Soroban Transaction Data
+### 3.5 SorobanTransactionData
 
-Soroban transactions carry additional resource declarations in
-`SorobanTransactionData` (present when `Transaction.ext.v() == 1`):
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `resources.footprint.readOnly` | `LedgerKey<>` | Keys the transaction will read but not modify. |
-| `resources.footprint.readWrite` | `LedgerKey<>` | Keys the transaction will read and may modify. |
-| `resources.instructions` | `uint32` | CPU instruction budget. |
-| `resources.diskReadBytes` | `uint32` | Disk read byte budget. |
-| `resources.writeBytes` | `uint32` | Write byte budget. |
-| `resourceFee` | `int64` | Declared resource fee in stroops. |
-| `ext` | union | `@version(≥23)`: MAY contain `archivedSorobanEntries` (indexes into footprint identifying archived entries for auto-restore). |
-
-### 3.6 Preconditions
-
-The `Preconditions` union supports three forms:
-
-- **`PRECOND_NONE`**: No preconditions.
-- **`PRECOND_TIME`**: Only `TimeBounds` (min/max close time).
-- **`PRECOND_V2`** `@version(≥19)`: Full preconditions:
+When `Transaction.ext.v() == 1`, the envelope carries
+`SorobanTransactionData`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `timeBounds` | `TimeBounds*` | Optional min/max close time. |
-| `ledgerBounds` | `LedgerBounds*` | Optional min/max ledger sequence. |
-| `minSeqNum` | `SequenceNumber*` | Optional minimum sequence number (enables gap-filling). |
-| `minSeqAge` | `Duration` | Minimum seconds since source account's last sequence change. |
-| `minSeqLedgerGap` | `uint32` | Minimum ledgers since source account's last sequence change. |
-| `extraSigners` | `SignerKey<2>` | Up to 2 additional required signers. |
+| `resources.footprint.readOnly` | `xvector<LedgerKey>` | Read-only footprint keys. |
+| `resources.footprint.readWrite` | `xvector<LedgerKey>` | Read-write footprint keys. |
+| `resources.instructions` | `uint32` | Declared CPU instruction budget. |
+| `resources.diskReadBytes` | `uint32` | Declared disk-read byte budget. |
+| `resources.writeBytes` | `uint32` | Declared write-byte budget. |
+| `resourceFee` | `int64` | Declared resource fee in stroops; MUST satisfy `0 ≤ resourceFee ≤ MAX_RESOURCE_FEE` (1 << 50). |
+| `ext` | union | V0 or V1; V1 carries `archivedSorobanEntries` for autorestore (v23+). |
 
-### 3.7 Transaction Results
+### 3.6 Result Types
 
-`TransactionResult` contains:
+A `TransactionResult` is:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `feeCharged` | `int64` | Actual fee charged (may be less than declared fee after refunds). |
-| `result` | union | Success: `OperationResult` array. Failure: error code. Fee-bump: inner result pair. |
+```
+{ feeCharged: int64,
+  result: union { code: TransactionResultCode,
+                  innerResultPair: optional InnerTransactionResultPair,
+                  operationResults: optional xvector<OperationResult,100> } }
+```
 
-For fee-bump transactions, the outer result code is
-`txFEE_BUMP_INNER_SUCCESS` or `txFEE_BUMP_INNER_FAILED`, and the
-`result` contains an `InnerTransactionResultPair` with the inner
-transaction's hash and result.
-
-### 3.8 Signature Types
-
-Each envelope carries up to 20 `DecoratedSignature` entries. A
-`DecoratedSignature` contains a 4-byte `hint` (last 4 bytes of the
-signer's public key) and a `Signature` (up to 64 bytes).
-
-Signers are identified by `SignerKey`, a union with four types:
-
-| Type | Description |
-|------|-------------|
-| `KEY_TYPE_ED25519` | Standard Ed25519 public key. |
-| `KEY_TYPE_PRE_AUTH_TX` | SHA-256 hash of a transaction envelope; consumed on use. |
-| `KEY_TYPE_HASH_X` | SHA-256 preimage; the signature is the preimage itself. |
-| `KEY_TYPE_ED25519_SIGNED_PAYLOAD` | Ed25519 key plus a payload that must match the signed data. `@version(≥19)` |
-
-**Signature hints**: Each `DecoratedSignature` includes a 4-byte hint
-to speed up signer lookup:
-- `ED25519`: last 4 bytes of the ed25519 public key.
-- `PRE_AUTH_TX`: last 4 bytes of the pre-auth transaction hash.
-- `HASH_X`: last 4 bytes of the hashX value.
-- `ED25519_SIGNED_PAYLOAD`: `last4bytes(ed25519_key) XOR last4bytes(payload)`.
-  If the payload is shorter than 4 bytes, it is right-padded with
-  zero bytes to 4 bytes before XOR. See CAP-0040.
+For fee-bump transactions, the outer result holds the `feeCharged` (full
+charged fee including inner op fees) and the inner pair holds the inner
+transaction's hash and `InnerTransactionResult`. See §15 for the full
+result-code enumeration.
 
 ---
 
-## 4. Transaction Validation
+## 4. Transaction Lifecycle
 
-Validation determines whether a transaction is eligible for inclusion
-in a transaction set and for application. Validation MUST NOT mutate
+A transaction passes through the following phases. Phase 5 (post-apply)
+runs immediately after apply for protocols `<V_23`, and only after all
+transactions in the set have applied for `@version(≥23)`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Submitted
+    Submitted --> Validated: checkValid / checkValidForOverlay
+    Validated --> Queued: HERDER mempool admission
+    Queued --> SelectedForApply: HERDER tx set construction
+    SelectedForApply --> FeePhase: processFeeSeqNum (charges fee, may consume seq)
+    FeePhase --> ApplyPhase: per-tx apply
+    ApplyPhase --> CommonValid: validate against live state
+    CommonValid --> ProcessSeqNum: cv != kInvalid
+    CommonValid --> Failed: cv == kInvalid
+    ProcessSeqNum --> ProcessSignatures: cv >= kInvalidUpdateSeqNum
+    ProcessSignatures --> ApplyOperations: signatures OK and cv == kMaybeValid
+    ProcessSignatures --> Failed: bad signatures
+    ApplyOperations --> Success: all ops succeed
+    ApplyOperations --> Failed: any op fails
+    Success --> PostApply: processPostApply
+    Failed --> PostApply
+    PostApply --> [*]: refund (Soroban only)
+```
+
+The four `ValidationType` values returned by `commonValid` are:
+
+- `kInvalid` — transaction is invalid; sequence number is NOT consumed.
+- `kInvalidUpdateSeqNum` — invalid but sequence number IS consumed
+  (e.g., `txBAD_AUTH` from V_10+).
+- `kInvalidPostAuth` — invalid after auth succeeded; one-time signers
+  MUST be removed.
+- `kMaybeValid` — passes all checks; operations MAY be applied.
+
+The fee-bump variant uses a 2-state model (`kInvalid` / `kInvalidPostAuth`
+/ `kFullyValid`) on a `FeeBumpTransactionFrame::ValidationType`, but
+otherwise mirrors the same flow over its outer fee-source account, then
+delegates to the inner `TransactionFrame::checkValidWithOptionallyChargedFee`
+with `chargeFee=false`.
+
+---
+
+## 5. Transaction Validation
+
+`TransactionFrameBase::checkValid` (and `checkValidForOverlay`) MUST be a
+pure function over a read-only `LedgerSnapshot`. It SHALL NOT mutate
 ledger state.
 
-### 4.1 Validation Stages
+### 5.1 Envelope and Fee Pre-checks
 
-Validation proceeds in two conceptual stages:
+The outermost `checkValidImpl` performs (in this order):
 
-1. **Structural validation** (Section 4.2): Checks that can be
-   performed without ledger state (envelope well-formedness,
-   operation count, Soroban consistency).
+1. **XDR depth check** — `xdr::check_xdr_depth(envelope, 500)` MUST
+   succeed; otherwise return `txMALFORMED`. This bound applies the same
+   500-level depth limit to nested XDR structures observed at the
+   envelope.
+2. **`XDRProvidesValidFee`** — for Soroban transactions: the envelope
+   MUST be `ENVELOPE_TYPE_TX`, `tx.ext.v() == 1`, and
+   `0 ≤ resourceFee ≤ MAX_RESOURCE_FEE` (where `MAX_RESOURCE_FEE = 1 <<
+   50`). For fee-bump txs, the outer `fee` MUST be ≥ 0. Failure ⇒
+   `txMALFORMED`.
+3. **Initialise feeCharged** — set `result.feeCharged = getFee(header,
+   baseFee=header.baseFee, applying=false)` as a presentational estimate
+   (this value may differ from the actually-charged fee).
+4. Construct a `SignatureChecker` over `tx.signatures` with
+   `isOverlayValidation=true` for `checkValidForOverlay` and `false`
+   otherwise; load `sorobanConfig` if at `@version(≥SOROBAN)`.
+5. Run `commonValid(app, sorobanConfig, sigChecker, ls, current=current,
+   applying=false, chargeFee=true, ..., diagnosticEvents)`. If it returns
+   anything other than `kMaybeValid`, stop.
+6. For each operation in order: call
+   `op.checkValid(app, sigChecker, sorobanConfig, ls, forApply=false,
+   opResult, diagEvents)`. On the first failure, set the outer code to
+   `txFAILED` and stop.
+7. Call `sigChecker.checkAllSignaturesUsed()`. If it returns false, set
+   the outer code to `txBAD_AUTH_EXTRA`.
 
-2. **Stateful validation** (Section 4.3–4.8): Checks that require
-   reading ledger state (source account existence, sequence numbers,
-   preconditions, fee sufficiency, signatures).
+### 5.2 commonValidPreSeqNum
 
-### 4.2 Structural Validation
+`commonValidPreSeqNum` performs envelope-format and structural checks in
+this exact order:
 
-The following checks MUST be performed on every transaction envelope:
+1. **Envelope-type / muxed-account version gate.**
+   - `@version(<V_13)` MUST reject `ENVELOPE_TYPE_TX` and any envelope
+     containing a muxed source account ⇒ `txNOT_SUPPORTED`.
+   - `@version(≥V_13)` MUST reject `ENVELOPE_TYPE_TX_V0` ⇒
+     `txNOT_SUPPORTED`.
+2. **PreconditionsV2 gate.** `@version(<V_19)` MUST reject `PRECOND_V2`
+   ⇒ `txNOT_SUPPORTED`.
+3. **Extra-signers malformed checks** (when `PRECOND_V2.extraSigners`
+   is non-empty):
+   - If the two extra signers are equal ⇒ `txMALFORMED`.
+   - If any extra signer is of type
+     `SIGNER_KEY_TYPE_ED25519_SIGNED_PAYLOAD` with empty payload ⇒
+     `txMALFORMED`.
+4. **At least one operation.** `getNumOperations() == 0` ⇒
+   `txMISSING_OPERATION`.
+5. **Soroban ops consistency.** `validateSorobanOpsConsistency` ⇒
+   `txMALFORMED` if classic + Soroban ops are mixed or if a Soroban tx
+   contains more than one op.
+6. **Soroban-specific structural checks** (if `isSoroban()`):
+   - `@version(<SOROBAN_PROTOCOL_VERSION)` (= V_20) ⇒ `txMALFORMED`.
+   - `@version(≥V_25)`: `validateSorobanMemo()` MUST hold — the memo
+     MUST be `MEMO_NONE`, the tx source account MUST NOT be muxed, and
+     the op source account (if present) MUST NOT be muxed. Violation ⇒
+     `txSOROBAN_INVALID`.
+   - `checkSorobanResources(sorobanConfig, ledgerVersion)` MUST pass.
+     The check order is:
+     1. `instructions ≤ txMaxInstructions`.
+     2. `diskReadBytes ≤ txMaxDiskReadBytes`.
+     3. `writeBytes ≤ txMaxWriteBytes`.
+     4. `@version(≥V_23)`: `numDiskReads ≤ txMaxDiskReadEntries`
+        where `numDiskReads = getNumDiskReadEntries(resources, ext,
+        isRestoreFootprintTx)` counts (a) classic keys in either
+        footprint, plus (b) entries from `archivedSorobanEntries`, plus
+        (c) for restore ops, all `readWrite` entries.
+        Total footprint entry count `readOnly + readWrite ≤
+        txMaxFootprintEntries`.
+     5. `@version(<V_23)`: `readOnly.size + readWrite.size ≤
+        txMaxDiskReadEntries`.
+     6. `writeEntries.size ≤ txMaxWriteLedgerEntries`.
+     7. Each footprint key MUST be a valid type:
+        - `ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE` are accepted.
+        - `TRUSTLINE`: asset MUST be valid, non-native, and account
+          MUST NOT be the issuer.
+        - `OFFER`, `DATA`, `CLAIMABLE_BALANCE`, `LIQUIDITY_POOL`,
+          `CONFIG_SETTING`, `TTL` are rejected.
+     8. Each footprint key's serialized size ≤
+        `maxContractDataKeySizeBytes`.
+     9. `txSize ≤ txMaxSizeBytes`.
+     10. If `ext.v() == 1`: `@version(≥AUTO_RESTORE_PROTOCOL_VERSION)`
+         (= V_23) is required; the `archivedSorobanEntries` indices MUST
+         be strictly ascending, MUST be in bounds, and MUST point to
+         persistent entries.
+   - **Resource-fee structural checks**:
+     1. `@version(<V_23)` or `chargeFee=true`:
+        `sorobanData.resourceFee ≤ getFullFee()` ⇒ else
+        `txSOROBAN_INVALID`.
+     2. Adding the computed `non_refundable_fee` and `refundable_fee`
+        MUST NOT overflow `int64` ⇒ else `txSOROBAN_INVALID`.
+     3. `sorobanData.resourceFee ≥ (non_refundable_fee +
+        refundable_fee)` ⇒ else `txSOROBAN_INVALID`.
+   - **Footprint disjointness**: every key across `readOnly ∪
+     readWrite` MUST be unique. Duplicates ⇒ `txSOROBAN_INVALID`.
+7. **Classic tx ext gate.** `@version(≥V_21)` and classic tx: if
+   `ENVELOPE_TYPE_TX` and `tx.ext.v() != 0` ⇒ `txMALFORMED` (Soroban
+   data is forbidden on classic transactions starting at V_21).
+8. **Time / ledger preconditions.**
+   - `isTooEarly`: if a `minTime` precondition is set and `closeTime +
+     lowerBoundCloseTimeOffset < minTime` ⇒ `txTOO_EARLY`.
+     Additionally `@version(≥V_19)`: if a `LedgerBounds.minLedger >
+     header.ledgerSeq` ⇒ `txTOO_EARLY`.
+   - `isTooLate`: if `maxTime` is set and `closeTime +
+     upperBoundCloseTimeOffset > maxTime` ⇒ `txTOO_LATE`.
+     `@version(≥V_19)`: if `LedgerBounds.maxLedger != 0` and
+     `maxLedger ≤ header.ledgerSeq` ⇒ `txTOO_LATE`.
+9. **Minimum inclusion fee.**
+   - If `chargeFee` is true: `getInclusionFee() ≥ getMinInclusionFee(tx,
+     header)` ⇒ else `txINSUFFICIENT_FEE`. `getMinInclusionFee` returns
+     `effectiveBaseFee * max(1, numOperations)` where `effectiveBaseFee
+     = max(header.baseFee, optional caller baseFee)`.
+   - `@version(<V_23)`: if `chargeFee=false` and `getInclusionFee() < 0`
+     ⇒ `txINSUFFICIENT_FEE`. (Fee-bump inner txs are allowed to have
+     non-positive inner inclusion fee from V_23+.)
+10. **Source account existence.** Load the tx source account; if absent
+    ⇒ `txNO_ACCOUNT`.
+11. **CAP-77 frozen-key gate** (`@version(≥V_23)`, when `cfg != nullptr`
+    and `cfg.hasFrozenKeys()`): if `accessesFrozenKey(*cfg)` is true and
+    the envelope hash is not in `cfg.isFreezeBypassTx(envHash)` ⇒
+    `txFROZEN_KEY_ACCESSED`. This visits the tx source, every op source,
+    every footprint key, and per-op frozen-key predicates.
 
-1. **Envelope type**: The envelope type MUST be `ENVELOPE_TYPE_TX_V0`,
-   `ENVELOPE_TYPE_TX`, or `ENVELOPE_TYPE_TX_FEE_BUMP`.
+Returns the source account on success.
 
-2. **Operation count**: The transaction MUST contain at least one
-   operation. Result: `txMISSING_OPERATION`.
+### 5.3 commonValid Post-SeqNum
 
-3. **Fee-bump inner type** (fee-bump only): The inner transaction
-   MUST be `ENVELOPE_TYPE_TX`. Result: `txMALFORMED`.
+After `commonValidPreSeqNum` returns the source account, `commonValid`
+performs:
 
-4. **Fee-bump fee floor** (fee-bump only): The outer fee MUST be
-   ≥ the inner transaction's fee. Result: `txINSUFFICIENT_FEE`.
+1. **Sequence-number check.**
+   `@version(≥V_10)` or `applying=false`: if `current == 0`, set
+   `current = sourceAccount.seqNum`; if `isBadSeq(header, current)` ⇒
+   `txBAD_SEQ`. `isBadSeq` semantics:
+   - If `getSeqNum() == getStartingSequenceNumber(header)` (a freshly
+     created account's starting seqnum) ⇒ bad.
+   - `@version(≥V_19)`: if `minSeqNum` is set, accept iff `minSeqNum
+     ≤ current < getSeqNum()`.
+   - Otherwise accept iff `current == getSeqNum() - 1`.
 
-5. **Fee-bump fee overflow** (fee-bump only): The outer fee MUST
-   be ≥ `innerBaseFee * (numInnerOps + 1)`, where the `+1` accounts
-   for the fee-bump operation itself. This product MUST NOT overflow
-   `int64`. Result: `txINSUFFICIENT_FEE`.
+   After this check, `res = kInvalidUpdateSeqNum`.
+2. **isTooEarlyForAccount** (`@version(≥V_19)`): consults the
+   `AccountEntry.ext.v3.seqTime` / `seqLedger`. Let
+   `minSeqAge / minSeqLedgerGap` come from the V2 preconditions; let
+   `lowerBoundCloseTime = closeTime + lowerBoundCloseTimeOffset`. If
+   `minSeqAge > lowerBoundCloseTime` or `lowerBoundCloseTime - minSeqAge
+   < accSeqTime`, OR if `minSeqLedgerGap > ledgerSeq` or `ledgerSeq -
+   minSeqLedgerGap < accSeqLedger`, ⇒ `txBAD_MIN_SEQ_AGE_OR_GAP`.
+3. **Transaction-level signature check.**
+   `checkAllTransactionSignatures(sigChecker, sourceAccount, ledgerVer)`:
+   - Source account MUST exist.
+   - Master signer (`thresholds[THRESHOLD_LOW]` if `thresholds[0] != 0`)
+     plus all extra `signers` on the account MUST collectively satisfy
+     `THRESHOLD_LOW` weight. The full signature-check algorithm is
+     given in §5.5.
+   - `@version(≥V_19)`: every key in `PRECOND_V2.extraSigners` MUST
+     have a matching signature, weighted 1 each, threshold equal to the
+     set size.
 
-6. **Soroban consistency** (Section 4.9): If any operation in the
-   transaction is a Soroban type (InvokeHostFunction,
-   ExtendFootprintTTL, RestoreFootprint), then: (a) the transaction
-   MUST contain exactly one operation, (b) that operation MUST be a
-   Soroban type, and (c) the transaction MUST carry
-   `SorobanTransactionData` (`ext.v() == 1`). A non-Soroban
-   transaction MUST NOT carry `SorobanTransactionData`.
-   Result: `txMALFORMED`.
+   Failure ⇒ `txBAD_AUTH`. After success, `res = kInvalidPostAuth`.
+4. **Fee source balance check.** Let `feeToPay = 0` if
+   `applying=true && @version(≥V_9)`; otherwise `feeToPay = full fee`.
+   If `chargeFee=true` and `availableBalance(header, sourceAccount) <
+   feeToPay` ⇒ `txINSUFFICIENT_BALANCE`. `availableBalance` excludes
+   reserve and any selling liabilities.
 
-7. **Soroban memo restriction** `@version(≥25)`: If the transaction is
-   a Soroban InvokeHostFunction transaction, the memo MUST be
-   `MEMO_NONE`. Result: `txSOROBAN_INVALID`.
+   On success, `res = kMaybeValid`.
 
-8. **Soroban muxed account restriction** `@version(≥25)`: If the
-   transaction is a Soroban InvokeHostFunction transaction, the
-   transaction source account MUST NOT be a muxed account
-   (`KEY_TYPE_MUXED_ED25519`). The operation source (if present)
-   MUST NOT be muxed either. Result: `txSOROBAN_INVALID`.
+For `@version(<V_8)` and `applying=true`, `commonValid` MUST run the
+above block inside an inner-snapshot LedgerTxn to mimic the legacy buggy
+account loading; for all later versions it runs directly against the
+read-only snapshot.
 
-### 4.3 Precondition Validation
+### 5.4 FeeBumpTransactionFrame commonValid
 
-Preconditions are checked against the current ledger header:
+`FeeBumpTransactionFrame::commonValid` runs (in order):
 
-1. **Time bounds**: If `timeBounds` is present:
-   - If `minTime > 0`: the ledger close time MUST be ≥ `minTime`.
-     Result: `txTOO_EARLY`.
-   - If `maxTime > 0`: the ledger close time MUST be ≤ `maxTime`.
-     Result: `txTOO_LATE`.
+1. `@version(<V_13)` ⇒ `txNOT_SUPPORTED`.
+2. **Fee-bump inclusion fee gate.** `getInclusionFee() ≥
+   getMinInclusionFee(this, header)` ⇒ else `txINSUFFICIENT_FEE`.
+3. **Inner-fee comparison.** Let `inner = innerTx.getInclusionFee()`,
+   `minOuter = getMinInclusionFee(this, header)`,
+   `minInner = getMinInclusionFee(innerTx, header)`.
 
-2. **Ledger bounds** `@version(≥19)`: If `ledgerBounds` is present:
-   - If `minLedger > 0`: the ledger sequence MUST be ≥ `minLedger`.
-     Result: `txTOO_EARLY`.
-   - If `maxLedger > 0`: the ledger sequence MUST be < `maxLedger` (strictly less-than).
-     Result: `txTOO_LATE`.
+   When `inner ≥ 0`, the outer per-op inclusion fee MUST exceed the
+   inner per-op inclusion fee, i.e.
+   `outerInclusionFee * minInner ≥ inner * minOuter`. If not, set
+   `txINSUFFICIENT_FEE` with `feeCharged = ceilDiv(inner * minOuter,
+   minInner)` (clamped to `INT64_MAX`).
 
-3. **Minimum fee**: The declared fee MUST be ≥ `baseFee * numOps`,
-   where `baseFee` is the ledger header's base fee.
-   Result: `txINSUFFICIENT_FEE`.
+   When `inner < 0`: `@version(≥V_23) && innerTx.isSoroban()` permits
+   non-positive inner inclusion fee. Otherwise ⇒
+   `txFEE_BUMP_INNER_FAILED`.
+4. Load fee source account; absent ⇒ `txNO_ACCOUNT`.
+5. **Fee source signature check** at `THRESHOLD_LOW` ⇒ else `txBAD_AUTH`.
+6. **Fee source balance check.** `feeToPay = applying ? 0 : getFullFee()`;
+   `availableBalance < feeToPay` ⇒ `txINSUFFICIENT_BALANCE`.
+7. **CAP-77 frozen-fee-source gate** (`@version(≥V_23)`): if
+   `sorobanConfig.hasFrozenKeys()` and `isKeyFrozen(accountKey(feeSource))`
+   and not `isFreezeBypassTx(getContentsHash())` ⇒ `txFROZEN_KEY_ACCESSED`.
+8. `checkAllSignaturesUsed` ⇒ else `txBAD_AUTH_EXTRA`.
+9. Delegate to `innerTx.checkValidWithOptionallyChargedFee(..., chargeFee=false, ...)`.
+   The inner tx is validated against its own envelope-contents hash.
 
-### 4.4 Source Account Validation
+### 5.5 Signature Checking Algorithm
 
-1. **Source account existence**: The source account MUST exist in the
-   ledger. Result: `txNO_ACCOUNT`.
+`SignatureChecker` accumulates signer weight from the transaction's up-to-20
+signatures and a list of `Signer`s sorted by `SignerKey` type.
 
-2. **Starting sequence number guard**: The transaction's `seqNum`
-   MUST NOT equal the starting sequence number for the current ledger
-   (`currentLedgerSeq << 32`). This prevents freshly-created accounts
-   from being used in the same ledger they were created.
-   Result: `txBAD_SEQ`.
-
-3. **INT64_MAX overflow guard**: If the source account's current
-   sequence number is `INT64_MAX`, the sequence check always fails
-   to prevent overflow. Result: `txBAD_SEQ`.
-
-4. **Sequence number**: The transaction's `seqNum` MUST satisfy:
-   - If `minSeqNum` precondition is present `@version(≥19)`:
-     the **source account's current sequence number** MUST be
-     ≥ `minSeqNum`, AND the **transaction's** `seqNum` MUST be
-     > the source account's current sequence number.
-   - Otherwise: `seqNum` MUST equal the source account's current
-     sequence number + 1.
-   - Result: `txBAD_SEQ`.
-
-5. **Minimum sequence age** `@version(≥19)`: If `minSeqAge > 0`, the
-   time elapsed since the source account's sequence number was last
-   changed MUST be ≥ `minSeqAge`. At apply time: checks
-   `closeTime - accSeqTime >= minSeqAge`, where `accSeqTime` is the
-   ledger close time at which the account's sequence number was last
-   consumed (`AccountEntryExtensionV3.seqTime`, or 0 if absent).
-   Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
-
-6. **Minimum sequence ledger gap** `@version(≥19)`: If
-   `minSeqLedgerGap > 0`, the number of ledgers elapsed since the
-   source account's sequence number was last changed MUST be ≥
-   `minSeqLedgerGap`. Result: `txBAD_MIN_SEQ_AGE_OR_GAP`.
-
-### 4.5 Signature Validation
-
-Transaction-level signature validation checks that the transaction
-envelope carries sufficient authorization from the source account:
-
-1. The transaction-level signature check uses the **low** threshold
-   of the source account (for the outer transaction in a fee-bump,
-   this is the fee source).
-
-2. The signature check algorithm is defined in Section 4.7.
-
-3. Result: `txBAD_AUTH`.
-
-### 4.6 Fee Source Balance Validation
-
-The fee source account MUST have sufficient balance to pay the
-computed fee:
-
-- For a non-fee-bump transaction: the source account's available
-  native balance MUST be ≥ the fee.
-- For a fee-bump transaction: the fee source's available native
-  balance MUST be ≥ the fee (where "available" means total balance
-  minus selling liabilities minus `baseReserve * (2 + numSubEntries
-  + numSponsoring - numSponsored)`).
-
-Result: `txINSUFFICIENT_BALANCE`.
-
-### 4.7 Signature Checking Algorithm
-
-Given a set of `DecoratedSignature` entries and a target hash (the
-transaction's content hash), signature verification proceeds as
-follows:
+**Algorithm** (see Appendix A for a decision tree):
 
 ```
-function checkSignature(signers, neededWeight, contentHash, signatures):
-    usedSignatures = empty set
+function checkSignature(signers, neededWeight, checkEd25519SignedPayload):
+    if protocolVersion == V_7:                          # buggy legacy
+        return true
     totalWeight = 0
-
-    // Partition signers by type
-    preAuthSigners  = signers.filter(type == PRE_AUTH_TX)
-    hashXSigners    = signers.filter(type == HASH_X)
-    ed25519Signers  = signers.filter(type == ED25519)
-    payloadSigners  = signers.filter(type == ED25519_SIGNED_PAYLOAD)
-
-    // Phase 1: PRE_AUTH_TX — outer=signers, no inner loop over signatures
-    for each signer in preAuthSigners:
-        if signer.preAuthTxHash == contentHash:
-            mark signer as used (consume from account)
-            w = signer.weight
-            // @version(≥10): cap individual signer weight
-            if w > UINT8_MAX: w = UINT8_MAX
+    # 1. PRE_AUTH_TX signers: match by transaction contents hash.
+    for s in signers[SIGNER_KEY_TYPE_PRE_AUTH_TX]:
+        if s.key.preAuthTx == contentsHash:
+            w = s.weight; @version(≥V_10) clamp w to UINT8_MAX
             totalWeight += w
             if totalWeight >= neededWeight: return true
-
-    // Phase 2-4: HASH_X, ED25519, ED25519_SIGNED_PAYLOAD
-    // All use the same loop: outer=signatures, inner=signers
-    for each signerType in [hashXSigners, ed25519Signers, payloadSigners]:
-        for each (index, sig) in signatures:
-            if index in usedSignatures: continue
-            for each signer in signerType:
-                matched = false
-                match signer.type:
-                    case HASH_X:
-                        if sig.hint == last4bytes(signer.hashX):
-                            if sha256(sig.signature) == signer.hashX:
-                                matched = true
-
-                    case ED25519:
-                        if sig.hint == last4bytes(signer.ed25519):
-                            if ed25519Verify(signer.ed25519, contentHash, sig.signature):
-                                matched = true
-
-                    case ED25519_SIGNED_PAYLOAD:
-                        if sig.hint == xorHint(signer.ed25519SignedPayload):
-                            if ed25519Verify(signer.ed25519, signer.payload, sig.signature):
-                                matched = true
-
-                if matched:
-                    usedSignatures.add(index)
-                    w = signer.weight
-                    // @version(≥10): cap individual signer weight
-                    if w > UINT8_MAX: w = UINT8_MAX
-                    totalWeight += w
-                    signerType.remove(signer)  // prevent reuse
-                    if totalWeight >= neededWeight: return true
-                    break  // next signature
-
+    # 2. HASH_X signers: signature payload is the preimage; hash matches the key.
+    if verifyAll(signers[HASH_X], verifyHashX): return true
+    # 3. ED25519 signers: ed25519 signature over contentsHash.
+    if verifyAll(signers[ED25519], verifyEd25519): return true
+    # 4. ED25519_SIGNED_PAYLOAD: ed25519 signature over key's embedded payload.
+    if checkEd25519SignedPayload:
+       if verifyAll(signers[ED25519_SIGNED_PAYLOAD],
+                    verifyEd25519SignedPayload): return true
     return false
 ```
 
-The final `return false` mirrors stellar-core's `SignatureChecker::checkSignature()`:
-the **only** path to `true` is via the early returns inside the loops when
-`totalWeight >= neededWeight`. If execution reaches the end of the function,
-no sufficient match was found, so the result is `false` regardless of
-`neededWeight`. This is critical for correctness when `neededWeight == 0`
-(used by `checkSignatureNoAccount` below): a `neededWeight` of 0 does NOT
-mean the check automatically passes — at least one signer must match.
+`verifyAll` iterates the signature vector outer-to-inner over a (mutable)
+copy of `signers`; on first match, the signature is marked used in
+`mUsedSignatures`, its weight is added (clamped at V_10+ to `UINT8_MAX`),
+and the signer is removed from the list to prevent reuse. If
+`totalWeight ≥ neededWeight`, return true.
 
-**Protocol-7 quirk** `@version(=7)`: At protocol version 7 exactly (and
-**only** at this exact version), `SignatureChecker::checkSignature`
-unconditionally returns `true` and `checkAllSignaturesUsed` also
-unconditionally returns `true`. This is a historical bug preserved
-for determinism; transactions in protocol-7 ledgers MUST have their
-signature checks bypassed accordingly. All other protocol versions
-run the full algorithm above.
+`checkEd25519SignedPayload = false` is used **only** in
+`checkValidForOverlay` (background flooding validation) to avoid the
+overhead of signed-payload verification.
 
-**PRE_AUTH_TX signer consumption**: When a PRE_AUTH_TX signer matches,
-it MUST be removed from the source account's signer list regardless
-of whether the overall signature check succeeds or the transaction
-succeeds. This removal is committed even if the transaction fails.
+`checkAllSignaturesUsed()`: every entry in `mUsedSignatures` MUST be true;
+otherwise the tx is rejected with `txBAD_AUTH_EXTRA`. The check is
+suppressed `@version(=V_7)`.
 
-**Extra signers** `@version(≥19)`: If `PreconditionsV2.extraSigners`
-is non-empty, each extra signer MUST be satisfied by at least one
-signature in the envelope. Each extra signer requires a weight of 1
-(i.e., the total weight needed for extra signers equals the count of
-extra signers). Result: `txBAD_AUTH_EXTRA`.
+### 5.6 Operation-Level Validation
 
-**Unused signature check**: After all signature checks complete (inside
-`processSignatures`, Section 6.2), if any signature in the envelope
-was not consumed by either the transaction-level check or any
-operation-level check, the transaction MUST fail with
-`txBAD_AUTH_EXTRA`.
+Each `OperationFrame::checkValid` runs (in order):
 
-### 4.8 Operation-Level Validation
+1. `isOpSupported(header)`: if false ⇒ `opNOT_SUPPORTED`. Per-op
+   protocol-version gates are listed in §3.4.
+2. **Signature gate** (only when `forApply=false` OR `@version(<V_10)`):
+   `checkSignature(sigChecker, ls, &res, forApply)`. This loads the op
+   source account, applies the threshold level (`getThresholdLevel`),
+   and accumulates weight. Failures: `opNO_ACCOUNT` if source missing
+   and `forApply || !op.sourceAccount`; `opBAD_AUTH` otherwise.
+3. **Op source existence re-check** (only when `forApply` and
+   `@version(≥V_10)`): if `op.sourceAccount || forApply` and the op
+   source is not loadable ⇒ `opNO_ACCOUNT`.
+4. **Body-specific validation**:
+   - For Soroban ops `@version(≥SOROBAN)`: dispatch to
+     `doCheckValidForSoroban(networkConfig, appConfig, ledgerVersion,
+     res, diagEvents)`.
+   - Otherwise: dispatch to `doCheckValid(ledgerVersion, res)`.
 
-Each operation is individually validated during application (not during
-the pre-application validation pass). The validation checks for each
-operation type are specified in Section 7.
+For `@version(<V_8)` and `forApply=true`, this entire procedure runs
+inside an inner snapshot to mimic legacy account-loading bugs.
 
-The common operation-level checks are:
+### 5.7 Cross-Spec Validation Inputs
 
-1. **Operation support**: The operation type MUST be supported at the
-   current protocol version (see Section 3.4).
-   Result: `opNOT_SUPPORTED`.
+`checkValid` is also invoked by:
 
-2. **Source account resolution and signature check**: Determine the
-   effective source account (Section 6.6) and verify authorization:
-
-   a. If the source account **exists**: check the operation's signature
-      against the account's signers at the required threshold level
-      (Section 6.5). If the signature check fails → `opBAD_AUTH`.
-
-   b. If the source account **does not exist** and the operation has
-      an **explicit** `sourceAccount` override (and `forApply` is
-      `false`): attempt `checkSignatureNoAccount` — construct a
-      synthetic signer list containing only the account's master
-      public key with weight 1, and call `checkSignature` with
-      `neededWeight = 0`. If no matching signature is found →
-      `opBAD_AUTH`. If a matching signature is found, the operation
-      proceeds to validation (where it will typically fail with the
-      operation-specific "no account" error).
-
-   c. If the source account **does not exist** and either `forApply`
-      is `true` or the operation **inherits** the transaction source
-      (no explicit `sourceAccount`) → `opNO_ACCOUNT`.
-
-   **Account merged by prior operation**: When a transaction contains
-   multiple operations, an earlier operation (e.g., `ACCOUNT_MERGE`)
-   may delete an account that a later operation uses as its source.
-   During the `processSignatures` per-operation check (which runs
-   with `forApply = false` and uses a pre-operation snapshot — see
-   Section 6.1), the account may still exist. However, during the
-   actual `op.apply()` call (which runs with `forApply = true`), the
-   account may have been deleted by a prior operation in the same
-   transaction. In this case, rule (c) applies: the result is
-   `opNO_ACCOUNT`. This is intentional — the `processSignatures`
-   pass has already verified authorization against the pre-operation
-   state.
-
-3. **Operation-specific validation**: Each operation type defines its
-   own `doCheckValid()` checks (Section 7).
-
-### 4.9 Soroban Resource Validation
-
-For Soroban transactions, the declared resources in
-`SorobanTransactionData` MUST satisfy:
-
-1. `instructions` MUST be ≤ `txMaxInstructions` (network config).
-2. `diskReadBytes` MUST be ≤ `txMaxDiskReadBytes`.
-3. `writeBytes` MUST be ≤ `txMaxWriteBytes`.
-4. The number of disk-read entries MUST be ≤
-   `txMaxReadLedgerEntries` (called `txMaxDiskReadEntries`
-   from protocol 23+).
-   - `@version(<23)`: disk-read entries = all footprint entries
-     (readOnly + readWrite).
-   - `@version(≥23)`: disk-read entries = classic (non-Soroban)
-     footprint entries + archived Soroban entries (from
-     `archivedSorobanEntries`). Soroban entries
-     (`CONTRACT_DATA`, `CONTRACT_CODE`) that are live
-     in-memory are excluded from the disk-read count
-     (CAP-0066). For `RestoreFootprint` operations, all
-     readWrite entries count as disk reads.
-5. The total number of read-write footprint entries MUST be ≤
-   `txMaxWriteLedgerEntries`.
-6. `@version(<23)`: The total number of all footprint entries
-   (read-only + read-write) MUST be ≤ `txMaxReadLedgerEntries`.
-   `@version(≥23)`: The total number of all footprint entries
-   MUST be ≤ `txMaxFootprintEntries` (from
-   `CONFIG_SETTING_CONTRACT_LEDGER_COST_EXT`, see
-   LEDGER_SPEC Section 9.2).
-7. Each footprint key MUST have a serialized size ≤
-   `maxContractDataKeySizeBytes`.
-8. The serialized transaction size MUST be ≤ `txMaxSizeBytes`.
-9. Footprint keys MUST be of type `ACCOUNT`, `TRUSTLINE`,
-   `CONTRACT_DATA`, or `CONTRACT_CODE` only. For `TRUSTLINE`
-   footprint keys, the asset MUST also be valid, non-native,
-   and not self-issued.
-10. There MUST be no duplicate keys across the read-only and read-write
-    footprints combined.
-11. `@version(≥23)`: If `archivedSorobanEntries` is present, each
-    index MUST be valid (within the footprint). The
-    `archivedSorobanEntries` indexes MUST be sorted in ascending
-    order, within bounds of the readWrite footprint, and MUST point
-    to persistent entries only.
-12. The `resourceFee` MUST be ≤ the total fee declared in the
-    envelope.
-13. The `resourceFee` MUST be ≤ `MAX_RESOURCE_FEE` (2^50).
-14. The computed resource fee (from the fee computation function) MUST
-    be ≤ the declared `resourceFee`.
-
-Result: `txSOROBAN_INVALID`.
+- `HERDER_SPEC §6.1` — tx-set construction and surge pricing.
+- `HERDER_SPEC §8` — mempool admission and replace-by-fee.
+- `OVERLAY_SPEC §7.1` — flooding (`checkValidForOverlay`).
+- RPC ingestion / catchup (replay) — runs `checkValid` with
+  `lowerBoundCloseTimeOffset = upperBoundCloseTimeOffset = 0`.
 
 ---
 
-## 5. Fee Framework
+## 6. Fee Framework
 
-### 5.1 Fee Structure
+### 6.1 Fee Components
 
-The total fee for a transaction serves two purposes:
+For a non-fee-bump transaction:
 
-1. **Inclusion fee**: Compensates the network for including the
-   transaction in a ledger. Subject to surge pricing.
-2. **Resource fee** (Soroban only): Covers the cost of computational
-   resources consumed by smart contract execution.
+- **Full fee** = `tx.fee` (uint32).
+- **Inclusion fee** = `fullFee` (classic) or `fullFee - declaredSorobanResourceFee` (Soroban).
+- **Declared Soroban resource fee** = `tx.ext.sorobanData().resourceFee`
+  (zero for classic).
 
-For a **classic transaction**:
-```
-totalFee = inclusionFee
-inclusionFee = envelope.fee
-```
+For a fee-bump transaction:
 
-For a **Soroban transaction**:
-```
-totalFee = inclusionFee + declaredResourceFee
-inclusionFee = envelope.fee - sorobanData.resourceFee
-declaredResourceFee = sorobanData.resourceFee
-```
+- **Full fee** = `feeBump.fee` (int64).
+- **Inclusion fee** = `fullFee - declaredSorobanResourceFee`.
+- **Min inclusion fee** (per fee-bump tx) is computed using
+  `getNumOperations() = innerOps + 1` (the +1 is the conceptual fee-bump
+  op).
 
-For a **fee-bump transaction**:
-```
-totalFee = feeBumpEnvelope.fee
-inclusionFee (classic) = totalFee / (numInnerOps + 1)  // per-op
-inclusionFee (Soroban) = totalFee - declaredResourceFee
-```
-
-### 5.2 Surge Pricing
-
-When the number of submitted transactions exceeds the ledger's
-capacity, surge pricing increases the effective base fee. The full
-algorithm — including fee rate comparison, the lane model, multi-
-dimensional Soroban resource limits, transaction set selection, queue
-eviction, and per-lane base fee computation — is defined in
-**HERDER_SPEC §12** ("Surge Pricing and Eviction") and **§6.6**
-("Per-Lane Base Fee Computation").
-
-**Per-operation fee rounding**: `@version(≥20)`: per-op fee
-computation uses floor division. Prior versions use ceiling
-division.
-
-**Exact per-op fee calculation** (stellar-core):
+### 6.2 getFee(header, baseFee, applying)
 
 ```
-if protocolVersion >= 20:
-    perOpFee = floor(inclusionFee / numOps)
-else:
-    perOpFee = ceil(inclusionFee / numOps)
-```
-
-The comparison uses 128-bit arithmetic to avoid overflow.
-
-### 5.3 Effective Fee Computation
-
-When a transaction is applied, the actual fee charged is:
-
-For a **classic transaction**:
-```
-feeCharged = min(inclusionFee, baseFee * numOps)
-```
-
-For a **Soroban transaction**:
-```
-feeCharged = declaredResourceFee + min(inclusionFee, baseFee * numOps)
-```
-
-where `declaredResourceFee` is `sorobanData.resourceFee` from the
-transaction envelope. Unused refundable portions are later refunded
-(see Section 5.5). `baseFee` is the surge-priced base fee for this
-transaction's phase.
-
-**During validation** (not application), the fee is computed as:
-```
-feeCharged = resourceFee + baseFee * numOps
-```
-without the `min()` cap on inclusion fee.
-
-### 5.4 Fee and Sequence Number Pre-Processing
-
-Before any operations execute, for each transaction in apply order:
-
-```
-function processFeeSeqNum(tx, ltx):
-    feeSource = loadAccount(tx.feeSourceAccount, ltx)
-    feeCharged = computeFee(tx, ledgerHeader, baseFee)
-
-    // Deduct fee (never more than available balance)
-    actualDeduction = min(feeSource.balance, feeCharged)
-    feeSource.balance -= actualDeduction
-    ledgerHeader.feePool += actualDeduction
-
-    // @version(<10): advance sequence number during fee processing
-    if protocolVersion < 10:
-        sourceAccount = loadAccount(tx.sourceAccount, ltx)
-        sourceAccount.seqNum = tx.seqNum
-
-    // @version(≥10): sequence number is NOT advanced here;
-    // it is advanced later during apply in processSeqNum()
-    // (called from commonPreApply, see Section 6.1).
-
-    commit(ltx)
-```
-
-The `MAX_SEQ_NUM_TO_APPLY` internal entry `@version(≥19)` prevents an
-account merge from allowing a replayed transaction. It is created in
-the **ledger-level** fee processing loop (`processFeesSeqNums`), not in
-the per-transaction `processFeeSeqNum`. The algorithm:
-1. For every transaction in the set, record `(sourceAccountID →
-   max(seqNum))` in a map.
-2. Separately, check if **any** transaction in the set contains an
-   `ACCOUNT_MERGE` operation (set `mergeSeen = true`).
-3. If `mergeSeen`, create a `MAX_SEQ_NUM_TO_APPLY` entry for **every**
-   source account in the map — not just accounts whose transactions
-   contain merges. This blanket protection ensures that if the account
-   is recreated, sequence-number-based replay protection is preserved.
-
-### 5.5 Soroban Fee Refunds
-
-After a Soroban transaction completes (including when validation
-fails — see Section 6.1), unused refundable fees are returned to the
-fee source:
-
-```
-function processRefund(tx, ltx):
-    if not tx.isSoroban():
-        return
-
-    refundableFee = tx.declaredResourceFee - tx.nonRefundableFee
-    consumedRefundable = tx.consumedRentFee + tx.consumedEventsFee
-    refund = max(0, refundableFee - consumedRefundable)
-
-    if refund > 0:
-        feeSource = loadAccount(tx.feeSourceAccount, ltx)
-        if feeSource is None:
-            return                          // account merged, no refund
-        if not addBalance(feeSource, refund):
-            return                          // overflow or buying liabilities
-        ledgerHeader.feePool -= refund
-        tx.result.feeCharged -= refund
-
-    commit(ltx)
-```
-
-`addBalance` checks `@version(≥10)`: (1) `balance + refund` does not
-overflow `INT64_MAX`, and (2) the new balance does not exceed
-`INT64_MAX - buyingLiabilities`. If either check fails, the refund is
-silently skipped.
-
-The resource fee is split into **non-refundable** and **refundable**
-components by the resource fee computation function:
-- **Non-refundable**: Covers compute (instructions), bandwidth
-  (transaction size), historical archival (read bytes).
-- **Refundable**: Covers rent and contract event emission. The actual
-  consumption depends on execution, so the unused portion is refunded.
-
-`@version(≥23)`: Fee refunds for all Soroban transactions in a stage
-are processed after the entire stage completes, not after each
-individual transaction.
-
-### 5.6 Fee-Bump Semantics
-
-Fee-bump transactions are **not supported** before protocol 13.
-`@version(<13)`: A fee-bump envelope causes the transaction to fail
-with `txNOT_SUPPORTED` during `commonValidPreSeqNum`. The rest of
-this section applies to `@version(≥13)`.
-
-A fee-bump transaction wraps an inner transaction with a new fee
-source and higher fee:
-
-1. The inner transaction's operations, source account, and sequence
-   number are preserved unchanged.
-
-2. The fee-bump's `feeSource` pays the fee instead of the inner
-   source.
-
-3. The content hash used for signature verification of the outer
-   envelope is computed over the `FeeBumpTransaction` body.
-
-4. The inner transaction's signatures are verified against the inner
-   transaction's content hash.
-
-5. The result structure nests: the outer result code is
-   `txFEE_BUMP_INNER_SUCCESS` or `txFEE_BUMP_INNER_FAILED`, containing
-   the inner result.
-
-6. `@version(≥21)`: The inner result's `feeCharged` is updated to
-   reflect Soroban refunds. Prior versions did not propagate refunds
-   to the inner result.
-
-7. `@version(≥25)`: The inner `feeCharged` is set to 0. The outer
-   `feeCharged` carries the full fee amount.
-
-8. **Apply-time inner signature re-validation**: When a fee-bump
-   transaction is applied, the outer fee has already been charged and
-   committed during the `processFeeSeqNum` pre-processing pass
-   (Section 5.4). During `apply()`, the inner transaction goes through
-   `commonPreApply`, which re-validates the inner transaction's
-   signatures against the inner source account's **current** signer set
-   (which may have been modified by prior transactions in the same
-   ledger). If the inner transaction's signatures are no longer valid
-   at apply time, the inner result is `txBAD_AUTH`, the outer result is
-   `txFEE_BUMP_INNER_FAILED`, and the outer fee remains charged. The
-   `feeCharged` field in the result reflects the full fee that was
-   deducted during pre-processing — it is never zero for a fee-bump
-   transaction that reached the apply phase.
-
-9. **Per-operation inclusion fee comparison** (in `commonValidPreSeqNum`):
-   The outer fee-bump's per-op inclusion fee MUST be strictly greater
-   than the inner's per-op inclusion fee. Concretely, with
-   `outerInclusion = getInclusionFee()`,
-   `innerInclusion = mInnerTx.getInclusionFee()`,
-   `outerMinInclusion = getMinInclusionFee(self)`,
-   `innerMinInclusion = getMinInclusionFee(innerTx)`, the check is
-   `outerInclusion * innerMinInclusion >= innerInclusion *
-   outerMinInclusion` (128-bit cross-multiplied to avoid overflow).
-   If this fails, the result is `txINSUFFICIENT_FEE` with `feeCharged`
-   set to the required fee (rounded up).
-
-10. **Non-positive inner inclusion fee** `@version(<23)`: If
-    `mInnerTx.getInclusionFee() < 0`, the fee-bump fails with
-    `txFEE_BUMP_INNER_FAILED`. `@version(≥23)`: An inner Soroban
-    transaction is allowed to have a non-positive inclusion fee (the
-    fee-bump source supplies the full inclusion fee); the check above
-    is skipped in this case.
-
----
-
-## 6. Transaction Application Pipeline
-
-### 6.1 Application Entry Point
-
-After fee and sequence number pre-processing (Section 5.4), each
-transaction is applied via the following pipeline:
-
-```
-function apply(tx, ltx, metaBuilder):
-    // Phase 1: Pre-apply (signatures, final validation)
-    sigChecker = commonPreApply(tx, ltx, metaBuilder)
-
-    // Phase 2: Apply operations (only if pre-apply succeeded)
-    if sigChecker is not null:
-        applyOperations(tx, sigChecker, ltx, metaBuilder)
-
-    // Phase 3: Post-apply (Soroban refunds)
-    // Called UNCONDITIONALLY — even when commonPreApply fails.
-    // For Soroban TXs, the refundable fee tracker was initialized
-    // in commonPreApply before validation, so the refund is
-    // computed regardless of the transaction result. For non-Soroban
-    // transactions, processPostApply is a no-op.
-    processPostApply(tx, ltx, metaBuilder)
-```
-
-Note: Phase 3 (`processPostApply`) runs **unconditionally** after
-`apply()`, even when `commonPreApply` returns null. This ensures
-Soroban fee refunds are correctly subtracted from `feeCharged` even
-for failed transactions. The unused-signature check
-(`allSignaturesUsed`) is performed inside `processSignatures` (called
-from `commonPreApply` — see below), NOT after operation execution.
-
-### 6.2 Pre-Apply Phase (commonPreApply)
-
-The pre-apply phase performs final validation with mutable state access
-and records fee-related metadata:
-
-```
-function commonPreApply(tx, ltx, metaBuilder):
-    // Create a child ledger transaction for pre-apply work
-    ltxPreApply = createChild(ltx)
-
-    // Build signature checker
-    sigChecker = SignatureChecker(tx.contentHash, tx.signatures)
-
-    // @version(≥20): For Soroban TXs, initialize the refundable fee
-    // tracker BEFORE commonValid. This ensures the refund is computed
-    // and feeCharged is adjusted even when validation fails.
-    if tx.isSoroban():
-        sorobanResourceFee = computePreApplySorobanResourceFee(tx)
-        txResult.initializeRefundableFeeTracker(
-            declaredResourceFee - sorobanResourceFee.nonRefundable)
-
-    // Run stateful validation (commonValid)
-    validity = commonValid(tx, sigChecker, ltxPreApply, applying=true)
-
-    // @version(≥10): If validation passed the sequence number check
-    // but failed on a later check (kInvalidUpdateSeqNum), advance
-    // the sequence number. This ensures the TX's sequence slot is
-    // consumed even on validation failure (e.g., Soroban resource
-    // validation failure or signature failure).
-    if validity >= kInvalidUpdateSeqNum:
-        processSeqNum(tx, ltxPreApply)
-
-    // @version(<10): advance sequence number here unconditionally
-    if protocolVersion < 10:
-        processSeqNum(tx, ltxPreApply)
-
-    // Process per-operation signatures, one-time signer removal,
-    // and unused-signature check.
-    // NOTE: The transaction-level signature check already happens
-    // inside commonValid (see Section 6.3), so it is not repeated here.
-    signaturesValid = processSignatures(
-        validity, sigChecker, ltxPreApply, txResult)
-
-    // ALWAYS record changes and commit — never rollback.
-    // Even on validation failure, the sequence number advancement,
-    // one-time signer removal, and refundable fee tracker state
-    // must be committed.
-    metaBuilder.pushTxChangesBefore(ltxPreApply.getChanges())
-    commit(ltxPreApply)
-
-    if signaturesValid and validity == kMaybeValid:
-        return sigChecker
+function getFee(header, baseFee, applying):
+    if not baseFee: return getFullFee()
+    if @version(≥V_11) OR not applying:
+        adjustedFee = saturatingMultiply(baseFee, max(1, numOperations))
+        maybeResourceFee = isSoroban ? declaredSorobanResourceFee : 0
+        if applying:
+            return saturatingAdd(maybeResourceFee,
+                                 min(getInclusionFee(), adjustedFee))
+        else:
+            return saturatingAdd(maybeResourceFee, adjustedFee)
     else:
-        return null
+        return getFullFee()
 ```
 
-#### processSignatures
+The applying path caps the inclusion-fee component at the surge-priced
+per-op rate (`adjustedFee = baseFee * numOps`), implementing the
+charge-the-floor surge pricing semantics from V_11+: the tx pays no more
+than its inclusion fee, but no more than the surge-priced floor either.
 
-`@version(≥10)`: The `processSignatures` function performs per-operation
-signature checking, one-time signer removal, and unused-signature
-verification. It is called from `commonPreApply` **before** any
-operations execute. The ordering of steps within this function is
-critical for correctness.
+For fee-bump txs, `getFee` always uses the V_11+ formula (no protocol gate)
+and adds the inner Soroban resource fee as a flat component.
 
-```
-function processSignatures(cv, sigChecker, ltx, txResult):
-    maybeValid = (cv == kMaybeValid)
+### 6.3 Surge Pricing Input
 
-    // @version(<10): no-op, return maybeValid
-    if protocolVersion < 10: return maybeValid
+The `baseFee` parameter is supplied by the herder (see `HERDER_SPEC §6`)
+based on the tx set's lane occupancy. The transaction subsystem itself
+does not select baseFee; it only honors the value passed.
 
-    // @version(≥13): fast-fail on validation failure
-    // Still remove one-time signers even on failure
-    if protocolVersion >= 13 and not maybeValid:
-        removeOneTimeSignerFromAllSourceAccounts(ltx)
-        return false
+### 6.4 processFeeSeqNum (Fee Phase)
 
-    // @version(10..12): fast-fail for pre-auth failures
-    if protocolVersion < 13 and cv < kInvalidPostAuth:
-        return false
+For non-fee-bump:
 
-    // Step 1: Check per-operation source account signatures
-    // Uses a snapshot of the current ledger state
-    allOpsValid = checkOperationSignatures(sigChecker, snapshot(ltx), txResult)
+1. Reset legacy pre-V_8 account cache.
+2. Load source account; absent ⇒ runtime error (the herder MUST have
+   admitted only well-formed txs).
+3. Compute `fee = getFee(header, baseFee, applying=true)`.
+4. If `fee > 0`: clamp to `min(account.balance, fee)`, deduct from
+   account balance, add to `header.feePool`.
+5. `@version(<V_10)`: assert `acc.seqNum + 1 == getSeqNum()`; consume
+   the sequence number here. `@version(≥V_10)` defers seq consumption
+   to `processSeqNum` inside apply.
 
-    // Step 2: Remove one-time (PreAuthTx) signers from ALL source accounts
-    // MUST happen AFTER operation signature checks so that PreAuthTx
-    // signers are still present when their weight is evaluated.
-    removeOneTimeSignerFromAllSourceAccounts(ltx)
+For fee-bump:
 
-    // Step 3: Handle operation signature failures
-    if not allOpsValid:
-        txResult.setError(txFAILED)
-        return false
+1. Load fee source; deduct fee clamped to balance; add to fee pool.
+2. `@version(<V_25)`: also compute the inner per-op fee
+   (`innerFeeCharged = innerTx.getFee(header, baseFee, applying=true)`)
+   and stash it in the inner result. `@version(≥V_25)` skips this; the
+   inner fee is no longer reported separately.
 
-    // Step 4: Check all signatures were consumed
-    if not sigChecker.checkAllSignaturesUsed():
-        txResult.setError(txBAD_AUTH_EXTRA)
-        return false
+Returns a `MutableTxResultPtr` with `feeCharged` set.
 
-    return maybeValid
-```
+### 6.5 Soroban Refundable Fees
 
-**Ordering invariant**: The sequence `checkOperationSignatures` →
-`removeOneTimeSignerFromAllSourceAccounts` → `checkAllSignaturesUsed`
-is mandatory. PreAuthTx signers MUST be present during signature
-weight evaluation (Step 1) and MUST be removed regardless of outcome
-(Step 2). The `checkAllSignaturesUsed` check (Step 4) runs after
-signer removal because it only checks `mUsedSignatures` flags, which
-are set during Steps 1 and the earlier transaction-level check.
+A Soroban resource fee splits into:
 
-### 6.3 Stateful Validation (commonValid)
+- **Non-refundable fee** — the deterministic component computed up-front
+  via `rust_bridge::compute_transaction_resource_fee` over the declared
+  resources (`instructions`, `disk_read_entries`, `write_entries`,
+  `disk_read_bytes`, `write_bytes`, `transaction_size_bytes`,
+  `contract_events_size_bytes=0`). It is charged in full at fee phase.
+- **Refundable fee** — `declaredResourceFee - nonRefundableFee`.
+  Initialized on a `RefundableFeeTracker` at pre-apply time. During
+  apply, host-computed `rent_fee` and the actual `contract_events_size`
+  are consumed (`consumeRefundableSorobanResources`); any remainder is
+  refunded.
 
-The `commonValid` function performs all stateful checks. It is called
-both during validation (without mutation) and during application (with
-mutation). The `applying` parameter controls whether the call is
-during the apply path.
+The refund is applied to the **fee source** (not the tx source, which
+matters for fee-bump):
 
 ```
-function commonValid(tx, sigChecker, ltx, applying):
-    // 1. Pre-sequence-number checks
-    result = commonValidPreSeqNum(tx, ltx, applying)
-    if result != kMaybeValid:
-        return result
-
-    // 2. Sequence number check
-    sourceAccount = loadAccount(tx.sourceAccount, ltx)
-    if isBadSeq(tx, sourceAccount):
-        tx.setError(txBAD_SEQ)
-        return kInvalid
-
-    // 3. Sequence age/gap checks (@version(≥19))
-    if isTooEarlyForAccount(tx, sourceAccount, ledgerHeader):
-        tx.setError(txBAD_MIN_SEQ_AGE_OR_GAP)
-        return kInvalid
-
-    // 4. Transaction-level signature check (both validation and apply)
-    //    checkAllTransactionSignatures includes both the LOW-threshold
-    //    signature check AND the extra signers check (@version(≥19)).
-    //    Failure produces txBAD_AUTH.
-    if not checkAccountSignatures(tx.sourceAccount, sigChecker, LOW):
-        tx.setError(txBAD_AUTH)
-        return kInvalidPostAuth
-
-    // 5. Balance sufficiency
-    if not checkFeeBalance(tx, sourceAccount):
-        tx.setError(txINSUFFICIENT_BALANCE)
-        return kInvalid
-
-    return kMaybeValid
+function refundSorobanFee(ltx, feeSource, txResult):
+    refund = refundableFeeTracker.getFeeRefund()
+    if refund == 0: return 0
+    feeAcc = loadAccount(ltx, feeSource)
+    if !feeAcc: return 0     # account merged
+    if !addBalance(header, feeAcc, refund):
+        return 0             # liabilities block refund
+    txResult.finalizeFeeRefund(ledgerVersion)
+    header.feePool -= refund
+    return refund
 ```
 
-The `commonValidPreSeqNum` function checks:
-1. Envelope type validity
-2. Operation count (≥1)
-3. Soroban operations consistency (Section 4.2, item 6)
-4. Soroban resource validation (Section 4.9)
-5. Time bounds and ledger bounds
-6. Minimum fee (`fee ≥ baseFee * numOps`)
-7. Source account existence
+A fee event reflecting `-refund` is emitted with stage
+`TRANSACTION_EVENT_STAGE_AFTER_TX` (`@version(<V_23)`) or
+`TRANSACTION_EVENT_STAGE_AFTER_ALL_TXS` (`@version(≥V_23)`).
 
-### 6.4 Operation Application
+### 6.6 Fee-Bump Fee Charging
 
-Operations are applied sequentially within a nested ledger transaction
+The outer fee-bump pays the full charged fee in `processFeeSeqNum`. The
+inner transaction has its inclusion-fee floor checked in
+`FeeBumpTransactionFrame::commonValid` using the cross-multiplication
+(see §5.4). The inner inclusion fee MUST exceed the inner minimum
+**per-op** rate, computed against the outer min rate:
+
+```
+outerInclusion * minInner ≥ innerInclusion * minOuter
+```
+
+This guarantees fee-bumps actually raise the inclusion priority above
+the original.
+
+---
+
+## 7. Transaction Application Pipeline
+
+### 7.1 Entry Point
+
+`LedgerManagerImpl::applyTransactions` (`LEDGER_SPEC §3.3`) calls, for
+each transaction in apply order:
+
+1. `tx.processFeeSeqNum(ltx, txSet.getTxBaseFee(tx))` — fee phase under
+   the outer ledger ltx.
+2. `tx.apply(app, ltx, tm, mutableResult, sorobanConfig, prngSeed)` —
+   apply phase.
+3. `tx.processPostApply(app, ltx, tm, mutableResult)` — refund (Soroban,
+   `@version(<V_23)`).
+
+For Soroban transactions in `@version(≥V_23)`, parallel apply replaces
+step 2 with `preParallelApply` + `parallelApply` per `HERDER_SPEC §5.3`.
+
+### 7.2 commonPreApply
+
+`TransactionFrame::commonPreApply` runs (inside a sub-LedgerTxn to allow
+rollback on failure):
+
+1. Reset legacy pre-V_8 account cache.
+2. Construct `SignatureChecker` over the tx signatures.
+3. If Soroban (`@version(≥SOROBAN)`):
+   - Recompute the per-apply Soroban resource fee.
+   - `meta.setNonRefundableResourceFee(nonRefundableFee)`.
+   - Initialize the `RefundableFeeTracker` with
+     `declaredResourceFee - nonRefundableFee`.
+4. Run `commonValid(..., applying=true, chargeFee=chargeFee, ...)` and
+   capture the validation type `cv`.
+5. If `cv >= kInvalidUpdateSeqNum`: run `processSeqNum(ltx)` — for
+   `@version(≥V_10)`, set `account.seqNum = getSeqNum()` and call
+   `maybeUpdateAccountOnLedgerSeqUpdate` to refresh `accountExtV3.seqTime
+   / seqLedger`.
+6. Run `processSignatures(cv, sigChecker, ltx, txResult)`:
+   - `@version(<V_10)`: only consume signatures when `cv == kMaybeValid`.
+   - `@version(<V_13)` and `cv < kInvalidPostAuth`: fast-fail, do not
+     remove signers.
+   - `@version(≥V_13)` and `cv != kMaybeValid`: remove one-time signers
+     and return false.
+   - Otherwise: validate operation signatures
+     (`checkOperationSignatures`) when the tx result code is
+     `txSUCCESS` or `txFAILED`, remove one-time signers from all source
+     accounts (tx + each op source), and verify
+     `checkAllSignaturesUsed` ⇒ else `txBAD_AUTH_EXTRA`.
+7. Push the sub-ltx's accumulated entry changes as
+   `pushTxChangesBefore` into the meta builder, then commit the sub-ltx.
+
+Returns the constructed `SignatureChecker` if successful (so it can be
+reused for op application without re-loading signers).
+
+### 7.3 applyOperations
+
+For each operation index `i` from 0 to `numOperations - 1`:
+
+1. Open a sub-LedgerTxn `ltxOp` over `ltxTx` (which is itself a sub-ltx
+   over the outer apply ltx).
+2. Compute the per-op PRNG seed: `subSeed = subSha256(basePrngSeed, opNum)`
+   if the op is Soroban, else inherit the base seed.
+3. Call `op.apply(app, sigChecker, ltxOp, sorobanConfig, subSeed,
+   opResult, refundableFeeTracker, opMeta)`.
+4. If `txRes` (the per-op result) is true:
+   - `@version(<V_8)` and op is not `INFLATION`: call
+     `reconcileEvents(txSourceID, op, delta, opEventManager)` — see §14.3.
+   - Call `app.checkOnOperationApply(operation, opResult, delta, events)`
+     for invariants (`LEDGER_SPEC §10`).
+   - Set op meta from the sub-ltx delta.
+5. **Commit policy**:
+   - `txRes == true` or `@version(<V_14)`: commit `ltxOp`.
+   - `@version(≥V_14)` and `txRes == false`: discard `ltxOp` (rollback).
+
+If any op fails, the tx is marked `txFAILED` and the outer `ltxTx`
+discards. If all ops succeed:
+
+- `@version(<V_10)`: `checkAllSignaturesUsed` re-runs; failure ⇒
+  `txBAD_AUTH_EXTRA`. Then a fresh sub-ltx removes one-time signers and
+  is pushed as `pushTxChangesAfter` into the meta.
+- `@version(≥V_14)`: if `ltxTx.hasSponsorshipEntry()` (i.e., any
+  sponsorship temporary entries remain) ⇒ `txBAD_SPONSORSHIP`.
+
+Commit `ltxTx` on success.
+
+### 7.4 OperationFrame::apply
+
+Polymorphic; for each op:
+
+1. Re-run `op.checkValid(..., forApply=true, ...)` against the live
+   sub-ltx state (this is necessary because earlier ops may have
+   modified the op source account or other state). Failure returns
+   false.
+2. If Soroban: dispatch to `doApplyForSoroban` (pre-V_23) or has its
+   `doParallelApply` invoked by `preParallelApply` (V_23+).
+3. Otherwise: dispatch to `doApply(app, ltx, sorobanConfig, res,
+   opMeta)`. The classic path uses the sorobanConfig-aware overload
+   solely for CAP-77 frozen-key checks against offer counterparties
+   during DEX crossing (see §10).
+
+### 7.5 Source Account Resolution
+
+For each op, `getSourceID()` returns either `op.sourceAccount` (if
+present) or `parentTx.getSourceID()`. The op source account is loaded
+via `loadSourceAccount`, which on `@version(<V_8)` re-applies the
+legacy cached-account behavior tracked by `mCachedAccountPreProtocol8`
+(this is a deliberate parity-preserving bug; see source comment).
+
+### 7.6 Threshold Levels
+
+`OperationFrame::getThresholdLevel` returns:
+
+- `ThresholdLevel::LOW` for `ALLOW_TRUST`, `INFLATION`, `BUMP_SEQUENCE`,
+  `CLAIM_CLAIMABLE_BALANCE`, `EXTEND_FOOTPRINT_TTL`, `RESTORE_FOOTPRINT`.
+- `ThresholdLevel::HIGH` for `ACCOUNT_MERGE`, and `SET_OPTIONS` when
+  any of `masterWeight`, `lowThreshold`, `medThreshold`, `highThreshold`,
+  or `signer` is set.
+- `ThresholdLevel::MEDIUM` for all other operations.
+
+The needed weight comes from `account.thresholds[level]`. The master
+signer's weight is taken from `account.thresholds[THRESHOLD_MASTER_WEIGHT
+= 0]`.
+
+---
+
+## 8. Operation Execution
+
+Each subsection lists the `doCheckValid` checks in **exact source order**
+(this order determines which result code a malformed op receives), then
+the `doApply` execution logic with all protocol-version branches.
+
+Result codes are written `SCREAMING_SNAKE_CASE`. Op-level wrapper codes
+`opBAD_AUTH`, `opNO_ACCOUNT`, `opNOT_SUPPORTED`, `opTOO_MANY_SUBENTRIES`,
+`opEXCEEDED_WORK_LIMIT`, `opTOO_MANY_SPONSORING` are emitted by the
+common machinery and are not repeated per-op below.
+
+### 8.1 CreateAccount
+
+**doCheckValid:**
+1. `startingBalance < minStartingBalance` where
+   `minStartingBalance = @version(≥V_14) ? 0 : 1` ⇒
+   `CREATE_ACCOUNT_MALFORMED`.
+2. `destination == getSourceID()` ⇒ `CREATE_ACCOUNT_MALFORMED`.
+
+**doApply:**
+1. If destination already exists ⇒ `CREATE_ACCOUNT_ALREADY_EXIST`.
+2. `@version(<V_14)`:
+   - `startingBalance < getMinBalance(header, 0, 0, 0)` ⇒
+     `CREATE_ACCOUNT_LOW_RESERVE`.
+   - `availableBalance(source) < startingBalance` ⇒
+     `CREATE_ACCOUNT_UNDERFUNDED`.
+   - Deduct from source, create the new account with
+     `thresholds[0]=1`, starting balance and starting seqnum.
+3. `@version(≥V_14)`: invoke `createEntryWithPossibleSponsorship` to
+   set up reserves with potential sponsorship; map results
+   `LOW_RESERVE → CREATE_ACCOUNT_LOW_RESERVE`. Then check
+   `availableBalance < startingBalance` ⇒ `CREATE_ACCOUNT_UNDERFUNDED`,
+   deduct, and `ltx.create`.
+4. Emit a transfer event for the native asset from source to destination.
+
+### 8.2 Payment
+
+**doCheckValid:**
+1. `amount ≤ 0` ⇒ `PAYMENT_MALFORMED`.
+2. `!isAssetValid(asset, ledgerVersion)` ⇒ `PAYMENT_MALFORMED`.
+
+**doApply:**
+1. If `instantSuccess` — `@version(≥V_3)`: `dest == source &&
+   asset.type == NATIVE`; `@version(<V_3)`: `dest == source` regardless
+   of asset — emit transfer event and return `PAYMENT_SUCCESS`.
+2. Otherwise: synthesize a `PATH_PAYMENT_STRICT_RECEIVE` operation
+   with `sendMax = destAmount = amount`, run its `doCheckValid` and
+   `doApply`. On failure, translate the inner result codes
+   (see source for the mapping). On success ⇒ `PAYMENT_SUCCESS`.
+
+### 8.3 PathPaymentStrictReceive
+
+**doCheckValid:**
+1. `destAmount ≤ 0 || sendMax ≤ 0` ⇒
+   `PATH_PAYMENT_STRICT_RECEIVE_MALFORMED`.
+2. `!isAssetValid(sendAsset) || !isAssetValid(destAsset)` ⇒ ditto.
+3. Any element of `path` invalid ⇒ ditto.
+
+**doApply:**
+1. `@version(<V_8)`: `doesSourceAccountExist = (loadAccount(source) !=
+   null)`; otherwise `true`.
+2. `bypassIssuerCheck = shouldBypassIssuerCheck(path)` — true iff
+   `destAsset` is non-native, `path` empty, `sendAsset == destAsset`,
+   and `destAsset.issuer == destID`.
+3. If `!bypassIssuerCheck`: load destination account; missing ⇒
+   `PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION`.
+4. `updateDestBalance(ltx, destAmount, bypassIssuerCheck, res)`:
+   - Native: `addBalance(dest, destAmount)`; on failure
+     `@version(≥V_11)` ⇒ `..._LINE_FULL`, else `..._MALFORMED`.
+   - Non-native: `checkIssuer` (`@version(<V_13)` requires issuer
+     existence ⇒ `..._NO_ISSUER`); load trustline ⇒
+     `..._NO_TRUST`; trustline must be authorized ⇒
+     `..._NOT_AUTHORIZED`; `addBalance` ⇒ `..._LINE_FULL`.
+5. Walk `fullPath = reverse(path) + [sourceAsset]` from destAsset:
+   For each `sendAsset` in path:
+   - Skip if `sendAsset == recvAsset`.
+   - `checkIssuer(sendAsset)`.
+   - `maxOffersToCross = @version(≥V_11) ? getMaxOffersToCross() -
+     offersClaimed.size() : INT64_MAX`.
+   - `convert(app, sorobanConfig, ltx, maxOffersToCross, sendAsset,
+     INT64_MAX, amountSend, recvAsset, maxAmountRecv, amountRecv,
+     RoundingType::PATH_PAYMENT_STRICT_RECEIVE, offerTrail, res)`.
+   - On convert result:
+     - `eFilterStopCrossSelf` ⇒ `..._OFFER_CROSS_SELF`.
+     - `eOK` and `!checkTransfer(maxSend=INT64_MAX, amountSend,
+       maxRecv=maxAmountRecv, amountRecv)` where checkTransfer here
+       requires `maxRecv == amountRecv` ⇒ `..._TOO_FEW_OFFERS`.
+     - `ePartial` ⇒ `..._TOO_FEW_OFFERS`.
+     - `eCrossedTooMany` ⇒ `opEXCEEDED_WORK_LIMIT`.
+   - Insert claimed offers at the **front** of the result's offers
+     vector (reverse-path order).
+6. If `maxAmountRecv > sendMax` ⇒ `..._OVER_SENDMAX`.
+7. `updateSourceBalance(ltx, res, maxAmountRecv, bypassIssuerCheck,
+   doesSourceAccountExist)`:
+   - Native: load source; `getAvailableBalance < amount` ⇒
+     `..._UNDERFUNDED`; deduct.
+   - Non-native: `checkIssuer` (unless bypass); load source trustline ⇒
+     `..._SRC_NO_TRUST`; trustline must be authorized ⇒
+     `..._SRC_NOT_AUTHORIZED`; `addBalance` ⇒ `..._UNDERFUNDED`.
+8. Emit per-claim-atom events; emit final transfer event from source
+   to destination for `destAsset / destAmount`.
+
+### 8.4 PathPaymentStrictSend
+
+`isOpSupported`: `@version(≥V_12)`.
+
+**doCheckValid:** mirrors §8.3 with `sendAmount ≤ 0 || destMin ≤ 0` ⇒
+`PATH_PAYMENT_STRICT_SEND_MALFORMED`.
+
+**doApply:** mirrors §8.3 reading forward through
+`fullPath = path + [destAsset]`:
+
+1. `bypassIssuerCheck = shouldBypassIssuerCheck(path)`.
+2. If `!bypassIssuerCheck`: load destination ⇒ `..._NO_DESTINATION`.
+3. `updateSourceBalance(ltx, res, sendAmount, bypassIssuerCheck, true)`.
+4. For each `recvAsset` in fullPath (skip equal to current sendAsset):
+   `convert(... maxAmountSend, amountSend, recvAsset, INT64_MAX,
+   amountRecv, RoundingType::PATH_PAYMENT_STRICT_SEND, ...,
+   maxOffersToCross = getMaxOffersToCross() - claimed.size())`.
+   `checkTransfer` here requires `maxSend == amountSend`.
+   Append claim atoms to the **back** of offers vector (forward order).
+5. If `maxAmountSend < destMin` ⇒ `..._UNDER_DESTMIN`.
+6. `updateDestBalance(ltx, maxAmountSend, bypassIssuerCheck, res)`.
+7. Emit events.
+
+### 8.5 ManageSellOffer / ManageBuyOffer / CreatePassiveSellOffer
+
+All three share `ManageOfferOpFrameBase`. They differ only in:
+
+- `ManageSellOffer`: sell-side amount fixed.
+- `ManageBuyOffer`: buy-side amount fixed (price stored as inverse
+  internally).
+- `CreatePassiveSellOffer`: sell-side fixed with `passive=true` so the
+  offer doesn't auto-fill equal-priced counter offers.
+
+**doCheckValid:**
+1. `!isAssetValid(sheep) || !isAssetValid(wheat)` ⇒ `MALFORMED`.
+2. `compareAsset(sheep, wheat)` (same asset) ⇒ `MALFORMED`.
+3. `!isAmountValid() || price.d ≤ 0 || price.n ≤ 0` ⇒ `MALFORMED`.
+4. `offerID == 0 && isDeleteOffer()`:
+   - `@version(≥V_11)` ⇒ `MALFORMED`.
+   - `@version(≥V_3)` ⇒ `NOT_FOUND`.
+5. `@version(≥V_15)` and `offerID < 0` ⇒ `MALFORMED`.
+
+**doApply:**
+1. `checkOfferValid` (under a rolled-back sub-ltx):
+   - For non-native `sheep`:
+     - `@version(<V_13)`: issuer must exist ⇒ `SELL_NO_ISSUER`.
+     - Trustline missing ⇒ `SELL_NO_TRUST`.
+     - `getBalance == 0` ⇒ `UNDERFUNDED`.
+     - Not authorized ⇒ `SELL_NOT_AUTHORIZED`.
+   - For non-native `wheat`:
+     - `@version(<V_13)`: issuer must exist ⇒ `BUY_NO_ISSUER`.
+     - Trustline missing ⇒ `BUY_NO_TRUST`.
+     - Not authorized ⇒ `BUY_NOT_AUTHORIZED`.
+2. If `offerID != 0`: load offer; missing ⇒ `NOT_FOUND`. Capture
+   flags & sponsorship extension; release liabilities
+   (`@version(≥V_10)`); erase the offer (numSubEntries and sponsorship
+   updates are deferred).
+3. Else if creating new offer `@version(≥V_14)`:
+   `createEntryWithPossibleSponsorship` to reserve the slot; map results
+   `LOW_RESERVE → LOW_RESERVE`, `TOO_MANY_SUBENTRIES → opTOO_MANY_SUBENTRIES`, etc.
+4. Compute exchange parameters (`computeOfferExchangeParameters`):
+   - `@version(<V_14) && creatingNewOffer && (V_10+ || (sheep==NATIVE &&
+     V_9+))`: precheck `canCreateEntryWithoutSponsorship` ⇒
+     `LOW_RESERVE` or `opTOO_MANY_SUBENTRIES`.
+   - Compute `maxWheatReceive = canBuyAtMost(...)`, `maxSheepSend =
+     canSellAtMost(...)`.
+   - `@version(≥V_10)`: if `availableLimit < offerBuyingLiabilities`
+     ⇒ `LINE_FULL`; if `availableBalance < offerSellingLiabilities` ⇒
+     `UNDERFUNDED`; then `applyOperationSpecificLimits`.
+   - `@version(<V_10)`: `getExchangeParametersBeforeV10`.
+5. `maxWheatReceive == 0` ⇒ `LINE_FULL`.
+6. Convert: `convertWithOffersAndPools(sheep, maxSheepSend, sheepSent,
+   wheat, maxWheatReceive, wheatReceived, RoundingType::NORMAL,
+   filter, offerTrail, maxOffersToCross)`. Filter logic:
+   - If `(passive && o.price >= maxWheatPrice) || o.price > maxWheatPrice`
+     ⇒ `eStopBadPrice`.
+   - If `o.sellerID == getSourceID()` ⇒ `eStopCrossSelf`
+     (`MANAGE_SELL_OFFER_CROSS_SELF` / `MANAGE_BUY_OFFER_CROSS_SELF`).
+   - `@version(≥V_23) && offerAccessesFrozenKey(o, *sorobanConfig)`
+     ⇒ `eSkipFrozen`.
+   - Else `eKeep`.
+7. Map convert result:
+   - `eOK` ⇒ `sheepStays = false`.
+   - `ePartial` or `eFilterStopBadPrice` ⇒ `sheepStays = true`.
+   - `eFilterStopCrossSelf` ⇒ `CROSS_SELF`.
+   - `eCrossedTooMany` ⇒ `opEXCEEDED_WORK_LIMIT`.
+8. Append claimed offers to result.
+9. If `wheatReceived > 0`: add `wheatReceived` to source's wheat
+   balance and subtract `sheepSent` from source's sheep balance
+   (native or trustline as appropriate; runtime error on overflow,
+   indicating an `OfferExchange` bug).
+10. Compute remaining offer `amount`:
+    - `@version(≥V_10)`: if `sheepStays`, reload limits and call
+      `adjustOffer(price, sheepSendLimit, wheatReceiveLimit)`;
+      else `amount = 0`.
+    - `@version(<V_10)`: `amount = maxSheepSend - sheepSent`.
+11. If `amount > 0`:
+    - `@version(<V_14) && creatingNewOffer`: precheck
+      `canCreateEntryWithoutSponsorship`.
+    - Generate fresh `offerID = generateID(header)` if creating.
+    - `ltx.create(newOffer)`; `@version(≥V_10)`: `acquireLiabilities`.
+    - Result: `MANAGE_OFFER_CREATED` or `MANAGE_OFFER_UPDATED`.
+12. Else (`amount == 0`):
+    - Result: `MANAGE_OFFER_DELETED`.
+    - If `!creatingNewOffer || @version(≥V_14)`:
+      `removeEntryWithPossibleSponsorship` to release reserves.
+13. Commit; emit per-claim-atom events.
+
+`ManageBuyOffer` and `CreatePassiveSellOffer` reuse this body with the
+appropriate flags. `CreatePassiveSellOffer` sets `setPassiveOnCreate=true`
+so that newly-created offers have `PASSIVE_FLAG`.
+
+### 8.6 SetOptions
+
+`getThresholdLevel`: HIGH if any of `masterWeight`, `lowThreshold`,
+`medThreshold`, `highThreshold`, `signer` is set; else MEDIUM.
+
+**doCheckValid** (order):
+1. `setFlags` / `clearFlags` validity (`accountFlagMaskCheckIsValid`) ⇒
+   `UNKNOWN_FLAG`.
+2. `setFlags & clearFlags != 0` ⇒ `BAD_FLAGS`.
+3. `masterWeight > UINT8_MAX` ⇒ `THRESHOLD_OUT_OF_RANGE`.
+4. `lowThreshold > UINT8_MAX` ⇒ `THRESHOLD_OUT_OF_RANGE`.
+5. `medThreshold > UINT8_MAX` ⇒ `THRESHOLD_OUT_OF_RANGE`.
+6. `highThreshold > UINT8_MAX` ⇒ `THRESHOLD_OUT_OF_RANGE`.
+7. Signer checks (when `signer` is set):
+   - Self-key (signer key equals source) ⇒ `BAD_SIGNER`.
+   - `@version(<V_3)` and `!canConvert<PublicKey>(key)` ⇒ `BAD_SIGNER`.
+   - `@version(≥V_10)` and `weight > UINT8_MAX` ⇒ `BAD_SIGNER`.
+   - Signer key type `ED25519_SIGNED_PAYLOAD`:
+     `@version(<V_19)` or empty payload ⇒ `BAD_SIGNER`.
+8. `!isStringValid(homeDomain)` ⇒ `INVALID_HOME_DOMAIN`.
+
+**doApply** (order):
+1. `inflationDest` set: if `!= source`, load it without record; missing
+   ⇒ `INVALID_INFLATION`. Activate.
+2. `clearFlags` set: if affects auth flags and `isImmutableAuth(source)`
+   ⇒ `CANT_CHANGE`. Otherwise clear bits.
+3. `setFlags` set: same immutable check; otherwise set bits.
+4. If flags changed: `!accountFlagClawbackIsValid(account.flags,
+   ledgerVersion)` ⇒ `AUTH_REVOCABLE_REQUIRED` (auth_clawback requires
+   auth_revocable).
+5. Apply `homeDomain`, `masterWeight`, `lowThreshold`, `medThreshold`,
+   `highThreshold` (all masked to UINT8_MAX).
+6. Signer: if `weight > 0`, `addOrChangeSigner` (under sub-ltx):
+   - Existing signer: update weight in place.
+   - Else if `signers.full()` ⇒ `TOO_MANY_SIGNERS`.
+   - Else insert sorted; reserve sponsorship slot if account has ext_v2;
+     `createSignerWithPossibleSponsorship` ⇒ `LOW_RESERVE`,
+     `opTOO_MANY_SUBENTRIES`, `opTOO_MANY_SPONSORING`.
+7. Signer with `weight == 0`: `deleteSigner` (with possible sponsorship
+   release).
+
+### 8.7 ChangeTrust
+
+**doCheckValid:**
+1. `limit < 0` ⇒ `MALFORMED`.
+2. `!isAssetValid(line, ledgerVersion)` ⇒ `MALFORMED`.
+3. `@version(≥V_10)` and `line.type == NATIVE` ⇒ `MALFORMED`.
+4. `@version(≥V_16)` and `isIssuer(source, line)` ⇒ `MALFORMED`.
+
+**doApply:**
+1. Native asset ⇒ runtime error (caught by checkValid in V_10+).
+2. Self-trust handling:
+   - `@version(≥V_3) && isIssuer(source, line)` ⇒ `SELF_NOT_ALLOWED`.
+   - `@version(<V_3)`: if `limit < INT64_MAX` ⇒ `INVALID_LIMIT`; if
+     source missing ⇒ `NO_ISSUER`; else success (no actual trustline
+     mutation).
+3. Load existing trustline.
+4. **Existing trustline**:
+   - `limit < minimumLimit(trustline)` (balance + buying liab) ⇒
+     `INVALID_LIMIT`.
+   - `limit == 0` (delete): for non-pool-share, check
+     `trustLineExtV2.liquidityPoolUseCount == 0` ⇒
+     `CANNOT_DELETE`; release reserves; erase; for pool-share:
+     `managePoolOnDeletedTrustLine` decrements pool counters.
+   - `limit > 0`: for non-pool-share, verify issuer exists ⇒
+     `NO_ISSUER`. Update `trustLine.limit`.
+5. **New trustline**:
+   - `limit == 0` ⇒ `INVALID_LIMIT`.
+   - Non-pool-share: load issuer ⇒ `NO_ISSUER`; set
+     `AUTHORIZED_FLAG` if issuer doesn't require auth; set
+     `TRUSTLINE_CLAWBACK_ENABLED_FLAG` if issuer has clawback enabled.
+   - `tryManagePoolOnNewTrustLine`: for pool-shares, increment
+     pool-use-count on both underlying assets' trustlines; create or
+     update the liquidity pool entry.
+   - `createEntryWithPossibleSponsorship` ⇒ `LOW_RESERVE`,
+     `opTOO_MANY_SUBENTRIES`, `opTOO_MANY_SPONSORING`.
+
+### 8.8 AllowTrust
+
+`getThresholdLevel`: LOW.
+
+**doCheckValid** (in `AllowTrustOpFrame::doCheckValid`):
+1. `asset.type == NATIVE` ⇒ `MALFORMED`.
+2. `authorize > AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG` ⇒ `MALFORMED`.
+3. `!trustLineFlagIsValid(authorize, ledgerVersion)` ⇒ `MALFORMED`.
+4. `!isAssetValid(mAsset)` ⇒ `MALFORMED`.
+5. `@version(≥V_16)` and `trustor == source` ⇒ `MALFORMED`.
+
+**doApply** (shared in `TrustFlagsOpFrameBase`):
+1. `isAuthRevocationValid`: `@version(<V_16)` source MUST have
+   `AUTH_REQUIRED_FLAG` ⇒ `TRUST_NOT_REQUIRED`. If `!authRevocable &&
+   authorize == 0` ⇒ `CANT_REVOKE`.
+2. Load trustline (issuer-side, key = `{trustor, asset}`); missing ⇒
+   `NO_TRUST_LINE`.
+3. Compute `expectedVal = (current.flags & ~TRUSTLINE_AUTH_FLAGS) |
+   authorize`.
+4. `isRevocationToMaintainLiabilitiesValid`: if `!authRevocable` and
+   transitioning AUTHORIZED → AUTH_TO_MAINTAIN_LIABS ⇒ `CANT_REVOKE`.
+5. If revoking authorization: `removeOffersByAccountAndAsset(trustor,
+   asset)` — delete all offers and pull liquidity pool stakes (this is
+   the heavy lift; see `TrustFlagsOpFrameBase` source).
+6. Set the flag value.
+
+### 8.9 SetTrustLineFlags
+
+`isOpSupported`: `@version(≥V_17)`. Shares `TrustFlagsOpFrameBase` with
+AllowTrust.
+
+**doCheckValid:**
+1. `asset.type == NATIVE` ⇒ `MALFORMED`.
+2. `!isAssetValid(asset)` ⇒ `MALFORMED`.
+3. `source != getIssuer(asset)` ⇒ `MALFORMED`.
+4. `trustor == source` ⇒ `MALFORMED`.
+5. `setFlags & clearFlags != 0` ⇒ `MALFORMED`.
+6. `!trustLineFlagIsValid(setFlags) || setFlags &
+   TRUSTLINE_CLAWBACK_ENABLED_FLAG` ⇒ `MALFORMED` (cannot set
+   clawback via this op).
+7. `!trustLineFlagMaskCheckIsValid(clearFlags)` ⇒ `MALFORMED`.
+
+**calcExpectedFlagValue** returns `INVALID_STATE` if the resulting
+combination has both `AUTHORIZED` and
+`AUTHORIZED_TO_MAINTAIN_LIABILITIES`.
+
+### 8.10 AccountMerge
+
+`getThresholdLevel`: HIGH.
+
+**doCheckValid:** `source == destination` ⇒ `MALFORMED`.
+
+**doApply** branches by protocol:
+
+**`@version(<V_16)` (`doApplyBeforeV16`):**
+1. Load destination account; missing ⇒ `NO_ACCOUNT`.
+2. `@version(V_5..<V_8)`: load source via `loadWithoutRecord` and use
+   that balance (stale-account bug).
+3. `@version(<V_6) || @version(≥V_8)`: use the source account's
+   current balance.
+4. `isImmutableAuth(source)` ⇒ `IMMUTABLE_SET`.
+5. `source.numSubEntries != source.signers.size()` ⇒ `HAS_SUB_ENTRIES`.
+6. `@version(≥V_10)` and `isSeqnumTooFar` ⇒ `SEQNUM_TOO_FAR`.
+   `isSeqnumTooFar`: at `@version(≥V_19)`, also checks the
+   `maxSeqNumToApplyEntry.maxSeqNum`; in all cases checks
+   `source.seqNum ≥ getStartingSequenceNumber(header)`.
+7. `@version(≥V_14)`: `loadSponsorshipCounter(source)` ⇒ `IS_SPONSOR`;
+   `numSponsoring(source) > 0` ⇒ `IS_SPONSOR`; remove every signer via
+   `removeSignerWithPossibleSponsorship`.
+8. `addBalance(dest, sourceBalance)` ⇒ `DEST_FULL` on overflow.
+9. `removeEntryWithPossibleSponsorship` on the source; erase the source
+   account.
+10. Emit native transfer event from source to destination.
+11. Result: `SUCCESS`, `sourceAccountBalance = sourceBalance`.
+
+**`@version(≥V_16)` (`doApplyFromV16`):** Same logic, simpler control
+flow (no version branches), no IMMUTABLE_SET pre-V_16 short-circuit on
+load order.
+
+### 8.11 Inflation
+
+`isOpSupported`: `@version(<V_12)` — inflation is permanently disabled
+from V_12 onward. `getThresholdLevel`: LOW.
+
+**doCheckValid:** always true (no parameters).
+
+**doApply:**
+1. `closeTime < INFLATION_START_TIME + inflationSeq * INFLATION_FREQUENCY`
+   ⇒ `NOT_TIME`.
+2. Query inflation winners: top `INFLATION_NUM_WINNERS = 2000` accounts
+   by `inflationDest` votes that received at least
+   `totalCoins * INFLATION_WIN_MIN_PERCENT / TRILLION` (.05%).
+3. `inflationAmount = totalCoins * INFLATION_RATE_TRILLIONTHS / TRILLION`
+   (1% per year).
+4. `amountToDole = inflationAmount + feePool`; reset `feePool = 0`;
+   increment `inflationSeq`.
+5. For each winner: `toDoleThisWinner = amountToDole * w.votes /
+   totalVotes` (`ROUND_DOWN`); `@version(≥V_10)`: cap at
+   `getMaxAmountReceive`. If the winner exists, add balance,
+   `@version(<V_8)` increment `totalCoins`, record the payout.
+6. `feePool += leftAfterDole`; `@version(≥V_8)` increment
+   `totalCoins += inflationAmount`.
+7. Emit a mint event per payout (native asset).
+
+### 8.12 ManageData
+
+**doCheckValid:**
+1. `@version(<V_2)` ⇒ `NOT_SUPPORTED_YET`.
+2. `dataName.size < 1 || !isStringValid(dataName)` ⇒ `INVALID_NAME`.
+
+**doApply:**
+1. `@version(=V_3)` ⇒ runtime error (ManageData was temporarily
+   disabled at exactly V_3).
+2. If `dataValue` is set:
+   - New: `createEntryWithPossibleSponsorship` ⇒ `LOW_RESERVE`,
+     `opTOO_MANY_*`; create entry.
+   - Existing: overwrite the value.
+3. Else (delete): if no entry ⇒ `NAME_NOT_FOUND`; else
+   `removeEntryWithPossibleSponsorship` and erase.
+
+### 8.13 BumpSequence
+
+`isOpSupported`: `@version(≥V_10)`. `getThresholdLevel`: LOW.
+
+**doCheckValid:** `bumpTo < 0` ⇒ `BAD_SEQ`.
+
+**doApply:**
+1. Load source account, call `maybeUpdateAccountOnLedgerSeqUpdate`
+   (refreshes ext.v3 seqTime/seqLedger).
+2. If `bumpTo > current.seqNum`: `seqNum = bumpTo`, commit.
+3. Else if `@version(≥V_19)`: still commit (only to persist the
+   seqLedger update).
+4. Result: `SUCCESS` (bump succeeds silently if `bumpTo ≤ current`).
+
+### 8.14 CreateClaimableBalance
+
+`isOpSupported`: `@version(≥V_14)`.
+
+**doCheckValid:**
+1. `!isAssetValid(asset) || amount ≤ 0 || claimants.empty()` ⇒
+   `MALFORMED`.
+2. Duplicate destination in `claimants` ⇒ `MALFORMED`.
+3. For each claimant: `validatePredicate(predicate, depth=1)` —
+   recursive depth ≤ 5, AND/OR predicates require both branches valid,
+   NOT requires non-null, `BEFORE_ABSOLUTE_TIME`/`BEFORE_RELATIVE_TIME`
+   require non-negative values. Failure ⇒ `MALFORMED`.
+
+**doApply:**
+1. Load source.
+2. **Native asset**: `availableBalance < amount` ⇒ `UNDERFUNDED`;
+   deduct.
+3. **Non-native**: trustline missing ⇒ `NO_TRUST`; not authorized ⇒
+   `NOT_AUTHORIZED`; `addBalance(-amount)` ⇒ `UNDERFUNDED`. At
+   `@version(≥V_17)`: if `source == issuer` and account has clawback
+   enabled, or if trustline has clawback enabled, mark the new CB with
+   `CLAIMABLE_BALANCE_CLAWBACK_ENABLED_FLAG`.
+4. Populate balance entry: `amount`, `asset`, `balanceID = sha256(OpID
+   preimage)`, claimants (with relative predicates converted to absolute
+   via `updatePredicatesForApply` over `closeTime`).
+5. `createEntryWithPossibleSponsorship` ⇒ `LOW_RESERVE`,
+   `opTOO_MANY_SPONSORING`.
+6. Emit transfer event from source to CB address.
+7. Result: `SUCCESS` with `balanceID`.
+
+### 8.15 ClaimClaimableBalance
+
+`isOpSupported`: `@version(≥V_14)`. `getThresholdLevel`: LOW.
+
+**doCheckValid:** always true.
+
+**doApply:**
+1. Load CB; missing ⇒ `DOES_NOT_EXIST`.
+2. Find claimant matching `source`; if none, or
+   `!validatePredicate(predicate, closeTime)` ⇒ `CANNOT_CLAIM`. The
+   apply-time predicate validator evaluates AND/OR semantically, NOT
+   negates, `BEFORE_ABSOLUTE_TIME` requires `absBefore > closeTime`,
+   `UNCONDITIONAL` always true.
+3. `@version(≥V_23)` CAP-77: `accessesFrozenKeyAtApplyTime(sorobanConfig,
+   asset)` ⇒ `TRUSTLINE_FROZEN`. Checks frozen status of
+   `accountKey(source)` (native) or `trustlineKey(source, asset)`.
+4. Credit source: native ⇒ `addBalance` ⇒ `LINE_FULL`; non-native ⇒
+   trustline absent `NO_TRUST`; not authorized `NOT_AUTHORIZED`;
+   `addBalance` `LINE_FULL`.
+5. `removeEntryWithPossibleSponsorship`; erase CB.
+6. Emit transfer event from CB address to source.
+
+### 8.16 BeginSponsoringFutureReserves
+
+`isOpSupported`: `@version(≥V_14)`.
+
+**doCheckValid:** `sponsoredID == source` ⇒ `MALFORMED`.
+
+**doApply:**
+1. If sponsorship exists for `sponsoredID` ⇒ `ALREADY_SPONSORED`.
+2. If sponsorship exists for `source` (i.e., source is already
+   sponsored by someone else) ⇒ `RECURSIVE`.
+3. If sponsorship counter exists for `sponsoredID` (sponsored is
+   already sponsoring someone else) ⇒ `RECURSIVE`.
+4. Create the `SPONSORSHIP` internal entry.
+5. Increment (or create) the source's `SPONSORSHIP_COUNTER` entry.
+
+### 8.17 EndSponsoringFutureReserves
+
+`isOpSupported`: `@version(≥V_14)`.
+
+**doCheckValid:** always true.
+
+**doApply:**
+1. Load source's sponsorship; missing ⇒ `NOT_SPONSORED`.
+2. Decrement sponsoring's counter; erase counter if reaches 0.
+3. Erase sponsorship.
+
+### 8.18 RevokeSponsorship
+
+`isOpSupported`: `@version(≥V_14)`.
+
+**doCheckValid** for `REVOKE_SPONSORSHIP_LEDGER_ENTRY`:
+- `ACCOUNT`, `CLAIMABLE_BALANCE`: always valid.
+- `TRUSTLINE`: asset must be valid, non-native, account not issuer ⇒
+  else `MALFORMED`.
+- `OFFER`: `offerID > 0` ⇒ else `MALFORMED`.
+- `DATA`: `dataName.size ≥ 1 && isStringValid` ⇒ else `MALFORMED`.
+- `LIQUIDITY_POOL`, `CONTRACT_DATA`, `CONTRACT_CODE`, `CONFIG_SETTING`,
+  `TTL` ⇒ `MALFORMED`.
+
+**doApply** dispatches on type:
+
+**LEDGER_ENTRY case (`updateLedgerEntrySponsorship`):**
+1. Load entry; missing ⇒ `DOES_NOT_EXIST`.
+2. Determine current sponsorship from `le.ext`. Required: if
+   sponsored ⇒ source MUST be current sponsor; else ⇒ source MUST be
+   the entry's owner (`getAccountID(le)`). Else ⇒ `NOT_SPONSOR`.
+3. Determine future sponsorship: a `SPONSORSHIP` entry for source
+   that targets a different account ⇒ entry will be sponsored.
+4. Special case: claimable balance with `!willBeSponsored` ⇒
+   `ONLY_TRANSFERABLE`.
+5. Four transitions:
+   - was+will: `canTransferEntrySponsorship`, then `transferEntrySponsorship`.
+   - was+!will: `canRemoveEntrySponsorship`, then `removeEntrySponsorship`.
+   - !was+will: `canEstablishEntrySponsorship`, then
+     `establishEntrySponsorship`.
+   - !was+!will: no-op.
+6. Each `can*` call may return `LOW_RESERVE → REVOKE_SPONSORSHIP_LOW_RESERVE`
+   or `TOO_MANY_SPONSORING → opTOO_MANY_SPONSORING`.
+
+**SIGNER case (`updateSignerSponsorship`):**
+Same structure over `signerSponsoringIDs[index]` from `account.ext.v1.ext.v2`.
+Result code `DOES_NOT_EXIST` if account or signer missing.
+
+### 8.19 Clawback / ClawbackClaimableBalance
+
+Both `isOpSupported`: `@version(≥V_17)`.
+
+**Clawback doCheckValid:**
+1. `from == toMuxedAccount(source)` ⇒ `MALFORMED`.
+2. `amount < 1` ⇒ `MALFORMED`.
+3. `asset.type == NATIVE` ⇒ `MALFORMED`.
+4. `!isAssetValid(asset)` ⇒ `MALFORMED`.
+5. `source != getIssuer(asset)` ⇒ `MALFORMED`.
+
+**Clawback doApply:**
+1. Load `{from, asset}` trustline; missing ⇒ `NO_TRUST`.
+2. `!isClawbackEnabledOnTrustline` ⇒ `NOT_CLAWBACK_ENABLED`.
+3. `addBalanceSkipAuthorization(-amount)` ⇒ `UNDERFUNDED` on failure.
+4. Emit clawback event.
+
+**ClawbackClaimableBalance doApply:**
+1. Load CB by ID; missing ⇒ `DOES_NOT_EXIST`.
+2. Asset native ⇒ `NOT_ISSUER`.
+3. `source != issuer(asset)` ⇒ `NOT_ISSUER`.
+4. `!isClawbackEnabledOnClaimableBalance` ⇒ `NOT_CLAWBACK_ENABLED`.
+5. Emit clawback event for `(asset, balanceID, amount)`.
+6. `removeEntryWithPossibleSponsorship`, erase.
+
+### 8.20 LiquidityPoolDeposit
+
+`isOpSupported`: `@version(≥V_18) && !isPoolDepositDisabled(header)`.
+
+**doCheckValid:**
+1. `maxAmountA ≤ 0 || maxAmountB ≤ 0` ⇒ `MALFORMED`.
+2. `minPrice.n ≤ 0 || minPrice.d ≤ 0` ⇒ `MALFORMED`.
+3. `maxPrice.n ≤ 0 || maxPrice.d ≤ 0` ⇒ `MALFORMED`.
+4. `minPrice > maxPrice` (cross-multiplied, no rounding) ⇒ `MALFORMED`.
+
+**doApply:**
+1. Load pool-share trustline; missing ⇒ `NO_TRUST`.
+2. Load liquidity pool (must exist if trustline exists).
+3. Load underlying trustlines `tlA`, `tlB` (if non-native).
+4. Either trustline not authorized ⇒ `NOT_AUTHORIZED`.
+5. CAP-77 (`@version(≥V_23)`): `accessesFrozenKeyAtApplyTime` for
+   either underlying ⇒ `TRUSTLINE_FROZEN`.
+6. Compute available balances and shares limit.
+7. **Empty pool**: amounts = max; check available; check price bounds
+   ⇒ `BAD_PRICE`; shares = `bigSquareRoot(amountA, amountB)`;
+   `availableLimitShares < shares` ⇒ `LINE_FULL`.
+8. **Non-empty pool**: `sharesA = totalPoolShares * maxAmountA / reserveA`
+   (ROUND_DOWN), `sharesB` similarly; pick min as `amountPoolShares`;
+   recompute `amountA = amountPoolShares * reserveA / totalPoolShares`
+   (ROUND_UP), `amountB` similarly; check available ⇒ `UNDERFUNDED`;
+   price bounds ⇒ `BAD_PRICE`; shares limit ⇒ `LINE_FULL`.
+9. Overflow check on reserves and totalPoolShares ⇒ `POOL_FULL`.
+10. Transfer assetA / assetB from source; bump pool reserves; mint
+    shares.
+11. Emit per-asset transfer events from source to pool.
+
+### 8.21 LiquidityPoolWithdraw
+
+`isOpSupported`: `@version(≥V_18) && !isPoolWithdrawalDisabled(header)`.
+
+**doCheckValid:** `amount ≤ 0 || minAmountA < 0 || minAmountB < 0` ⇒
+`MALFORMED`.
+
+**doApply:**
+1. Load pool-share trustline; missing ⇒ `NO_TRUST`.
+2. `getAvailableBalance(tlPool) < amount` ⇒ `UNDERFUNDED`.
+3. Load pool. CAP-77 (`@version(≥V_23)`): frozen underlying ⇒
+   `TRUSTLINE_FROZEN`.
+4. `amountA = getPoolWithdrawalAmount(amount, totalShares, reserveA)`;
+   `tryAddAssetBalance` ⇒ `UNDER_MINIMUM` or `LINE_FULL`.
+5. Same for `amountB`.
+6. Decrement `tlPool` balance, `totalPoolShares`, `reserveA`, `reserveB`.
+7. Emit transfer events from pool to source.
+
+### 8.22 InvokeHostFunction
+
+`isOpSupported`: `@version(≥SOROBAN_PROTOCOL_VERSION)`. `isSoroban`: true.
+`getThresholdLevel`: MEDIUM (default).
+
+**doCheckValidForSoroban:**
+1. For `HOST_FUNCTION_TYPE_UPLOAD_CONTRACT_WASM`: `wasm.size >
+   maxContractSizeBytes` ⇒ diagnostic error, return false (op result
+   code is set later by the apply path).
+2. For `HOST_FUNCTION_TYPE_CREATE_CONTRACT`: if `preimage.type ==
+   FROM_ASSET` and `!isAssetValid(fromAsset)` ⇒ diagnostic error,
+   return false.
+
+**doApplyForSoroban** (sequential path, `@version(<V_23)`):
+Delegated to `InvokeHostFunctionPreV23ApplyHelper`:
+
+1. **Add footprint** (read-only then read-write):
+   For each `lk`:
+   - If Soroban entry: load TTL key; if expired and temporary, skip;
+     if expired and persistent ⇒ `ENTRY_ARCHIVED` (pre-V_23 archived
+     entries are not restorable in-line).
+   - Validate `validateContractLedgerEntry`: code size ≤
+     `maxContractSizeBytes`, data entry size ≤
+     `maxContractDataEntrySizeBytes` ⇒ else
+     `RESOURCE_LIMIT_EXCEEDED`.
+   - Meter disk read; if `diskReadBytes` exceeded ⇒
+     `RESOURCE_LIMIT_EXCEEDED`.
+2. **Invoke host function** via `rust_bridge::invoke_host_function`.
+   On host return: if `!success`, map `cpu_insns > limit` or
+   `mem_bytes > txMemoryLimit` to `RESOURCE_LIMIT_EXCEEDED`, else
+   `TRAPPED`. `is_internal_error` ⇒ runtime error (propagates as
+   `txINTERNAL_ERROR`).
+3. **Record storage changes**:
+   - For each entry in `out.modified_ledger_entries`: validate; meter
+     write; upsert. Track created keys.
+   - Every newly-created `CONTRACT_CODE`/`CONTRACT_DATA` MUST have a
+     matching new `TTL` entry. `@version(≥V_26)`: also allow new
+     `ACCOUNT`/`TRUSTLINE` from the Stellar Asset Contract.
+   - For every readWrite key not present in modified set: erase if
+     present (and erase its TTL).
+4. **Collect events**: each contract event accumulates into
+   `EmitEventByte`; over `txMaxContractEventsSizeBytes` ⇒
+   `RESOURCE_LIMIT_EXCEEDED`. Same check after including
+   `result_value`.
+5. **Consume refundable resources**: charge events bytes + rent fee;
+   over budget ⇒ `INSUFFICIENT_REFUNDABLE_FEE`.
+6. **Finalize**: set return value, success code, events on op meta.
+
+**doParallelApply** (`@version(≥V_23)`):
+Same algorithm under `InvokeHostFunctionParallelApplyHelper`. Key
+additions:
+
+- Reads of archived persistent Soroban entries marked in
+  `archivedSorobanEntries` are auto-restored from the Hot Archive or
+  Live BucketList; disk reads are metered identically (CAP-0066).
+- The thread-local `TxParallelApplyLedgerState` accumulates entry
+  upserts and restored keys; these are surfaced as `ParallelTxSuccessVal`
+  on success and merged into the global state.
+- Protocol-23 corruption verifier checks restored entries against the
+  known-bad set; reconciliation events are emitted for SAC accounts
+  whose balance disagrees with the autorestored snapshot.
+
+### 8.23 ExtendFootprintTTL
+
+`isOpSupported`: `@version(≥SOROBAN)`. `getThresholdLevel`: LOW.
+`isSoroban`: true.
+
+**doCheckValidForSoroban:**
+1. `readWrite` MUST be empty ⇒ `MALFORMED`.
+2. Every `readOnly` key MUST be a Soroban entry ⇒ `MALFORMED`.
+3. `extendTo > maxEntryTTL - 1` ⇒ `MALFORMED`.
+
+**doApply** (both sequential and parallel helpers):
+For each `lk` in `readOnly`:
+1. Load TTL; missing or expired ⇒ skip (extend is best-effort).
+2. If `currLiveUntil ≥ newLiveUntil = ledgerSeq + extendTo` ⇒ skip.
+3. Load entry; `validateContractLedgerEntry` ⇒
+   `RESOURCE_LIMIT_EXCEEDED`.
+4. `@version(<V_23)`: meter `mLedgerReadByte += entrySize`; over
+   `diskReadBytes` ⇒ `RESOURCE_LIMIT_EXCEEDED`. `@version(≥V_23)`:
+   no metering (in-memory state).
+5. Record rent change; update TTL.
+
+After loop: `rentFee = rust_bridge::compute_rent_fee(...)`;
+`consumeRefundableSorobanResources(0, rentFee, ...)` ⇒
+`INSUFFICIENT_REFUNDABLE_FEE`.
+
+### 8.24 RestoreFootprint
+
+`isOpSupported`: `@version(≥SOROBAN)`. `getThresholdLevel`: LOW.
+`isSoroban`: true.
+
+**doCheckValidForSoroban:**
+1. `readOnly` MUST be empty ⇒ `MALFORMED`.
+2. Every `readWrite` key MUST be a persistent Soroban entry ⇒
+   `MALFORMED`.
+
+**doApply:** For each `lk` in `readWrite`:
+1. Load TTL: if absent, check `entryWasRestored` (parallel state only)
+   ⇒ skip if already restored; else fetch from Hot Archive
+   (`@version(≥V_23)`; pre-V_23 returns null) ⇒ skip if neither.
+2. If TTL exists and `isLive(ttl, ledgerSeq)` ⇒ skip.
+3. Determine source: hot archive entry overrides live. Update
+   `lastModifiedLedgerSeq = ledgerSeq` for hot-archive restores.
+4. Meter `mLedgerReadByte += entrySize` (`diskReadBytes` cap).
+5. `validateContractLedgerEntry` ⇒ `RESOURCE_LIMIT_EXCEEDED`.
+6. Meter `mLedgerWriteByte += entrySize` (`writeBytes` cap).
+7. Record rent change with `entryLiveUntilLedger = nullopt` (treated as
+   fresh).
+8. Restore: pre-V_23 calls `ltx.restoreFromLiveBucketList(entry,
+   restoredLiveUntilLedger)`; V_23+ upserts via thread state and
+   records the restore (hot vs. live).
+
+After loop: rent fee via `rust_bridge::compute_rent_fee`,
+`consumeRefundableSorobanResources` ⇒ `INSUFFICIENT_REFUNDABLE_FEE`.
+
+`restoredLiveUntilLedger = ledgerSeq + minPersistentTTL - 1`.
+
+---
+
+## 9. Sponsorship Framework
+
+Sponsorship lets one account pay the base reserve for another account's
+ledger entries (signers, trustlines, offers, data entries, claimable
+balances, account itself).
+
+### 9.1 Internal Entry Types
+
+Two `InternalLedgerEntry` types live within the LedgerTxn temporary
 scope:
 
-```
-function applyOperations(tx, sigChecker, ltx, metaBuilder):
-    success = true
+| Type | Purpose |
+|------|---------|
+| `SPONSORSHIP` | `(sponsoredID, sponsoringID)` — active sponsorship contract for the duration of the transaction. |
+| `SPONSORSHIP_COUNTER` | `(sponsoringID, numSponsoring)` — running count of sponsorships established by this source. |
 
-    for i in 0..tx.numOperations:
-        op = tx.operations[i]
-        ltxOp = createChild(ltx)
+At tx end, `applyOperations` asserts `!ltxTx.hasSponsorshipEntry()` for
+`@version(≥V_14)`. Any leftover `SPONSORSHIP` or `SPONSORSHIP_COUNTER`
+(produced by an unpaired `BeginSponsoringFutureReserves`) ⇒
+`txBAD_SPONSORSHIP`.
 
-        // op.apply() handles source resolution, validation, and
-        // execution internally. Per-operation signature authorization
-        // has already been verified in processSignatures (Section 6.2)
-        // using a pre-operation state snapshot. During apply, op source
-        // accounts are resolved against current state — if the source
-        // was merged by a prior op, the result is opNO_ACCOUNT (see
-        // Section 4.8, rule 2c).
-        txRes = op.apply(sigChecker, ltxOp, ...)
+### 9.2 Per-Entry Sponsorship Fields
 
-        if not txRes:
-            success = false
+Every sponsorable `LedgerEntry` carries an `ext.v1.sponsoringID` field
+holding the sponsor's account ID (null if not sponsored). Account
+entries additionally carry `ext.v1.ext.v2`:
 
-        // Record meta only while all ops are succeeding
-        if success:
-            opMetaBuilder.recordChanges(ltxOp)
+| Field | Type | Description |
+|-------|------|-------------|
+| `numSponsored` | uint32 | How many entries this account has paid reserves for that another account owns. |
+| `numSponsoring` | uint32 | How many entries this account owns whose reserves are paid by another. |
+| `signerSponsoringIDs` | xvector<optional AccountID> | Per-signer sponsor IDs, indexed parallel to `signers`. |
 
-        // @version(≥14): only commit the per-op LedgerTxn if the
-        // op succeeded. Failed ops are rolled back (ltxOp drops
-        // without commit).
-        // @version(<14): always commit, even on failure.
-        if txRes or protocolVersion < 14:
-            commit(ltxOp)
-        // else: ltxOp is rolled back (not committed)
+### 9.3 Reserve Math
 
-    // All-or-nothing: commit the parent LedgerTxn only if every
-    // op succeeded. If any failed, the entire transaction's
-    // changes are discarded.
-    if success:
-        commit(ltx)
-    else:
-        tx.setError(txFAILED)
-```
+`getMinBalance` accounts for `numSubentries + numSponsoring -
+numSponsored` (`@version(≥V_14)`). The effective reserve grows with
+sponsoring, shrinks with sponsored entries.
 
-**Failure semantics**: `@version(≥14)`: The loop does NOT break on
-first failure — all operations are still applied. However, a failed
-operation's per-op `LedgerTxn` is not committed (its changes are
-rolled back immediately). Subsequent operations continue executing in
-their own `LedgerTxn` scopes, but since the overall `success` flag is
-false, no metadata is recorded for them. After the loop, the parent
-`LedgerTxn` is never committed, so the entire transaction's state
-changes (including any individually-committed successful ops) are
-discarded. The result is `txFAILED`.
+### 9.4 Limits
 
-`@version(<14)`: All operations are attempted regardless of earlier
-failures. Each operation's `LedgerTxn` is always committed (even on
-failure). The transaction fails if any operation failed.
+- `numSponsoring ≤ UINT32_MAX` — overflow ⇒
+  `SponsorshipResult::TOO_MANY_SPONSORING` ⇒ `opTOO_MANY_SPONSORING`.
+- `numSubentries ≤ 1000` (uint8 limit through max sub-entries
+  field) ⇒ `opTOO_MANY_SUBENTRIES`.
+- Sponsored cannot itself sponsor (the BeginSponsoringFutureReserves
+  recursive checks; §8.16).
 
-### 6.5 Operation Threshold Levels
+### 9.5 Operations
 
-Each operation type requires a specific authorization threshold:
-
-| Threshold | Operations |
-|-----------|-----------|
-| **LOW** | AllowTrust, SetTrustLineFlags, Inflation, BumpSequence, ClaimClaimableBalance, ExtendFootprintTTL, RestoreFootprint |
-| **MEDIUM** | All operations not listed under LOW or HIGH (default). |
-| **HIGH** | SetOptions (when modifying master weight, thresholds, or signers), AccountMerge. |
-
-### 6.6 Source Account Resolution
-
-Each operation's effective source account is determined as:
-
-1. If the operation's `sourceAccount` field is present, use that
-   account.
-2. Otherwise, use the transaction's `sourceAccount`.
-
-For muxed accounts (`KEY_TYPE_MUXED_ED25519`), the embedded Ed25519
-key is used as the account ID for ledger lookups. The muxed ID is
-ignored for state access but preserved in metadata.
+- `BeginSponsoringFutureReserves` opens a sponsorship slot for the
+  source.
+- `EndSponsoringFutureReserves` closes it; MUST match a Begin.
+- `RevokeSponsorship` transfers, removes, or establishes sponsorship on
+  an existing entry or signer.
 
 ---
 
-## 7. Operation Execution
+## 10. DEX Conversion Engine
 
-This section specifies the execution semantics for each of the 27
-operation types. For each operation, the specification defines:
+`OfferExchange.cpp` implements offer crossing for path payments and
+manage-offer operations.
 
-- **Validation** (`doCheckValid`): Checks performed before execution.
-- **Execution** (`doApply`): The state mutation algorithm.
-- **Result codes**: All possible outcomes.
+### 10.1 Rounding Modes
 
-### 7.1 CreateAccount
-
-Creates a new account with a starting XLM balance.
-
-**Validation**:
-- `@version(<14)`: `startingBalance` MUST be > 0. `@version(≥14)`:
-  `startingBalance` MUST be ≥ 0. Result: `CREATE_ACCOUNT_MALFORMED`.
-- `destination` MUST NOT equal the source account. Result:
-  `CREATE_ACCOUNT_MALFORMED`.
-
-**Execution**:
-1. Load source account.
-2. Verify destination account does not already exist.
-   Result: `CREATE_ACCOUNT_ALREADY_EXIST`.
-3. Create with sponsorship support (Section 7.28). Note: this
-   increments `numSponsoring` on the sponsoring account BEFORE the
-   balance check. When the source account is itself the sponsor,
-   this increases the minimum balance, reducing available balance.
-   Result: `CREATE_ACCOUNT_LOW_RESERVE` if insufficient reserve.
-4. Verify source has sufficient native balance: `startingBalance`
-   MUST be ≤ source's available balance (`balance - minBalance
-   - sellingLiabilities`), where `minBalance` reflects the updated
-   `numSponsoring` from step 3.
-   Result: `CREATE_ACCOUNT_UNDERFUNDED`.
-5. Debit `startingBalance` from source.
-6. Create new `ACCOUNT` entry for destination with:
-   - `balance = startingBalance`
-   - `seqNum = ledgerSeq << 32` (current ledger shifted left by 32
-     bits)
-   - All thresholds set to 0 (master weight defaults to 1 implicitly).
-
-### 7.2 Payment
-
-Sends a specified amount of an asset to a destination.
-
-**Validation**:
-- `amount` MUST be > 0. Result: `PAYMENT_MALFORMED`.
-- `asset` MUST be valid. Result: `PAYMENT_MALFORMED`.
-- `destination` MUST NOT equal the source when asset is non-native
-  `@version(<13)`. Result: `PAYMENT_MALFORMED`.
-
-**Execution**: Internally constructs and delegates to a
-PathPaymentStrictReceive with empty path, `sendMax = amount`,
-`destAmount = amount`, `sendAsset = destAsset = asset`.
-
-Result codes are mapped from the path payment result.
-
-### 7.3 PathPaymentStrictReceive
-
-Sends a payment through a conversion path, delivering an exact
-destination amount.
-
-**Validation**:
-- `destAmount` MUST be > 0. Result: `PATH_PAYMENT_STRICT_RECEIVE_MALFORMED`.
-- `sendMax` MUST be > 0. Result: `PATH_PAYMENT_STRICT_RECEIVE_MALFORMED`.
-- All assets (source, path, destination) MUST be valid.
-  Result: `PATH_PAYMENT_STRICT_RECEIVE_MALFORMED`.
-
-**Execution**:
-1. **Issuer bypass check**: If destination asset is non-native, path
-   is empty, source asset equals destination asset, and the destination
-   is the issuer of the asset, then skip the destination account
-   existence check.
-2. Otherwise, verify destination account exists.
-   Result: `PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION`.
-3. Credit destination with `destAmount`.
-4. Build conversion path (reversed): walk backwards from destination
-   asset through each intermediate asset to source asset.
-5. At each hop, call the DEX conversion engine with
-   `ROUND_TYPE_STRICT_RECEIVE` to exchange the needed amount.
-6. `@version(≥11)`: Enforce `MAX_OFFERS_TO_CROSS` (1000) limit across
-   all hops. If the limit is exceeded, the operation returns the
-   outer-level result `opEXCEEDED_WORK_LIMIT` (not an inner
-   path-payment result code).
-7. If total source amount exceeds `sendMax`:
-   Result: `PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX`.
-8. Debit source account.
-
-Additional result codes: `SRC_NO_TRUST`, `SRC_NOT_AUTHORIZED`,
-`UNDERFUNDED`, `DEST_NO_TRUST`, `DEST_NOT_AUTHORIZED`, `LINE_FULL`,
-`NO_ISSUER` `@version(<13)`, `OFFER_CROSS_SELF`, `TOO_FEW_OFFERS`.
-
-### 7.4 PathPaymentStrictSend
-
-Sends an exact source amount through a conversion path, requiring a
-minimum destination amount. `@version(≥12)`.
-
-**Validation**:
-- `sendAmount` MUST be > 0. Result: `PATH_PAYMENT_STRICT_SEND_MALFORMED`.
-- `destMin` MUST be > 0. Result: `PATH_PAYMENT_STRICT_SEND_MALFORMED`.
-- All assets MUST be valid.
-
-**Execution**:
-1. Issuer bypass check (same as strict receive).
-2. Verify destination exists (unless bypassed).
-   Result: `PATH_PAYMENT_STRICT_SEND_NO_DESTINATION`.
-3. Debit source with `sendAmount` (source is debited first, unlike
-   strict receive).
-4. Walk conversion path forward from source asset to destination asset
-   using `ROUND_TYPE_STRICT_SEND`.
-5. Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`. If the limit
-   is exceeded, the operation returns the outer-level result
-   `opEXCEEDED_WORK_LIMIT` (not an inner path-payment result code).
-6. If destination amount received < `destMin`:
-   Result: `PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN`.
-7. Credit destination.
-
-Same additional result codes as PathPaymentStrictReceive.
-
-### 7.5 ManageSellOffer
-
-Creates, updates, or deletes a sell offer on the DEX.
-
-**Validation** (checks in this order):
-1. `selling` and `buying` MUST be valid assets, and they MUST NOT be
-   equal. Result: `MANAGE_SELL_OFFER_MALFORMED`.
-2. `amount` MUST be ≥ 0 (0 = delete), and `price.n` and `price.d` MUST
-   be > 0. Result: `MANAGE_SELL_OFFER_MALFORMED`.
-3. **Delete-without-offerID rejection**: If `offerID == 0` and the
-   operation is a delete (`amount == 0`):
-   - `@version(<3)`: this combination was historically accepted.
-   - `@version(3..10)`: rejected with `MANAGE_SELL_OFFER_NOT_FOUND`.
-   - `@version(≥11)`: rejected with `MANAGE_SELL_OFFER_MALFORMED`.
-4. `@version(≥15)`: `offerID` MUST NOT be negative.
-   Result: `MANAGE_SELL_OFFER_MALFORMED`.
-
-**Execution** (shared with ManageBuyOffer and CreatePassiveSellOffer via
-a common base):
-
-1. If `amount == 0` (delete): load offer by `offerID`, verify
-   ownership, remove offer and adjust liabilities.
-   Result: `MANAGE_SELL_OFFER_NOT_FOUND` if missing.
-
-2. If `offerID != 0` (update): load existing offer, verify ownership.
-   Result: `MANAGE_SELL_OFFER_NOT_FOUND`.
-
-3. Validate selling/buying trustlines (in this order, only when the
-   asset is non-native):
-   - **Selling trustline** (first): `@version(<13)` requires the
-     issuer exists (`SELL_NO_ISSUER`); the trustline MUST exist
-     (`SELL_NO_TRUST`); the trustline's balance MUST be > 0
-     (`MANAGE_SELL_OFFER_UNDERFUNDED`); and the trustline MUST be
-     authorized (`SELL_NOT_AUTHORIZED`).
-   - **Buying trustline** (second): `@version(<13)` requires the
-     issuer exists (`BUY_NO_ISSUER`); the trustline MUST exist
-     (`BUY_NO_TRUST`); and the trustline MUST be authorized
-     (`BUY_NOT_AUTHORIZED`).
-
-4. *(Combined into step 3 above.)*
-
-5. **Cross existing offers**: Walk the order book, crossing offers at
-   favorable prices. For each crossed offer:
-   - The crossed offer's ID MUST NOT equal the source operation's
-     `offerID` (assertion; loading the same offer twice is a bug).
-   - Exchange assets between the two parties.
-   - `@version(≥10)`: Adjust buying/selling liabilities.
-   - If the crossed offer is fully consumed, remove it.
-   - Self-crossing check (offer-filter): if the crossed offer's seller
-     equals the source account, the operation MUST stop and fail with
-     `MANAGE_SELL_OFFER_CROSS_SELF`.
-   - **Passive-offer filter**: if `passive == true` and the crossed
-     offer's price is `≥` the source offer's price, the crossing
-     stops (no further offers crossed; this is `StopBadPrice` —
-     remaining amount stays on the book).
-   - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`. Hitting the
-     limit produces the outer-level result `opEXCEEDED_WORK_LIMIT`.
-
-6. If the new offer (`offerID == 0`) was fully consumed during
-   crossing (no residual amount remains):
-   - `@version(≥14)`: stellar-core still performs the full sponsorship
-     create/remove cycle — it calls `createEntryWithPossibleSponsorship`
-     (which increments `sponsor.numSponsoring` and loads the sponsor
-     account) followed immediately by `removeEntryWithPossibleSponsorship`
-     (which decrements `sponsor.numSponsoring`). The net effect on all
-     account fields is zero, but both the source account and the sponsor
-     account (if any) are loaded into the transaction and receive an
-     updated `lastModifiedLedgerSeq`.
-   - If updating an existing offer (`offerID != 0`) that was fully
-     consumed: remove the offer entry with sponsorship cleanup
-     (Section 7.28).
-
-7. If residual amount remains and this is not a delete:
-   - If this is a new offer (`offerID == 0`): create a new OFFER
-     entry with sponsorship support.
-   - If this is an update: modify the existing offer.
-   - Validate liabilities capacity `@version(≥10)`. Checks are
-     performed in this order: buying capacity first (`LINE_FULL`),
-     then selling capacity (`UNDERFUNDED`). When both fail, the
-     first failing check determines the result code.
-   - Result: `MANAGE_SELL_OFFER_LOW_RESERVE`, `MANAGE_SELL_OFFER_LINE_FULL`,
-     `MANAGE_SELL_OFFER_UNDERFUNDED`.
-
-8. Passive offers (CreatePassiveSellOffer): do not cross offers at the
-   same price; only cross at strictly better prices.
-
-### 7.6 ManageBuyOffer
-
-Creates, updates, or deletes a buy offer on the DEX. `@version(≥11)`.
-
-The algorithm is identical to ManageSellOffer with the following
-differences:
-
-- The price is **inverted** internally: `Price { n: op.price.d,
-  d: op.price.n }`. This transforms the buy offer into a sell offer
-  from the perspective of the exchange engine.
-- The `buyAmount` caps the **wheat** (buying) side rather than the
-  **sheep** (selling) side.
-- Liabilities are computed using the original (non-inverted) price.
-
-### 7.7 CreatePassiveSellOffer
-
-Creates a passive sell offer. Equivalent to ManageSellOffer with
-`offerID = 0` and `passive = true`. A passive offer does not cross
-offers at the same price — it only crosses at strictly better prices.
-
-### 7.7.1 Liabilities Model
-
-`@version(≥10)` (CAP-0003): Accounts and trustlines track aggregate
-**buying** and **selling liabilities** from outstanding offers.
-Liabilities are stored in `AccountEntry.ext.v1().liabilities` and
-`TrustLineEntry.ext.v1().liabilities`.
-
-**Available balance** (how much can be sold/sent):
 ```
-availableBalance(account, native) =
-    account.balance - minBalance(account) - account.sellingLiabilities
-availableBalance(trustline) =
-    trustline.balance - trustline.sellingLiabilities
+enum class RoundingType { NORMAL, PATH_PAYMENT_STRICT_SEND, PATH_PAYMENT_STRICT_RECEIVE }
 ```
 
-**Available limit** (how much can be received):
+- `NORMAL` (manage-offer): cross-multiplications use balanced rounding;
+  see `exchangeV10`.
+- `PATH_PAYMENT_STRICT_RECEIVE`: round in favor of wheat receiver
+  (consume more sheep).
+- `PATH_PAYMENT_STRICT_SEND`: round in favor of sheep sender (yield
+  less wheat).
+
+### 10.2 convertWithOffersAndPools
+
 ```
-availableLimit(account, native) =
-    INT64_MAX - account.balance - account.buyingLiabilities
-availableLimit(trustline) =
-    trustline.limit - trustline.balance - trustline.buyingLiabilities
-```
-
-**Offer liabilities**: When an offer with `(price, amount)` is
-placed, the liabilities it reserves are computed via the exchange
-function (Section 7.29.1):
-- `offerSellingLiabilities` = amount of selling asset committed
-- `offerBuyingLiabilities` = amount of buying asset expected
-
-**Validation invariant** `@version(≥10)` (checked in this order):
-- `availableLimit >= offerBuyingLiabilities`, else
-  `MANAGE_SELL_OFFER_LINE_FULL`.
-- `availableBalance >= offerSellingLiabilities`, else
-  `MANAGE_SELL_OFFER_UNDERFUNDED`.
-
-**Lifecycle**: Liabilities are incremented when offers are created or
-updated, and decremented when offers are deleted, fully consumed, or
-partially filled. On each crossing, both parties' liabilities are
-adjusted to reflect the exchanged amounts.
-
-### 7.8 SetOptions
-
-Configures account settings. The fields are applied in the following
-order:
-
-**Threshold level**: HIGH if **any** of `masterWeight`,
-`lowThreshold`, `medThreshold`, `highThreshold`, or `signer` is
-present in the operation (regardless of value). MEDIUM otherwise.
-
-**Validation**:
-- `setFlags` and `clearFlags` MUST NOT contain unknown flag bits.
-  Result: `SET_OPTIONS_UNKNOWN_FLAG`.
-- `setFlags` and `clearFlags` MUST NOT overlap.
-  Result: `SET_OPTIONS_BAD_FLAGS`.
-- Each of `masterWeight`, `lowThreshold`, `medThreshold`,
-  `highThreshold` (when present) MUST be ≤ `UINT8_MAX` (255).
-  Result: `SET_OPTIONS_THRESHOLD_OUT_OF_RANGE`.
-- Signer MUST NOT be the account itself.
-  Result: `SET_OPTIONS_BAD_SIGNER`.
-- `@version(<3)`: Signer key MUST be a public key (the
-  `SIGNER_KEY_TYPE_PRE_AUTH_TX` and `SIGNER_KEY_TYPE_HASH_X` types
-  introduced in protocol 3 are rejected). Result:
-  `SET_OPTIONS_BAD_SIGNER`.
-- `@version(≥10)`: Signer `weight` MUST be ≤ `UINT8_MAX` (255).
-  Result: `SET_OPTIONS_BAD_SIGNER`.
-- `ED25519_SIGNED_PAYLOAD` signers require `@version(≥19)` and a
-  non-empty payload. Result: `SET_OPTIONS_BAD_SIGNER`.
-
-**Execution** (applied in this order):
-1. **Inflation destination**: If set, verify the target account exists
-   (unless it's self). Result: `SET_OPTIONS_INVALID_INFLATION`.
-2. **Clear flags**: Clear the specified flags. If account has
-   `AUTH_IMMUTABLE_FLAG`, MUST fail.
-   Result: `SET_OPTIONS_CANT_CHANGE`.
-3. **Set flags**: Set the specified flags. Same immutability check.
-   After both clear and set are applied, validate the **resulting**
-   flag combination: `AUTH_CLAWBACK_ENABLED_FLAG` requires
-   `AUTH_REVOCABLE_FLAG` in the resulting flags.
-   Result: `SET_OPTIONS_AUTH_REVOCABLE_REQUIRED`.
-4. **Home domain**: Set the home domain string.
-   Result: `SET_OPTIONS_INVALID_HOME_DOMAIN` if invalid.
-5. **Thresholds**: Set master weight, low/medium/high thresholds.
-6. **Signer**: Add, update, or remove a signer. Weight > 0 adds/updates;
-   weight == 0 removes. Result: `SET_OPTIONS_TOO_MANY_SIGNERS` if
-   adding beyond the limit (20). New signers use sponsorship support.
-
-### 7.9 ChangeTrust
-
-Creates, updates, or removes a trustline.
-
-**Validation** (checks in this order):
-- `limit` MUST be ≥ 0. Result: `CHANGE_TRUST_MALFORMED`.
-- Asset/pool MUST be valid. Result: `CHANGE_TRUST_MALFORMED`.
-- `@version(≥10)`: Asset type MUST NOT be `NATIVE`.
-  Result: `CHANGE_TRUST_MALFORMED`.
-- `@version(≥16)`: Source MUST NOT be the asset issuer.
-  Result: `CHANGE_TRUST_MALFORMED`.
-
-**Self-issuance handling**:
-- `@version(≥3, <16)`: If the source is the asset issuer, the
-  operation fails with `CHANGE_TRUST_SELF_NOT_ALLOWED` during apply
-  (not validation).
-- `@version(<3)`: If the source is the asset issuer, a special path
-  applies: `limit` MUST be `INT64_MAX` (otherwise
-  `CHANGE_TRUST_INVALID_LIMIT`); the source account MUST exist
-  (otherwise `CHANGE_TRUST_NO_ISSUER`); the operation then succeeds
-  without creating any trustline entry.
-
-**Execution**:
-1. If `limit == 0` (remove trustline):
-   - Trustline MUST exist. Result: `CHANGE_TRUST_INVALID_LIMIT`
-     (if the trustline was not found when attempting to remove).
-   - Balance MUST be 0. Selling/buying liabilities MUST be 0.
-   - For non-pool-share trustlines: if the trustline has extension
-     v2 and `liquidityPoolUseCount != 0` (the trustline's asset is
-     in use by at least one pool share owned by the same account),
-     the deletion fails. Result: `CHANGE_TRUST_CANNOT_DELETE`.
-   - For pool shares `@version(≥18)`: verify pool exists. After
-     removal, decrement the asset trustlines' pool use counts; if
-     the pool's `poolSharesTrustLineCount` reaches zero, delete the
-     pool entry.
-   - Remove with sponsorship cleanup.
-
-2. If trustline does not exist (create):
-   - `@version(<13)`: Issuer account MUST exist. This check MUST
-     be performed before the subentry/reserve check.
-     Result: `CHANGE_TRUST_NO_ISSUER`.
-   - `@version(≥13)`: If asset is `ASSET_TYPE_POOL_SHARE`, the pool
-     MUST exist or will be created.
-   - Verify issuer has `AUTH_REQUIRED_FLAG` implications.
-   - Verify the source account's sub-entry count plus the entry
-     multiplier (2 for pool share trustlines, 1 for regular
-     trustlines) does not exceed `ACCOUNT_SUBENTRY_LIMIT` (1000).
-     Result: `opTOO_MANY_SUBENTRIES`.
-   - Create TRUSTLINE entry with sponsorship support. Result:
-     `CHANGE_TRUST_LOW_RESERVE` (checked after issuer existence).
-   - For pool shares: increment both asset trustline pool counts.
-
-3. If trustline exists (update limit):
-   - `limit` MUST be ≥ current buying liabilities.
-   - Update the limit field.
-
-### 7.10 AllowTrust
-
-Authorizes or deauthorizes a trustline (issuer only).
-
-**Threshold level**: LOW.
-
-**Validation**:
-- Asset MUST NOT be native. Result: `ALLOW_TRUST_MALFORMED`.
-- `authorize` value MUST be ≤ `AUTHORIZED_TO_MAINTAIN_LIABILITIES`.
-  Result: `ALLOW_TRUST_MALFORMED`.
-- Trustor MUST NOT be source `@version(≥16)`.
-  Result: `ALLOW_TRUST_MALFORMED`.
-
-**Execution**:
-1. Source MUST have `AUTH_REQUIRED_FLAG` `@version(<16)`.
-   Result: `ALLOW_TRUST_TRUST_NOT_REQUIRED`.
-2. If deauthorizing: source MUST have `AUTH_REVOCABLE_FLAG`.
-   Result: `ALLOW_TRUST_CANT_REVOKE`.
-3. Load trustline. Result: `ALLOW_TRUST_NO_TRUST_LINE`.
-4. Set authorization flags.
-5. If deauthorizing from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
-   fully deauthorized `@version(≥10)`:
-   a. Remove all offers for the account in the deauthorized asset
-      (same mechanism as AccountMerge offer removal). Offers are
-      discovered by querying the **full ledger state** (bucket list
-      snapshot via secondary index), not only entries already in the
-      transaction's working set. Because this snapshot reflects the
-      state at ledger open and does not include in-ledger mutations,
-      offers that were already deleted by an earlier transaction in
-      the same ledger MUST be skipped (i.e., entries whose keys
-      appear in the current ledger's deleted-key set are excluded
-      before processing).
-   b. Redeem all pool share trustlines for the account that reference
-      the deauthorized asset `@version(≥18)`:
-      - Find pool share trustlines by querying the **full ledger state**
-        (see BUCKETLISTDB_SPEC §10.5
-        `loadPoolShareTrustLinesByAccountAndAsset`), not only entries
-        already in the transaction's working set. This requires a
-        secondary index mapping `(accountID, asset)` → pool IDs.
-      - The resulting pool share trustline keys MUST be sorted in
-        canonical `LedgerKey` order before processing. The query
-        returns results in hash-map iteration order which is
-        non-deterministic; sorting ensures identical behavior across
-        all validators.
-      - For each such pool share trustline (in sorted order):
-        1. Withdraw the account's proportional share from the pool.
-        2. Create a claimable balance for each withdrawn asset
-           (claimant: the account, predicate: unconditional).
-        3. Delete the pool share trustline (reserve multiplier = 2).
-        4. Decrement liquidity pool use counts on the underlying
-           asset trustlines.
-        5. If the pool's total shares reach zero, delete the pool.
-
-### 7.11 AccountMerge
-
-Merges the source account into a destination, transferring the
-remaining native balance.
-
-**Threshold level**: HIGH.
-
-**Validation**:
-- Source MUST NOT equal destination. Result: `ACCOUNT_MERGE_MALFORMED`.
-
-**Execution** (two code paths exist — `doApplyBeforeV16` and
-`doApplyFromV16` — but the observable check ordering from
-`@version(≥16)` onward is described here. The pre-v16 path has
-additional source-balance-resolution branches:
-- `@version(<6)`: `sourceBalance` is read directly from
-  `sourceAccount.balance`.
-- `@version(5..7)`: A separate read-only load of the source account
-  is performed first (the merge could be called against a stale
-  cached account); the account MUST exist (`ACCOUNT_MERGE_NO_ACCOUNT`).
-  `@version(≥6)` uses this stale-loaded balance as `sourceBalance`.
-- `@version(≥8)`: `sourceBalance` is read from the source account
-  loaded for mutation (no stale-account quirk).):
-
-1. Destination MUST exist. Result: `ACCOUNT_MERGE_NO_ACCOUNT`.
-2. Source MUST NOT be `AUTH_IMMUTABLE`. Result:
-   `ACCOUNT_MERGE_IMMUTABLE_SET`.
-3. Source MUST NOT have non-signer sub-entries (i.e.,
-   `numSubEntries != signers.size()`). Result:
-   `ACCOUNT_MERGE_HAS_SUB_ENTRIES`.
-4. `@version(≥10)`: Source sequence number MUST be less than the
-   starting sequence number for the current ledger
-   (`currentLedgerSeq << 32`). This prevents the account from
-   "jumping backwards" if recreated. `@version(≥19)`: Additionally,
-   if a `MAX_SEQ_NUM_TO_APPLY` entry exists and its value is ≥ the
-   starting sequence number, the merge is also rejected.
-   Result: `ACCOUNT_MERGE_SEQNUM_TOO_FAR`.
-5. `@version(≥14)`: Source MUST NOT be an active sponsor — both the
-   sponsorship counter (external sponsorships) and `numSponsoring`
-   (on the account entry itself) must be zero.
-   Result: `ACCOUNT_MERGE_IS_SPONSOR`.
-6. `@version(≥14)`: Remove all signers from the source account
-   (with sponsorship cleanup).
-7. Transfer: `destination.balance += source.balance`. Check for
-   overflow. Result: `ACCOUNT_MERGE_DEST_FULL`.
-8. Remove source account (with sponsorship cleanup).
-9. Return `source.balance` as the merge result value.
-
-### 7.12 Inflation
-
-Distributes newly minted XLM plus accumulated fees to top
-vote-getting accounts. **Disabled from `@version(≥12)`**.
-
-**Threshold level**: LOW.
-
-**Execution**:
-1. Check timing: ledger close time MUST be
-   ≥ `INFLATION_START_TIME + inflationSeq * INFLATION_FREQUENCY`.
-   Result: `INFLATION_NOT_TIME`.
-2. Query top 2000 accounts by inflation destination votes, requiring
-   ≥ 0.05% of `totalCoins` as vote weight.
-3. Compute inflation amount: `floor(totalCoins * 190721000 / 10^12)`
-   (~1%/year compound rate).
-4. Set `amountToDole = inflationAmount + feePool`. Zero `feePool` and
-   increment `inflationSeq` **before** distribution.
-5. Distribute `amountToDole` proportionally to winners:
-   - For each winner, `toDole = floor(amountToDole * winner.votes
-     / totalVotes)`. Skip when zero.
-   - `@version(≥10)`: Additionally cap `toDole` to
-     `getMaxAmountReceive(winner)` (computed via a read-only load
-     of the winner). Skip when this cap zeroes out.
-   - Credit `toDole` to the winner's balance.
-   - `@version(<8)`: Increment `header.totalCoins += toDole` **inside
-     the loop** (totalCoins grows incrementally per winner).
-6. Unallocated remainder returns to `feePool` (added back after the
-   distribution loop).
-7. `@version(≥8)`: Increment `header.totalCoins += inflationAmount`
-   **once**, after the distribution loop (in contrast to the per-winner
-   accumulation in v<8).
-
-### 7.13 ManageData
-
-Creates, updates, or deletes a named data entry on the source account.
-`@version(≥2)`.
-
-**Validation**:
-- `dataName` MUST have length ≥ 1 and be a valid string.
-  Result: `MANAGE_DATA_INVALID_NAME`.
-
-**Execution**:
-1. If `dataValue` is present:
-   - If data entry does not exist: create with sponsorship support.
-     Result: `MANAGE_DATA_LOW_RESERVE`.
-   - If data entry exists: update the value.
-2. If `dataValue` is absent (delete):
-   - Data entry MUST exist. Result: `MANAGE_DATA_NAME_NOT_FOUND`.
-   - Remove with sponsorship cleanup.
-
-### 7.14 BumpSequence
-
-Bumps the source account's sequence number. `@version(≥10)`.
-
-**Threshold level**: LOW.
-
-**Validation**:
-- `bumpTo` MUST be ≥ 0. Result: `BUMP_SEQUENCE_BAD_SEQ`.
-
-**Execution**:
-1. Load source account.
-2. Update ledger-sequence-dependent account fields.
-3. If `bumpTo > currentSeqNum`: set `seqNum = bumpTo`.
-4. `@version(≥19)`: Commit even if `bumpTo ≤ currentSeqNum` (to
-   persist ledger-seq-dependent account updates).
-
-### 7.15 CreateClaimableBalance
-
-Creates a claimable balance with specified claim predicates.
-`@version(≥14)`.
-
-**Validation**:
-- Asset MUST be valid. Result: `CREATE_CLAIMABLE_BALANCE_MALFORMED`.
-- `amount` MUST be > 0. Result: `CREATE_CLAIMABLE_BALANCE_MALFORMED`.
-- Claimants MUST NOT be empty. Result:
-  `CREATE_CLAIMABLE_BALANCE_MALFORMED`.
-- Claimant destinations MUST be unique.
-- Each predicate MUST be valid: maximum depth of 4, AND/OR have
-  exactly 2 children, absolute/relative time values ≥ 0.
-
-**Execution**:
-1. Debit source (native or via trustline). For native assets,
-   `amount` MUST be ≤ the source's available balance
-   (`balance - minBalance - sellingLiabilities`). For non-native
-   assets, `amount` MUST be ≤ the trustline's available balance
-   (`balance - sellingLiabilities`). The trustline MUST exist
-   (`NO_TRUST`), MUST be authorized (`NOT_AUTHORIZED`), and MUST
-   have sufficient available balance (`UNDERFUNDED`).
-2. `@version(≥17)`: Determine clawback flag from issuer account or
-   source trustline.
-3. Generate `balanceID = sha256(ENVELOPE_TYPE_OP_ID || sourceID
-   || seqNum || opIndex)`.
-4. Convert relative time predicates to absolute:
-   `absolute = closeTime + relative` (capped at `INT64_MAX`).
-5. Create `CLAIMABLE_BALANCE` entry with sponsorship support.
-   Reserve multiplier = number of claimants.
-   Result: `LOW_RESERVE`.
-
-### 7.16 ClaimClaimableBalance
-
-Claims a claimable balance. `@version(≥14)`.
-
-**Threshold level**: LOW.
-
-**Execution**:
-1. Load claimable balance. Result: `DOES_NOT_EXIST`.
-2. Find a claimant entry whose `destination` matches the source
-   account.
-3. Evaluate the claimant's predicate against the current ledger
-   close time. Result: `CANNOT_CLAIM`.
-4. Credit the source account with the claimed amount:
-   - **Trustline (non-native asset)**:
-     a. Load the trustline for the asset. Result: `NO_TRUST`.
-     b. Trustline MUST be authorized. Result: `NOT_AUTHORIZED`.
-     c. The available capacity (`limit − balance`) MUST be ≥ `amount`.
-        Result: `LINE_FULL`.
-     d. The new balance (`balance + amount`) MUST be
-        ≤ `limit − buyingLiabilities`. Result: `LINE_FULL`.
-     e. Credit the trustline.
-   - **Native asset**:
-     a. `INT64_MAX − balance` MUST be ≥ `amount`. Result: `LINE_FULL`.
-     b. The new balance (`balance + amount`) MUST be
-        ≤ `INT64_MAX − buyingLiabilities`. Result: `LINE_FULL`.
-     c. Credit the account balance.
-
-   > **Implementation note**: All capacity checks use the
-   > overflow-safe form `maxVal − balance < amount` (rather than
-   > `balance + amount > maxVal`) because `maxVal ≥ balance ≥ 0`.
-   > This matches stellar-core's `addBalance` in `types.cpp`.
-5. Remove claimable balance with sponsorship cleanup.
-
-**Predicate evaluation**:
-- `UNCONDITIONAL`: always true.
-- `AND(a, b)`: both must be true.
-- `OR(a, b)`: either must be true.
-- `NOT(p)`: negation.
-- `BEFORE_ABSOLUTE_TIME(t)`: `closeTime < t` (true when current
-  time is before `t`).
-
-### 7.17 BeginSponsoringFutureReserves
-
-Begins a sponsorship relationship. `@version(≥14)`.
-
-**Validation**:
-- `sponsoredID` MUST NOT be the source account.
-  Result: `BEGIN_SPONSORING_FUTURE_RESERVES_MALFORMED`.
-
-**Execution** (guards in this order):
-1. A sponsorship for `sponsoredID` MUST NOT already exist.
-   Result: `ALREADY_SPONSORED`.
-2. A sponsorship for the source account MUST NOT exist (the source
-   is itself being sponsored — no chained sponsorship).
-   Result: `RECURSIVE`.
-3. A `SPONSORSHIP_COUNTER` for `sponsoredID` MUST NOT exist (the
-   target is itself an active sponsor — no two-level sponsor chain).
-   Result: `RECURSIVE`.
-4. Create `SPONSORSHIP` internal entry mapping `sponsoredID` to source.
-5. Create or increment `SPONSORSHIP_COUNTER` for source.
-
-### 7.18 EndSponsoringFutureReserves
-
-Ends a sponsorship relationship. `@version(≥14)`.
-
-**Execution**:
-1. Load sponsorship for source account.
-   Result: `NOT_SPONSORED`.
-2. Get the sponsoring account from the entry.
-3. Decrement the sponsor's `SPONSORSHIP_COUNTER`. If zero, remove it.
-4. Remove the `SPONSORSHIP` entry.
-
-### 7.19 RevokeSponsorship
-
-Transfers, establishes, or removes sponsorship of a ledger entry or
-signer. `@version(≥14)`.
-
-**Validation**:
-- For ledger entry revocations: key type MUST be ACCOUNT, TRUSTLINE,
-  OFFER, DATA, or CLAIMABLE_BALANCE. LIQUIDITY_POOL, CONTRACT_DATA,
-  CONTRACT_CODE, CONFIG_SETTING, and TTL are rejected.
-  Result: `REVOKE_SPONSORSHIP_MALFORMED`.
-- TRUSTLINE key: asset MUST be valid, non-native, and not self-issued.
-- OFFER key: `offerID` MUST be > 0.
-- DATA key: `dataName` MUST have length ≥ 1.
-
-**Execution**:
-1. Load the target entry. Result: `DOES_NOT_EXIST`.
-2. Determine the current sponsor (if any) and verify the source is
-   authorized to revoke. Result: `NOT_SPONSOR`.
-3. Determine the new sponsor by checking if the source is currently
-   being sponsored (`BeginSponsoringFutureReserves`).
-4. Four cases:
-   - **Sponsored → sponsored** (transfer): transfer from old to new
-     sponsor.
-   - **Sponsored → unsponsored** (remove): remove sponsorship, owner
-     pays reserve.
-   - **Unsponsored → sponsored** (establish): new sponsor pays reserve.
-   - **Unsponsored → unsponsored**: no-op.
-5. Claimable balances MUST NOT be unsponsored.
-   Result: `ONLY_TRANSFERABLE`.
-6. Result: `LOW_RESERVE` if the new payer lacks sufficient reserve.
-
-### 7.20 Clawback
-
-Claws back an asset amount from a trustline (issuer only).
-`@version(≥17)`.
-
-**Validation**:
-- `from` MUST NOT be the source account. Result: `CLAWBACK_MALFORMED`.
-- `amount` MUST be > 0. Result: `CLAWBACK_MALFORMED`.
-- Asset MUST NOT be native and MUST be valid (`isAssetValid`).
-  Result: `CLAWBACK_MALFORMED`.
-- Source MUST be the asset issuer. Result: `CLAWBACK_MALFORMED`.
-
-**Execution**:
-1. Load trustline. Result: `CLAWBACK_NO_TRUST`.
-2. Trustline MUST have `CLAWBACK_ENABLED` flag.
-   Result: `CLAWBACK_NOT_CLAWBACK_ENABLED`.
-3. Debit the trustline (bypasses authorization check but respects
-   liabilities): the trustline's new balance (`balance - amount`)
-   MUST be ≥ `sellingLiabilities`. If not, result:
-   `CLAWBACK_UNDERFUNDED`.
-
-The clawed-back amount is destroyed (not credited to the issuer).
-
-### 7.21 ClawbackClaimableBalance
-
-Claws back a claimable balance (issuer only). `@version(≥17)`.
-
-**Execution**:
-1. Load claimable balance. Result: `DOES_NOT_EXIST`.
-2. Asset MUST NOT be native. Result: `NOT_ISSUER`.
-3. Source MUST be the asset issuer. Result: `NOT_ISSUER`.
-4. Claimable balance MUST have `CLAWBACK_ENABLED` flag.
-   Result: `NOT_CLAWBACK_ENABLED`.
-5. Remove the claimable balance (amount is destroyed).
-
-### 7.22 SetTrustLineFlags
-
-Sets or clears authorization and clawback flags on a trustline (issuer
-only). `@version(≥17)`.
-
-**Threshold level**: LOW.
-
-**Validation**:
-- Asset MUST NOT be native and MUST be valid.
-- Source MUST be the asset issuer.
-- `trustor` MUST NOT be the source.
-- `setFlags` and `clearFlags` MUST NOT overlap.
-- `CLAWBACK_ENABLED` MUST NOT appear in `setFlags` (can only be
-  cleared).
-- Result: `SET_TRUST_LINE_FLAGS_MALFORMED`.
-
-**Execution**:
-1. Compute new flag value: `(currentFlags & ~clearFlags) | setFlags`.
-2. Validate the resulting auth flag combination.
-   Result: `SET_TRUST_LINE_FLAGS_INVALID_STATE`.
-3. If deauthorizing without `AUTH_REVOCABLE_FLAG`:
-   Result: `SET_TRUST_LINE_FLAGS_CANT_REVOKE`.
-4. Load trustline. Result: `NO_TRUST_LINE`.
-5. If transitioning from `AUTHORIZED_TO_MAINTAIN_LIABILITIES` to
-   fully deauthorized:
-   a. Remove all offers for the account in the affected asset.
-      Offers are discovered by querying the **full ledger state**
-      (bucket list snapshot via secondary index). Because this
-      snapshot reflects the state at ledger open, offers already
-      deleted by an earlier transaction in the same ledger MUST be
-      skipped (entries whose keys appear in the current ledger's
-      deleted-key set are excluded before processing).
-   b. Redeem all pool share trustlines for the account that reference
-      the affected asset `@version(≥18)`:
-      - Find pool share trustlines by querying the **full ledger state**
-        (see BUCKETLISTDB_SPEC §10.5
-        `loadPoolShareTrustLinesByAccountAndAsset`), not only entries
-        already in the transaction's working set. This requires a
-        secondary index mapping `(accountID, asset)` → pool IDs.
-      - The resulting pool share trustline keys MUST be sorted in
-        canonical `LedgerKey` order before processing. The query
-        returns results in hash-map iteration order which is
-        non-deterministic; sorting ensures identical behavior across
-        all validators.
-      - For each such pool share trustline (in sorted order):
-        1. Withdraw the account's proportional share from the pool.
-        2. Create a claimable balance for each withdrawn asset
-           (claimant: the account, predicate: unconditional).
-        3. Delete the pool share trustline (reserve multiplier = 2).
-        4. Decrement liquidity pool use counts on the underlying
-           asset trustlines.
-        5. If the pool's total shares reach zero, delete the pool.
-6. Set the new flags.
-
-### 7.23 LiquidityPoolDeposit
-
-Deposits assets into a liquidity pool. `@version(≥18)`.
-
-**Validation**:
-- `maxAmountA` and `maxAmountB` MUST be > 0.
-- `minPrice` and `maxPrice` components MUST be > 0.
-- `minPrice` MUST be ≤ `maxPrice` (cross-multiplied comparison).
-- Result: `LIQUIDITY_POOL_DEPOSIT_MALFORMED`.
-
-**Execution**:
-1. Load pool share trustline. Result: `NO_TRUST`.
-2. Load liquidity pool.
-3. Load trustlines for both assets. Verify authorized.
-   Result: `NOT_AUTHORIZED`.
-4. **Empty pool**: deposit `maxAmountA` and `maxAmountB`.
-   Shares = `floor(sqrt(maxAmountA * maxAmountB))`.
-   Check price bounds: `maxAmountB/maxAmountA` within
-   `[minPrice, maxPrice]`. Result: `BAD_PRICE`.
-5. **Non-empty pool**: compute proportional deposit amounts and
-   shares. Two candidate share amounts are computed using 128-bit
-   checked arithmetic (`bigDivide`):
-   `sharesA = floor(maxAmountA * totalPoolShares / reserveA)`
-   `sharesB = floor(maxAmountB * totalPoolShares / reserveB)`
-   If a computation overflows, that candidate is invalid. The final
-   share count is `min` among valid candidates (`minAmongValid`):
-   if one overflows, use the other; if both overflow, the
-   implementation MUST panic (corrupted pool state). The deposit
-   then provides the proportional amount of each asset for the
-   chosen share count (one at the maximum, the other rounded up).
-   Result: `UNDERFUNDED`, `BAD_PRICE`, `LINE_FULL`.
-6. Check for reserve overflow. Result: `POOL_FULL`.
-7. Debit source (using **available balance**: `balance -
-   sellingLiabilities` for each deposited asset), credit pool
-   reserves and pool shares. Result: `UNDERFUNDED` if the available
-   balance is insufficient for either asset.
-
-### 7.24 LiquidityPoolWithdraw
-
-Withdraws assets from a liquidity pool. `@version(≥18)`.
-
-**Validation**:
-- `amount` MUST be > 0.
-- `minAmountA` and `minAmountB` MUST be ≥ 0.
-- Result: `LIQUIDITY_POOL_WITHDRAW_MALFORMED`.
-
-**Execution**:
-1. Load pool share trustline. Result: `NO_TRUST`.
-2. Verify sufficient **available** pool shares: the pool share
-   trustline's `balance - sellingLiabilities` MUST be ≥ `amount`.
-   Result: `UNDERFUNDED`.
-3. Load liquidity pool.
-4. Compute withdrawal amounts:
-   `amountA = floor(amount * reserveA / totalPoolShares)`.
-   `amountB = floor(amount * reserveB / totalPoolShares)`.
-5. Verify `amountA ≥ minAmountA` and `amountB ≥ minAmountB`.
-   Result: `UNDER_MINIMUM`.
-6. Credit source with both assets. Result: `LINE_FULL`.
-7. Debit pool shares, decrement pool reserves.
-
-### 7.25 InvokeHostFunction (Soroban)
-
-Invokes a Soroban smart contract function. `@version(≥20)`.
-See Section 8 for full Soroban execution semantics.
-
-### 7.26 ExtendFootprintTTL (Soroban)
-
-Extends the TTL of Soroban ledger entries. `@version(≥20)`.
-See Section 8.5 for full semantics.
-
-### 7.27 RestoreFootprint (Soroban)
-
-Restores archived Soroban ledger entries. `@version(≥20)`.
-See Section 8.6 for full semantics.
-
-### 7.28 Sponsorship Framework
-
-The sponsorship framework `@version(≥14)` allows one account (the
-sponsor) to pay the base reserve for ledger entries owned by another
-account (the sponsored).
-
-**Creating an entry with sponsorship**:
-1. Check if the owner has an active
-   `BeginSponsoringFutureReserves` entry.
-2. If sponsored: the sponsor pays the reserve. Increment
-   `sponsor.numSponsoring` and `owner.numSponsored`.
-   Set the entry's `sponsoringID` in its extension.
-3. If not sponsored: the owner pays the reserve.
-4. Verify sufficient reserve. Result: `opLOW_RESERVE` or
-   `opTOO_MANY_SPONSORING`.
-
-**Removing an entry with sponsorship**:
-1. If the entry was sponsored: decrement `sponsor.numSponsoring`
-   and `owner.numSponsored`. Release the reserve back to the
-   sponsor.
-2. If not sponsored: release the reserve back to the owner.
-
-**Reserve multipliers by entry type**:
-
-| Entry Type | Multiplier |
-|-----------|-----------|
-| `ACCOUNT` | 2 |
-| `TRUSTLINE` | 1 (2 for pool share trustlines) |
-| `OFFER` | 1 |
-| `DATA` | 1 |
-| `CLAIMABLE_BALANCE` | number of claimants |
-| `SIGNER` | 1 |
-
-### 7.29 DEX Conversion Engine
-
-The DEX conversion engine is used by path payments and offer
-management operations. It crosses offers from the order book and
-liquidity pools `@version(≥18)`:
-
-**`convertWithOffersAndPools()`**:
-1. Compare the best offer from the order book with the best price
-   from the liquidity pool (if any) for the given asset pair.
-2. Cross the better-priced source first.
-3. For order book offers (`crossOfferV10`):
-   - Load the offer and the seller's account/trustlines.
-   - `@version(≥10)`: **Release** the offer's current liabilities
-     first (decrement selling liabilities on the selling side and
-     buying liabilities on the buying side). This MUST happen
-     before computing available amounts.
-   - Compute `maxWheatSend` and `maxSheepReceive` from the seller's
-     available balance/limit (which now reflect the released
-     liabilities). Adjust the offer amount via `adjustOffer`.
-   - Compute the exchange using the offer's price (Section 7.29.1).
-   - Apply balance changes (credit buying asset, debit selling
-     asset) for the exchanged amounts.
-   - If the offer stays: re-adjust the remaining amount and
-     **re-acquire** liabilities for the updated offer. If the
-     adjusted remaining amount is zero, delete the offer.
-   - If offer is fully consumed, remove it.
-   - A `ClaimAtom` is **always** appended to the result's offer
-     trail, even when the exchanged amounts are zero (e.g., when
-     the 1% price-error threshold zeroes out the trade). This is
-     unconditional — no rounding mode skips it.
-4. For liquidity pools `@version(≥18)`:
-   - The 30 bps fee is integrated into the constant-product formula
-     (applied to the input amount before computing output), not
-     applied as a separate deduction.
-   - Strict-send: `fromPool = floor((maxBps - feeBps) *
-     reservesFromPool * toPool / (maxBps * reservesToPool +
-     (maxBps - feeBps) * toPool))` where `maxBps = 10000`,
-     `feeBps = 30`.
-   - Strict-receive: `toPool = ceil(maxBps * reservesToPool *
-     fromPool / ((reservesFromPool - fromPool) *
-     (maxBps - feeBps)))`.
-   - **Overflow-safe division (hugeDivide)**: Both formulas above
-     are of the form `result = round(A * B / C)` where `A` is a
-     small constant (≤10000) and `B`, `C` are products of two i64
-     values (fitting in u128). The product `A * B` can overflow
-     u128 when pool reserves are large. Implementations MUST use
-     the decomposition: `Q = B / C`, `R = B % C`, then
-     `result = A*Q + round(A*R / C)` (floor for strict-send,
-     ceil for strict-receive), which avoids computing `A * B`
-     directly. If the final result exceeds `INT64_MAX`, the
-     exchange is not possible (return false) — this MUST NOT be
-     treated as an internal error.
-   - Note: `NORMAL` rounding mode (ManageSellOffer/ManageBuyOffer)
-     does NOT cross liquidity pools — only path payments do.
-   - Update pool reserves.
-5. Repeat until the requested amount is fulfilled or no more
-   offers/pools are available.
-6. Enforce `MAX_OFFERS_TO_CROSS` (1000) across all crossings
-   `@version(≥11)`.
-
-**Self-crossing prevention**: An offer MUST NOT cross another offer
-from the same account. If detected, the operation fails with
-`OFFER_CROSS_SELF`.
-
-#### 7.29.1 Exchange Algorithm (exchangeV10)
-
-`@version(≥10)` (CAP-0004): The exchange function computes the
-amounts exchanged when two offers cross. Terminology:
-- **wheat**: the aggressor offer (from the operation).
-- **sheep**: the passive offer (from the order book).
-- `price = { n, d }`: the sheep offer's price (sheep per wheat).
-
-**Sizing**:
-```
-wheatValue = min(maxWheatSend * price.n, maxSheepReceive * price.d)
-sheepValue = min(maxWheatReceive * price.n, maxSheepSend * price.d)
-wheatStays = (wheatValue > sheepValue)
+function convertWithOffersAndPools(ltx, sheep, maxSheepSent, sheepSend,
+                                   wheat, maxWheatReceive, wheatReceived,
+                                   round, filter, offerTrail, maxOffersToCross):
+    while sheepSend < maxSheepSent and wheatReceived < maxWheatReceive:
+        bestOffer = loadBestOffer(ltx, wheat, sheep)
+        bestPool = loadLiquidityPool(ltx, wheat, sheep)
+        if bestOffer:
+            filterResult = filter(bestOffer)
+            if filterResult == eStopBadPrice: return eFilterStopBadPrice
+            if filterResult == eStopCrossSelf: return eFilterStopCrossSelf
+            if filterResult == eSkipFrozen: skip and continue
+            # cross offer or pool whichever has better price (pre/post-V_18)
+        crossesSoFar += 1
+        if crossesSoFar > maxOffersToCross: return eCrossedTooMany
+        ...
+    return eOK if reached maxes, ePartial otherwise
 ```
 
-**Rounding guarantees**:
-1. The smaller offer is always fully consumed (removed from book).
-2. Rounding error favors the offer that stays in the book.
-3. In `NORMAL` mode: if the rounding would cause > 1% price error
-   for either party, no trade occurs and the smaller offer is
-   removed with zero exchange amounts.
-4. In `PATH_PAYMENT_STRICT_RECEIVE` mode: the rounding may favor the
-   wheat side (book) by an arbitrary amount (the path payment's
-   `sendMax` provides protection).
-5. In `PATH_PAYMENT_STRICT_SEND` mode: `sheepSend > 0` is always
-   guaranteed when a trade occurs.
-6. Regardless of rounding mode or resulting amounts, a `ClaimAtom`
-   is emitted for every offer crossing. When `wheatReceive = 0`
-   (e.g., strict-send with rounding to zero on the receive side),
-   the `ClaimAtom` with zero amounts is still recorded.
+The exchange engine has been the subject of multiple protocol-version
+fixes (see `exchangeV2`, `exchangeV3`, `exchangeV10` in
+`OfferExchange.cpp`); the rounding rules are stable from V_10 onward.
 
-**Computation branches** (determined by `wheatStays`, `price.n`
-vs `price.d`, and rounding mode):
-- When `wheatStays` and `STRICT_SEND`:
-  `wheatReceive = floor(sheepValue / price.n)`,
-  `sheepSend = min(maxSheepSend, maxSheepReceive)`.
-- When `wheatStays` and (`price.n > price.d` or `STRICT_RECEIVE`):
-  `wheatReceive = floor(sheepValue / price.n)`,
-  `sheepSend = ceil(wheatReceive * price.n / price.d)`.
-- When `wheatStays` and `price.n <= price.d` (NORMAL only):
-  `sheepSend = floor(sheepValue / price.d)`,
-  `wheatReceive = floor(sheepSend * price.d / price.n)`.
-- When `!wheatStays` and `price.n > price.d`:
-  `wheatReceive = floor(wheatValue / price.n)`,
-  `sheepSend = floor(wheatReceive * price.n / price.d)`.
-- When `!wheatStays` and `price.n <= price.d`:
-  `sheepSend = floor(wheatValue / price.d)`,
-  `wheatReceive = ceil(sheepSend * price.d / price.n)`.
+### 10.3 Cross-Self
 
-After computation, a 1% price error threshold is applied:
-- In `NORMAL` mode: the check is **symmetric** — if the relative
-  error between the nominal price and the effective price exceeds 1%
-  in **either** direction, the exchange is zeroed out (both
-  `sheepSend` and `wheatReceive` set to 0, and the smaller offer is
-  removed).
-- In path payment modes (`STRICT_SEND`, `STRICT_RECEIVE`): the check
-  is **one-directional** — error favoring the wheat seller (book
-  offer) is unbounded (the path payment's `sendMax`/`destMin`
-  provides protection), while error favoring the sheep seller must
-  not exceed 1%.
+When an offer's `sellerID == source`, the entire conversion fails with
+`eStopCrossSelf` ⇒ caller emits `..._OFFER_CROSS_SELF` /
+`..._CROSS_SELF`.
+
+### 10.4 Pool Crossing
+
+Liquidity pools participate alongside offers from V_18+. The chosen
+counterparty per step is whichever offers a better effective price.
+Pool fee is encoded in `params.fee` (basis points). Conversion uses
+`exchangeWithPool` and produces `ClaimAtom` of type
+`CLAIM_ATOM_TYPE_LIQUIDITY_POOL`.
+
+### 10.5 Cross Limit
+
+`getMaxOffersToCross()` returns a fixed protocol-wide cap (1000 in
+v26.0.1). When exceeded, the operation fails with
+`opEXCEEDED_WORK_LIMIT`. This applies from
+`FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS = V_11`.
 
 ---
 
-## 8. Soroban Execution
+## 11. Soroban Execution
 
-### 8.1 Soroban Transaction Structure
+### 11.1 Structure
 
-A Soroban transaction MUST:
-1. Contain exactly one operation of type `INVOKE_HOST_FUNCTION`,
-   `EXTEND_FOOTPRINT_TTL`, or `RESTORE_FOOTPRINT`.
-2. Carry `SorobanTransactionData` in `Transaction.ext` (v=1).
-3. Declare all ledger keys it will access in the footprint.
+A Soroban tx carries exactly one operation
+(`INVOKE_HOST_FUNCTION`, `EXTEND_FOOTPRINT_TTL`, or
+`RESTORE_FOOTPRINT`) plus `SorobanTransactionData` in the envelope
+extension. The op MUST be supported at `@version(≥SOROBAN_PROTOCOL_VERSION
+= V_20)`.
 
-### 8.2 Soroban Fee Model
+### 11.2 Fee Model
 
-The Soroban fee has two components:
+Resource fee = `non_refundable_fee + refundable_fee` where
+`non_refundable_fee` covers fixed costs (instructions, footprint reads,
+disk reads, writes, tx size) and `refundable_fee` covers metered
+runtime costs (rent + event bytes). The
+`rust_bridge::compute_transaction_resource_fee` function returns these
+two scalars based on
+`(protocolVersion, currentLedgerProtocolVersion, CxxTransactionResources,
+rustBridgeFeeConfiguration)`. See §6.5 for refund handling.
 
-```
-totalFee = inclusionFee + declaredResourceFee
-```
+`CxxTransactionResources` fields populated at fee phase:
+- `instructions`
+- `disk_read_entries` — V_23+: `getNumDiskReadEntries`; pre-V_23: just
+  `readOnly.size()`
+- `write_entries` — `readWrite.size()`
+- `disk_read_bytes`, `write_bytes` — declared
+- `transaction_size_bytes` — xdr_size of the envelope
+- `contract_events_size_bytes` — 0 at fee phase (refunded later)
 
-The `declaredResourceFee` is split by the resource fee computation
-function into:
+### 11.3 Validation
 
-```
-FeePair {
-    nonRefundableFee,   // compute + bandwidth + historical reads
-    refundableFee       // rent + events
-}
-```
+`checkSorobanResources` (§5.2 step 6) enforces resource caps,
+footprint validity, footprint disjointness, archived-entry index
+validity, and tx size cap.
 
-The refundable fee tracker is initialized with:
-```
-maxRefundable = declaredResourceFee - nonRefundableFee
-```
+`doCheckValidForSoroban` per op (§§8.22–8.24) does op-specific
+structural checks.
 
-During execution, rent fees and event emission fees are charged against
-the refundable budget. After execution:
-```
-refund = max(0, maxRefundable - consumedRentFee - consumedEventsFee)
-```
+### 11.4 Host Function Invocation
 
-The refund is returned to the fee source and subtracted from
-`feeCharged`.
+`rust_bridge::invoke_host_function` is the boundary into the Rust
+Soroban host. It takes:
 
-**Resource fee computation**: The implementation MUST use the
-network-configured fee rates to compute the resource fee:
+- Protocol version (current + target).
+- ENABLE_SOROBAN_DIAGNOSTIC_EVENTS flag.
+- Declared `instructions` budget.
+- The serialized `HostFunction` (Invoke / Upload / CreateContract /
+  CreateContractV2).
+- Serialized `SorobanResources`.
+- Auto-restored RW entry indices.
+- Source account ID.
+- Auth entries.
+- `CxxLedgerInfo`: protocol version, ledger seq, base reserve, close
+  time, memory limit, min/max TTLs, network ID, cost params.
+- Ledger entry buffers + TTL buffers (parallel arrays).
+- Base PRNG seed.
+- Rent fee config.
+- Module cache (shared compiled Wasm).
 
-| Resource | Fee Rate Parameter |
-|----------|--------------------|
-| Read ledger entry | `feeReadLedgerEntry` (per entry) |
-| Write ledger entry | `feeWriteLedgerEntry` (per entry) |
-| Read 1KB | `feeRead1KB` |
-| Historical 1KB | `feeHistorical1KB` |
-| Transaction size 1KB | `feeTransactionSize1KB` |
-| Contract events 1KB | `feeContractEvents1KB` |
-| CPU instructions (per 10000) | `feeRatePerInstructionsIncrement` |
+Returns `InvokeHostFunctionOutput` containing: success flag, modified
+entries, contract events, return value, CPU/mem usage, rent fee,
+diagnostic events.
 
-### 8.3 Soroban Validation
+### 11.5 Diagnostic Events
 
-Beyond the standard validation (Section 4), Soroban transactions
-undergo additional resource validation (Section 4.9). The computed
-resource fee MUST be ≤ the declared `resourceFee`.
+When `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS` is on, the host's diagnostic
+events plus implementation-injected `core_metrics` events are appended
+to the diagnostic buffer in op meta. These are advisory only and not
+part of consensus.
 
-### 8.4 InvokeHostFunction Execution
+### 11.6 Parallel Execution
 
-```
-function doApply(op, ltx):
-    // 1. Load footprint entries
-    // NOTE: When loading entries, the full LedgerEntry structure
-    // including ext (sponsorship data) and lastModifiedLedgerSeq
-    // MUST be preserved from the source (BucketList or in-memory
-    // state). The host meters CPU based on XDR-encoded entry sizes,
-    // and V1 entries with sponsorship data are larger than V0.
-    addFootprint(op.sorobanResources, ltx):
-        for each key in footprint (readOnly + readWrite):
-            entry = loadEntry(key, ltx)
-            check TTL liveness
-            @version(≥23): handle archived entries (auto-restore,
-                see details below)
-            meter disk read bytes:
-                @version(<23): meter for all entries
-                @version(≥23): meter only for disk-read entries
-                    (classic entries + archived Soroban entries;
-                     skip live in-memory Soroban entries, CAP-0066)
-            validate entry size limits
+`@version(≥V_23)` Soroban transactions in tx-set parallel stages run
+under `ThreadParallelApplyLedgerState`. The flow is:
 
-    // The loaded entries are collected into two parallel vectors:
-    //   encodedLedgerEntries[i]  — XDR-encoded LedgerEntry (or empty)
-    //   encodedTtlEntries[i]     — XDR-encoded TtlEntry (or empty)
-    //
-    // IMPORTANT: Positional alignment invariant.
-    // These vectors MUST be 1:1 positionally aligned with the
-    // footprint keys (readOnly keys ++ readWrite keys). The Soroban
-    // host maps entries to footprint keys by vector index, not by
-    // key lookup. Every footprint key MUST have a corresponding slot
-    // in both vectors, even if the entry does not exist in the
-    // current ledger state. For missing entries, the slot contains
-    // an empty buffer (zero-length XDR). Skipping a missing entry
-    // (i.e., not inserting a slot) shifts all subsequent entries and
-    // causes the host to execute with misaligned key-entry pairs.
+1. **preParallelApply** (sequential): per tx, charges fee, processes
+   seq num, validates signatures, runs the op's `checkValid`. Sets up
+   the refundable-fee tracker. Pushes `pushTxChangesBefore` to meta.
+2. **parallelApply** (concurrent): per tx, runs `doParallelApply`
+   against the thread state. On success, returns a
+   `ParallelTxSuccessVal{ modifiedEntryMap, restoredEntries }` that the
+   thread merges back.
+3. **Merge** (sequential, post-stage): thread-state successes update
+   the global parallel state; only on the next stage do the writes
+   become visible.
+4. **processPostApply** (sequential): refunds (no-op pre-V_23) plus
+   meta finalization.
+5. **processPostTxSetApply** (sequential, post-everything,
+   `@version(≥V_23)`): emits Soroban refund fee events with
+   `STAGE_AFTER_ALL_TXS`.
 
-    // 2. Invoke host function via Soroban runtime
-    result = invokeHostFunction(
-        hostFunction = op.hostFunction,
-        auth = op.auth,
-        resources = sorobanResources,
-        ledgerEntries = encodedLedgerEntries,
-        ttlEntries = encodedTtlEntries,
-        ledgerInfo = current ledger info
-    )
-
-    if result.isError:
-        return INVOKE_HOST_FUNCTION_TRAPPED
-
-    // 3. Record storage changes
-    // 3a. Upsert/delete entries the host explicitly returned
-    for each modified entry in result:
-        if entry was deleted:
-            delete entry and its TTL entry from ltx
-        else:
-            upsert entry in ltx
-            validate write byte limits
-
-    // 3b. Erase unreturned read-write entries
-    for each key in readWrite footprint:
-        if key NOT in result.createdAndModifiedKeys:
-            erase the entry and its TTL entry from ltx (if they exist)
-
-    // 4. Collect events
-    events = result.contractEvents
-    validate total events size ≤ txMaxContractEventsSizeBytes
-
-    // 5. Consume refundable resources
-    charge rent fee against refundable budget
-    charge events fee against refundable budget
-    if insufficient: INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE
-
-    // 6. Finalize
-    set return value in result
-    hash success preimage for result
-```
-
-**Host function types**:
-- `HOST_FUNCTION_TYPE_INVOKE_CONTRACT`: Invoke a contract function.
-- `HOST_FUNCTION_TYPE_CREATE_CONTRACT`: Create a new contract instance.
-- `HOST_FUNCTION_TYPE_UPLOAD_WASM`: Upload a Wasm module.
-- `HOST_FUNCTION_TYPE_CREATE_CONTRACT_V2` `@version(≥22)`: Create a
-  contract with constructor arguments. Uses `CreateContractArgsV2`
-  which includes `contractIDPreimage`, `executable`, and
-  `constructorArgs<>` (vector of `SCVal`).
-
-**Create-contract pairing rules**:
-- If `contractIDPreimage.type() == CONTRACT_ID_PREIMAGE_FROM_ASSET`,
-  then `executable.type()` MUST be
-  `CONTRACT_EXECUTABLE_STELLAR_ASSET`.
-- If `contractIDPreimage.type() == CONTRACT_ID_PREIMAGE_FROM_ADDRESS`,
-  then `executable.type()` MUST be `CONTRACT_EXECUTABLE_WASM`.
-- Any other preimage/executable pairing is invalid.
-
-These rules are enforced during transaction admission and
-transaction-set construction. A transaction violating them MUST be
-rejected with `txSOROBAN_INVALID`.
-
-  **Constructor semantics** (CAP-0058):
-  - A Wasm exporting `__constructor` is considered to have a
-    constructor, but only if the Wasm's Soroban environment version
-    is ≥22.  Pre-v22 environment Wasms never have constructor
-    semantics even if they export `__constructor`.
-  - When creating a contract from constructor-enabled Wasm, the host
-    calls `__constructor` with the provided `constructorArgs`
-    immediately after creating the contract instance entry. If
-    `__constructor` fails (trap, error, or returns a non-Void value),
-    creation fails and all changes are rolled back.
-  - If a contract without a constructor is given ≥1 constructor
-    arguments, creation fails.
-  - Contracts without a constructor may be treated as having a
-    "default" 0-argument constructor. Passing 0 arguments succeeds.
-  - The legacy `HOST_FUNCTION_TYPE_CREATE_CONTRACT` is preserved for
-    backward compatibility: it works for contracts with no constructor
-    or an explicitly defined 0-argument constructor.
-  - Constructors are NOT called on Wasm updates, only on initial
-    creation.
-  - **Authorization**: `SOROBAN_AUTHORIZED_FUNCTION_TYPE_CREATE_CONTRACT_V2_HOST_FN`
-    authorizes `CreateContractArgsV2` payloads. The legacy
-    `SOROBAN_AUTHORIZED_FUNCTION_TYPE_CREATE_CONTRACT_HOST_FN` may
-    still be used for contracts with 0 constructor arguments.
-
-**Entry liveness**: An entry is **live** at ledger `L` if its TTL entry
-has `liveUntilLedgerSeq ≥ L`. Archived entries (not live) MUST NOT be
-accessed unless being restored.
-
-**Auto-restore** `@version(≥23)`: If `SorobanTransactionData.ext`
-contains `archivedSorobanEntries`, the listed entries are restored from
-the hot archive before execution. The restoration cost (rent fee) is
-charged against the refundable budget.
-
-**handleArchivedEntry detail** `@version(≥23)`: For each archived entry
-in the read-write footprint that is marked in `archivedSorobanEntries`:
-- Validate entry size and meter disk read bytes.
-- **Hot archive entries** (evicted from live state): Create (INIT) the
-  DATA entry and a new TTL entry in the per-operation LedgerTxn. Record
-  the key as a hot archive restore.
-- **Live BucketList archived entries** (expired but not yet evicted):
-  Update the existing TTL entry's `liveUntilLedgerSeq` to
-  `currentLedgerSeq + minPersistentTTL - 1`. Record as a live BucketList
-  restore.
-- Archived entries in the **read-only** footprint are NOT auto-restored;
-  they fail with `INVOKE_HOST_FUNCTION_ENTRY_ARCHIVED`.
-
-**Erase-RW loop (step 3b)**: After recording the host's storage changes,
-the implementation iterates over all read-write footprint keys. Any key
-NOT present in the host's returned `createdAndModifiedKeys` set has its
-entry and TTL entry erased from the LedgerTxn. This is essential for
-correctness of auto-restored entries that were only read (not written
-back) by the host.
-
-**Read-only access to auto-restored entries**: When a hot-archive
-auto-restored entry is read by the host but not written back, the
-erase-RW loop (step 3b) removes the DATA INIT and TTL INIT created by
-`handleArchivedEntry`. Because INIT + erase = annihilation (see
-LEDGER_SPEC §6.4.4), the net effect on the live bucket list is zero.
-Only the `HOT_ARCHIVE_LIVE` tombstone in the hot archive bucket list
-persists. This ensures that read-only access to an archived entry does
-not leave any residual state in the live bucket list.
-
-**Unconditional restoration visibility**: Although the erase-RW loop
-annihilates read-only hot-archive restorations within the per-operation
-LedgerTxn (producing zero net state in the live bucket list), the
-restoration itself MUST be recorded unconditionally in the transaction's
-state output (entry map / delta) so that the restored entry is visible
-to subsequent transactions in the same ledger. In stellar-core,
-`handleArchivedEntry` calls `mOpState.upsertEntry(lk, le, ...)`
-which writes the entry to the `globalEntryMap` outside the LedgerTxn
-scope, ensuring it persists regardless of the erase-RW loop's
-annihilation. A conforming implementation MUST ensure that hot-archive
-restored entries appear as INIT entries in the transaction's committed
-delta even when the host does not emit storage changes for them.
-
-**Failure rollback**: When InvokeHostFunction returns a non-success
-result (`TRAPPED`, `INSUFFICIENT_REFUNDABLE_FEE`,
-`RESOURCE_LIMIT_EXCEEDED`, etc.), the operation has failed. Per
-Section 6.4, the per-operation `LedgerTxn` is NOT committed — all
-storage modifications made during the invocation (contract data
-creates, updates, and deletes) are rolled back to their
-pre-invocation state. The transaction result is `txFAILED`, and the
-parent `LedgerTxn` is also not committed. The fee remains charged
-(per Section 2.3). Subsequent transactions in the same ledger MUST
-see the pre-invocation state of all entries that were in the failed
-transaction's footprint.
-
-### 8.5 ExtendFootprintTTL Execution
-
-Extends the time-to-live of Soroban ledger entries.
-
-**Validation**:
-- The read-write footprint MUST be empty.
-- The read-only footprint MUST contain only Soroban entry types
-  (`CONTRACT_DATA`, `CONTRACT_CODE`).
-- `extendTo` MUST be ≤ `maxEntryTTL - 1`.
-- Result: `EXTEND_FOOTPRINT_TTL_MALFORMED`.
-
-**Execution**:
-1. For each key in the read-only footprint:
-   - Load the entry and its TTL entry.
-   - Skip if entry is archived, missing, or already has sufficient TTL.
-   - Compute `newTTL = currentLedgerSeq + extendTo`.
-   - If `newTTL > currentTTL`: compute rent fee for the extension.
-   - Charge rent fee against refundable budget.
-   - Update TTL entry with the new `liveUntilLedgerSeq`.
-2. Result: `RESOURCE_LIMIT_EXCEEDED` if disk read/write byte limits
-   exceeded, `INSUFFICIENT_REFUNDABLE_FEE` if rent exceeds budget.
-
-### 8.6 RestoreFootprint Execution
-
-Restores archived Soroban ledger entries to live state.
-
-**Validation**:
-- The read-only footprint MUST be empty.
-- The read-write footprint MUST contain only persistent Soroban entry
-  types (`CONTRACT_DATA` with `PERSISTENT` durability, or
-  `CONTRACT_CODE`). Temporary entries MUST NOT be restored.
-- Result: `RESTORE_FOOTPRINT_MALFORMED`.
-
-**Execution**:
-1. For each key in the read-write footprint:
-   - Load the TTL entry.
-   - If TTL exists and entry is still live: skip.
-   - `@version(≥23)`: If TTL is missing, check the hot archive for
-     evicted entries.
-   - Meter disk read/write bytes.
-   - Compute rent fee for restoration (from current ledger to
-     `minPersistentTTL`).
-   - Charge rent fee against refundable budget.
-   - Set TTL entry `liveUntilLedgerSeq = currentLedgerSeq +
-     minPersistentTTL - 1`.
-   - Mark entry as restored in metadata.
-2. Result: `RESOURCE_LIMIT_EXCEEDED`, `INSUFFICIENT_REFUNDABLE_FEE`.
-
-**Hot archive interaction**: Entries restored from the hot archive
-during RestoreFootprint execution record hot archive restore keys in
-the per-operation LedgerTxn. If the operation fails, these keys are
-discarded on rollback (see Section 9.2).
-
-### 8.7 Parallel Soroban Execution
-
-`@version(≥23)`: Soroban transactions MAY be grouped into a parallel
-execution structure of stages and clusters. The stage/cluster model,
-footprint conflict rules, instruction budget, cluster limits, and
-canonical ordering are defined in **HERDER_SPEC §7** ("Parallel
-Soroban Transaction Sets").
-
-**Execution model**:
-1. For each stage:
-   a. Create a read-only snapshot of the current ledger state.
-   b. For each cluster (potentially in parallel):
-      - Create a thread-local writable state layer. Read-only TTL
-        bumps (from `ExtendFootprintTTL` operations) are deferred:
-        they are recorded for transaction metadata but NOT applied
-        to the thread-local state's TTL entries immediately.
-      - For each transaction in the cluster, sequentially:
-        i. **Flush deferred RO TTL bumps for write footprint keys**
-           (`flushRoTTLBumpsInTxWriteFootprint`): For each Soroban
-           entry key (`CONTRACT_DATA`, `CONTRACT_CODE`) in the
-           transaction's read-write footprint, if a deferred RO TTL
-           bump exists for that key (from a prior transaction in this
-           cluster), apply it to the thread-local TTL state and remove
-           it from the deferred set. This MUST occur before the
-           transaction snapshot (next step), so that flushed values
-           survive transaction rollback.
-        ii. Snapshot the thread-local state (for rollback on failure).
-        iii. Execute the transaction against the thread-local state.
-        iv. On success: commit changes; deferred RO TTL bumps from
-            this transaction are retained.
-        v. On failure: roll back the thread-local state to the
-           snapshot, including rolling back any deferred RO TTL bumps
-           recorded by this transaction.
-      - Record results and metadata.
-   c. After all clusters complete: merge thread-local state changes
-      into the global ledger state. Any remaining deferred read-only
-      TTL bumps (not already flushed in step 1b-i) are applied to
-      TTL entries. Read-only TTL extensions across clusters are
-      merged using maximum values.
-2. After all stages: commit all changes to the main ledger transaction.
-
-**Inter-stage entry visibility**: The read-only snapshot created at the
-start of each stage (step 1a) MUST reflect all state changes from prior
-stages, including hot-archive entries restored by prior-stage
-transactions that were only read (not modified) by the host. See
-"Unconditional restoration visibility" in Section 8.4.
-
-**Pre-parallel apply**: For each Soroban transaction in the parallel
-phase, the following steps are performed on the main thread before
-parallel execution begins:
-1. Fee deduction and sequence number advancement (already done in
-   Section 5.4).
-2. Signature verification.
-3. Operation validation (`doCheckValid`).
-
-**Failed pre-apply handling**: If the pre-parallel apply phase
-determines the transaction cannot succeed — specifically, if the fee
-source account had insufficient balance during fee deduction (Section
-5.4) — the operation body is **not** executed. The pre-apply side
-effects (sequence number bump, signer removal) are committed, but
-the parallel executor returns immediately with a failure result:
-- `success = false`
-- `txChangesBefore` populated (sequence bump + signer removal)
-- `operations` meta array is empty (no operation changes, no events)
-- No hot archive restored keys are collected
-- No read-only TTL bumps are applied
-
-This matches stellar-core's `parallelApply`, which checks
-`if (!txResult.isSuccess()) return {false, {}}` immediately after
-`preParallelApply`.
+Conflict detection (footprint-based) is the herder's responsibility
+(`HERDER_SPEC §5.3`).
 
 ---
 
-## 9. State Management
+## 12. State Management
 
-The nested ledger transaction (ltx) model — including hierarchy,
-entry states, commit/rollback semantics, merge rules, and entry
-loading — is defined in **LEDGER_SPEC §6** ("LedgerTxn: Nested
-Transactional State"). This section covers only the aspects specific
-to transaction execution.
+### 12.1 LedgerTxn Layering
 
-### 9.1 Root Commit Batch Size
+A transaction operates within a hierarchy of `LedgerTxn` nested
+transactions:
 
-When the root ltx's child is committed, entries are committed in
-batches of 4095 (`0xFFF`).
+```
+LedgerManagerImpl::applyTransactions
+  └─ outer ltx (per-ledger)
+      └─ ltxTx                      (TransactionFrame::applyOperations)
+          └─ ltxOp                  (per-op sub-ltx)
+              └─ inner sub-ltx      (often, e.g., addOrChangeSigner)
+```
 
-### 9.2 Restored Entries
+See `LEDGER_SPEC §6.2` for the LedgerTxn nesting and single-child
+invariant.
 
-`@version(≥23)`: The ltx tracks entries restored during Soroban
-execution in two categories:
+### 12.2 Entry Operations from Op Code
 
-- **Hot archive restores**: Entries restored from the evicted entry
-  archive.
-- **Live BucketList restores**: Entries restored from the live
-  BucketList with TTL extensions.
+- `ltx.create(entry)` — INIT state; new entry that doesn't exist.
+- `ltx.load(key)` / `ltx.loadWithoutRecord(key)` — read live entry
+  (recorded vs. not recorded for change tracking).
+- `entry.erase()` — mark as DELETED.
 
-These are propagated through commit and discarded on rollback.
+Inner-snapshot reads (`@version(<V_8)`) intentionally preserve a buggy
+account cache; see §7.5 and `TransactionFrame::loadSourceAccount`.
 
-**Consequence for hot archive tombstones**: Because hot archive restore
-keys are tracked in the LedgerTxn and follow commit/rollback semantics,
-a failed operation's LedgerTxn rollback (Section 6.4) discards any hot
-archive restore keys set up during that operation's execution (e.g., by
-`handleArchivedEntry` during footprint loading). Similarly, if the
-entire transaction fails (e.g., `txFAILED` because an operation failed,
-or insufficient fee balance during pre-apply), no hot archive restore
-keys from that transaction reach the root LedgerTxn. As a result, no
-`HOT_ARCHIVE_LIVE` tombstones are written to the Hot Archive BucketList
-for entries that were tentatively restored during a failed operation or
-transaction.
+### 12.3 Single-Child Invariant
+
+A `LedgerTxn` has at most one active child at any time. Operations
+that open sub-ltx's MUST commit or roll them back before opening a
+sibling. The op apply pipeline enforces this via stack-allocated
+`LedgerTxn` RAII.
+
+### 12.4 Last-Modified Stamping
+
+On `commit`, `LedgerTxn` sets `lastModifiedLedgerSeq` on every modified
+entry to the current `ledgerSeq` from the loaded header. Hot-archive
+restores override this with the current ledger seq (§8.24).
+
+### 12.5 RestoredEntries Tracking
+
+Parallel-apply tracks two restore sets per tx:
+- `liveBucketlistRestores` — entries that existed in the live
+  BucketList but were expired.
+- `hotArchiveRestores` — entries pulled from the Hot Archive.
+
+Both maps are surfaced via `ParallelTxSuccessVal` and consumed by the
+meta builder (§13.3) to emit `LEDGER_ENTRY_RESTORED` change records.
 
 ---
 
-## 10. Metadata Construction
+## 13. Metadata Construction
 
-### 10.1 Transaction Meta Versions
+### 13.1 Versions
 
-Transaction metadata version depends on the protocol:
+`TransactionMetaBuilder` selects a `TransactionMeta` XDR version based
+on protocol:
 
-| Protocol | Meta Version | Key Additions |
-|----------|-------------|---------------|
-| <20 | v2 | Classic operations only. |
-| 20–22 | v3 | Adds `SorobanTransactionMeta` with events, return value, diagnostics. |
-| ≥23 | v4 | Per-operation events, transaction-level events, `SorobanTransactionMetaV2`. See CAP-0067. |
+| Protocol | Version | Notes |
+|----------|---------|-------|
+| `<V_10` | `TransactionMetaV0` | Initial flat operations meta. |
+| `V_10..<V_20` | `TransactionMetaV1` | Adds `txChangesBefore`. |
+| `V_20..<V_23` | `TransactionMetaV2` | Adds `txChangesAfter`, Soroban return value, diagnostic events. |
+| `≥V_23` | `TransactionMetaV3` (or `V4` in newer ledgers) | Adds Soroban events, restore changes, autorestore-aware op changes. |
 
-### 10.2 Meta Structure
+### 13.2 Structure
 
-Each transaction's metadata contains:
+Each meta carries:
 
-1. **`txChangesBefore`**: Ledger entry changes from fee deduction and
-   sequence number advancement (Section 5.4). These are recorded as
-   STATE→UPDATED or STATE→CREATED change pairs.
+- `txChangesBefore` — ledger changes from `commonPreApply` (fee
+  consumption, seq update, one-time signer removal during fast-fail).
+- `operations` — per-op `OperationMeta` with `changes` (ledger entry
+  changes), events, and Soroban output.
+- `txChangesAfter` — refund changes and (pre-V_10) post-apply one-time
+  signer removal.
+- Optional Soroban metadata: return value, contract events, diagnostic
+  events.
 
-2. **`operations`**: An array of `OperationMeta` (v2/v3) or
-   `OperationMetaV2` (v4), one per operation. Each records:
-   - The ledger entry changes made by that operation.
-   - `@version(≥23)` (v4): Contract events emitted by that operation
-     (`ContractEvent events<>`).
+### 13.3 Change Types
 
-3. **`txChangesAfter`**: Ledger entry changes from post-apply
-   processing (Soroban fee refunds). Empty for classic transactions.
+`LedgerEntryChange` is a tagged union:
 
-4. **`sorobanMeta`** (v3/v4): Present for Soroban transactions,
-   including those that fail during pre-apply (e.g., insufficient fee
-   balance). stellar-core's `setNonRefundableResourceFee()` activates
-   the soroban meta field in `commonPreApply` before any failure path,
-   so even a failed Soroban TX produces soroban meta with fee extension
-   fields when the Soroban resource fee has been set. Contents:
-   - Contract events (v3: all events here; v4: events moved to
-     per-operation `OperationMetaV2.events`).
-   - Return value from host function invocation.
-   - Diagnostic events (v3 only; v4 uses `diagnosticEvents` at
-     transaction level).
-   - `@version(≥23)` (v4): `SorobanTransactionMetaV2` with extended
-     fields: `nonRefundableResourceFeeCharged`,
-     `rentFeeCharged`, `totalRefundableResourceFeeCharged`.
+| Type | Meaning |
+|------|---------|
+| `LEDGER_ENTRY_CREATED` | New entry. |
+| `LEDGER_ENTRY_UPDATED` | Existing entry mutated. |
+| `LEDGER_ENTRY_REMOVED` | Entry deleted. |
+| `LEDGER_ENTRY_STATE` | Original state captured before an UPDATED change. |
+| `LEDGER_ENTRY_RESTORED` (`@version(≥V_23)`) | Entry restored from archive. |
 
-5. **`events`** (v4 only): Transaction-level `TransactionEvent`
-   entries. Used for fee charge/refund events (Section 11.4).
+`processOpLedgerEntryChanges` (TransactionMeta.cpp) post-processes
+operation changes to convert CREATE/UPDATE pairs into RESTORE records
+for restored entries (Hot Archive or live BucketList restores).
 
-6. **`diagnosticEvents`** (v4 only): Transaction-level diagnostic
-   events (`DiagnosticEvent` entries).
+### 13.4 Recording
 
-### 10.3 XDR Structures (v4)
-
-`@version(≥23)`:
-
-```
-TransactionMetaV4 {
-    ext:              ExtensionPoint,
-    txChangesBefore:  LedgerEntryChanges,
-    operations:       OperationMetaV2[],
-    txChangesAfter:   LedgerEntryChanges,
-    sorobanMeta:      SorobanTransactionMetaV2*,  // optional
-    events:           TransactionEvent[],
-    diagnosticEvents: DiagnosticEvent[],
-}
-
-OperationMetaV2 {
-    ext:     ExtensionPoint,
-    changes: LedgerEntryChanges,
-    events:  ContractEvent[],
-}
-
-TransactionEvent {
-    stage: TransactionEventStage,  // BEFORE_ALL_TXS or AFTER_ALL_TXS
-    event: ContractEvent,
-}
-
-SorobanTransactionMetaV2 {
-    ext:         SorobanTransactionMetaExt,
-    returnValue: SCVal*,  // optional
-}
-```
-
-`SorobanTransactionMetaExt` may contain (v1 extension):
-`nonRefundableResourceFeeCharged`, `rentFeeCharged`,
-`totalRefundableResourceFeeCharged`.
-
-### 10.4 Ledger Entry Change Types
-
-| Change Type | Meaning |
-|-------------|---------|
-| `LEDGER_ENTRY_STATE` | Snapshot of entry before modification. |
-| `LEDGER_ENTRY_CREATED` | New entry was created. |
-| `LEDGER_ENTRY_UPDATED` | Existing entry was modified. |
-| `LEDGER_ENTRY_REMOVED` | Entry was deleted. |
-| `LEDGER_ENTRY_RESTORED` | Entry was restored from archive. `@version(≥23)`. |
-
-Changes are recorded as pairs:
-- **Created**: `CREATED` (no preceding STATE).
-- **Updated**: `STATE` (before) → `UPDATED` (after).
-- **Removed**: `STATE` (before) → `REMOVED`.
-- **Restored**: `RESTORED` (replaces what would otherwise be CREATED
-  for hot archive restores, or replaces STATE for live BucketList
-  restores). `@version(≥23)`.
-
-### 10.5 Change Recording
-
-Changes are computed by comparing the entry map of the committed ltx
-against the parent's state:
-
-- If an entry is INIT in the committed ltx and does not exist in the
-  parent: emit `CREATED`.
-- If an entry is LIVE in the committed ltx and differs from the
-  parent: emit `STATE` (parent version) then `UPDATED` (new version).
-- If an entry is DELETED in the committed ltx and existed in the
-  parent: emit `STATE` (parent version) then `REMOVED` (key only).
+`TransactionMetaBuilder::pushTxChangesBefore(ltx)` captures the
+delta from the supplied ltx into the `txChangesBefore` vector.
+`OperationMetaBuilder::setLedgerChanges` does the same per-op. The op
+delta is taken once per op, in order, capturing the diff at the moment
+of op success.
 
 ---
 
-## 11. Event Emission
+## 14. Event Emission
 
-`@version(≥23)`: Classic operations emit **Stellar Asset Contract
-(SAC) events** for all asset movements. These are placed in
-per-operation `OperationMetaV2.events` for operation-level events
-and `TransactionMetaV4.events` for transaction-level events (fees).
-See CAP-0067.
+Three event streams are produced:
 
-Classic SAC events are NOT hashed into the ledger (unlike Soroban
-contract events which are hashed via `InvokeHostFunctionResult`).
+### 14.1 Transaction-Level Fee Events
 
-### 11.1 Event Structure
+A `TxEventManager` emits a `TransactionEvent` for fee charging and
+refund. The XDR `TransactionEventStage` indicates when:
 
-All SAC events use the following `ContractEvent` structure:
+- `TRANSACTION_EVENT_STAGE_BEFORE_ALL_TXS = 0` — reserved.
+- `TRANSACTION_EVENT_STAGE_AFTER_TX = 1` — refund event for Soroban
+  pre-V_23 (emitted in `processPostApply`).
+- `TRANSACTION_EVENT_STAGE_AFTER_ALL_TXS = 2` — refund event for
+  Soroban V_23+ (emitted in `processPostTxSetApply` after every tx in
+  the set is done).
 
-```
-ContractEvent {
-    type:       CONTRACT,
-    contractID: getAssetContractID(networkID, asset),
-    body: V0 {
-        topics: [eventName, ...addresses..., sep0011AssetString],
-        data:   <event-type-specific>,
-    },
-}
-```
+The fee event has form `{ topics: ["fee", feeSource], data: amount:i128 }`.
+Refunds are negative amounts.
 
-**Contract ID derivation**: The contract ID is the SHA-256 hash of
-`HashIDPreimage::ENVELOPE_TYPE_CONTRACT_ID` with `networkID` and
-`CONTRACT_ID_PREIMAGE_FROM_ASSET(asset)`. This is computed
-deterministically — the SAC does not need to be deployed.
+### 14.2 Operation-Level Events
 
-**SEP-0011 asset string**: The last topic is always an `SCV_STRING`:
-- Native: `"native"`
-- Credit alphanum4/12: `"<CODE>:<ISSUER_STRKEY>"`
+`OpEventManager` emits contract events for asset movements:
 
-**Address stripping**: All `SCAddress` values in topics have muxed
-info dropped: `SC_ADDRESS_TYPE_MUXED_ACCOUNT` is converted to
-`SC_ADDRESS_TYPE_ACCOUNT` using only the `ed25519` key.
+- `newTransferEvent(asset, from, to, amount, allowMuxedIdOrMemo)` —
+  `{topics: ["transfer", from, to, sep11asset], data: amount:i128}`.
+- `eventForTransferWithIssuerCheck(asset, from, to, amount, ...)` —
+  emits **mint** if `from == issuer`, **burn** if `to == issuer`,
+  otherwise transfer.
+- `newMintEvent`, `newBurnEvent`, `newClawbackEvent`,
+  `newSetAuthorizedEvent` — direct emission of those event shapes.
+- `eventsForClaimAtoms(source, claims)` — emits a chain of per-claim
+  transfer / mint / burn events according to issuer relationships.
 
-### 11.2 Event Types
+For Soroban ops, `setEvents(events)` replaces the buffer with the
+host-emitted contract events plus any P23 SAC reconciliation events.
 
-#### 11.2.1 `transfer`
+### 14.3 XLM Reconciliation
 
-```
-topics: [Symbol("transfer"), Address(from), Address(to), String(sep0011Asset)]
-data:   i128(amount)  OR  Map{Symbol("amount"): i128, Symbol("to_muxed_id"): <mux>}
-```
+For `@version(<V_8)`, `reconcileEvents(txSourceID, op, delta,
+opEventManager)` synthesizes transfer events from raw ledger entry
+deltas (because operations didn't natively emit events). This applies
+to all classic ops except `INFLATION`. From V_8 onward, ops emit events
+inline.
 
-#### 11.2.2 `mint`
+### 14.4 Classic SAC Format Updates
 
-```
-topics: [Symbol("mint"), Address(to), String(sep0011Asset)]
-data:   i128(amount)  OR  Map{Symbol("amount"): i128, Symbol("to_muxed_id"): <mux>}
-```
-
-#### 11.2.3 `burn`
-
-```
-topics: [Symbol("burn"), Address(from), String(sep0011Asset)]
-data:   i128(amount)
-```
-
-#### 11.2.4 `clawback`
-
-```
-topics: [Symbol("clawback"), Address(from), String(sep0011Asset)]
-data:   i128(amount)
-```
-
-#### 11.2.5 `set_authorized`
-
-```
-topics: [Symbol("set_authorized"), Address(id), String(sep0011Asset)]
-data:   Bool(authorized)
-```
-
-#### 11.2.6 `fee` (transaction-level only)
-
-```
-topics: [Symbol("fee"), Address(feeSource)]
-data:   i128(amount)
-```
-
-Fee events are wrapped in `TransactionEvent { stage, event }`.
-The `fee` event has no `sep0011Asset` topic — it is always native
-XLM, identified by the contract ID. Zero-amount fee events are
-suppressed.
-
-### 11.3 Muxed Data (`to_muxed_id`)
-
-The `data` field for `transfer` and `mint` events may be either a
-plain `i128(amount)` or an `SCV_MAP` containing both the amount and
-a muxed identifier. The map format is used when **all** of the
-following hold:
-
-1. The event's `allowMuxedIdOrMemo` flag is `true` (see per-operation
-   table below).
-2. The `to` address is either:
-   - `SC_ADDRESS_TYPE_MUXED_ACCOUNT` — `to_muxed_id` is
-     `U64(muxedAccount.id)`, OR
-   - `SC_ADDRESS_TYPE_ACCOUNT` with a non-`MEMO_NONE` transaction
-     memo — `to_muxed_id` is the memo value:
-     - `MEMO_TEXT` → `SCV_STRING`
-     - `MEMO_ID` → `SCV_U64`
-     - `MEMO_HASH` → `SCV_BYTES`
-     - `MEMO_RETURN` → `SCV_BYTES`
-
-`burn` and `clawback` events always use plain `i128(amount)`.
-
-### 11.4 Issuer Detection
-
-When an operation transfers assets using `transferWithIssuerCheck`,
-the event type is determined by whether `from` or `to` is the asset
-issuer:
-
-| `from` is issuer | `to` is issuer | Event emitted |
-|------------------|----------------|---------------|
-| No | No | `transfer` |
-| Yes | No | `mint` (issuer is source = minting) |
-| No | Yes | `burn` (sending to issuer = burning) |
-| Yes | Yes | `transfer` (issuer-to-issuer) |
-
-An address is the issuer only for credit assets (alphanum4/12),
-never for native or pool-share assets. For muxed accounts, only the
-underlying `ed25519` key is compared.
-
-### 11.5 Per-Operation Event Semantics
-
-| Operation | Events | `allowMuxedIdOrMemo` | Notes |
-|-----------|--------|---------------------|-------|
-| Payment | `transferWithIssuerCheck` | Yes | Single event; may be mint/burn for issuer. |
-| PathPaymentStrictReceive | claim-atom events + final `transferWithIssuerCheck` | No (claims), Yes (final) | One pair of events per claim atom; final event to destination. |
-| PathPaymentStrictSend | claim-atom events + final `transferWithIssuerCheck` | No (claims), Yes (final) | Same as strict-receive. |
-| CreateAccount | `transfer` (XLM) | Yes | Source → new account. |
-| AccountMerge | `transfer` (XLM) | Yes | Source → destination. |
-| Clawback | `clawback` | No | From the clawed-back account. |
-| ClawbackClaimableBalance | `clawback` | No | From the claimable balance address. |
-| AllowTrust | `set_authorized` | No | Sets authorization flag. May trigger pool withdrawal events (see below). |
-| SetTrustLineFlags | `set_authorized` | No | Same as AllowTrust. |
-| CreateClaimableBalance | `transferWithIssuerCheck` | No | Source → claimable-balance address (`SC_ADDRESS_TYPE_CLAIMABLE_BALANCE`). |
-| ClaimClaimableBalance | `transferWithIssuerCheck` | No | Claimable-balance address → claimer. |
-| LiquidityPoolDeposit | `transfer` × 2 | No | One per deposited asset (source → pool address). |
-| LiquidityPoolWithdraw | `transfer` × 2 | No | One per withdrawn asset (pool address → source). |
-| ManageSellOffer | claim-atom events | No | Two events per traded claim atom (one per side). |
-| ManageBuyOffer | claim-atom events | No | Same as ManageSellOffer. |
-| CreatePassiveSellOffer | claim-atom events | No | Same as ManageSellOffer. |
-| Inflation | `mint` (XLM) | No | One per inflation winner. |
-
-**Claim-atom events**: For each `ClaimAtom` in an offer trade, two
-`transferWithIssuerCheck` events are emitted: one for the asset sold
-by the offer owner, one for the asset bought. The `allowMuxedIdOrMemo`
-flag is always `false` for claim-atom events.
-
-**Deauthorization side effects**: When AllowTrust or SetTrustLineFlags
-deauthorizes a trustline that participates in a liquidity pool, the
-automatic pool withdrawal emits additional `transfer` and/or `burn`
-events for the withdrawn assets and pool shares.
-
-### 11.6 Extended Address Types
-
-`@version(≥23)`: The following `SCAddressType` variants are used in
-events to reference non-account/non-contract addresses:
-
-- `SC_ADDRESS_TYPE_CLAIMABLE_BALANCE`: Used as `from`/`to` in
-  CreateClaimableBalance and ClaimClaimableBalance events.
-- `SC_ADDRESS_TYPE_LIQUIDITY_POOL`: Used as `from`/`to` in
-  LiquidityPoolDeposit and LiquidityPoolWithdraw events.
-- `SC_ADDRESS_TYPE_MUXED_ACCOUNT`: Used for muxed account
-  destinations. Stripped from topics (converted to
-  `SC_ADDRESS_TYPE_ACCOUNT`); the muxed ID is conveyed via
-  `to_muxed_id` in the data field.
-
-These address types MUST NOT be used in Soroban storage keys.
-
-### 11.7 Fee Events
-
-Fee charge and refund events are emitted at the transaction level
-(in `TransactionMetaV4.events`) with a `TransactionEventStage`:
-
-| Stage | Event | When |
-|-------|-------|------|
-| `BEFORE_ALL_TXS` | `fee` (positive amount) | Fee charged from fee source before any transactions execute. |
-| `AFTER_ALL_TXS` | `fee` (negative amount) | Fee refund to fee source after all transactions complete. |
-
-Zero-amount refund events are suppressed.
-
-### 11.8 Soroban Contract Events
-
-Soroban operations emit contract events during execution. These are
-collected by the host runtime and included in the transaction metadata:
-
-- `@version(20–22)` (meta v3): All events are placed in
-  `sorobanMeta.events`.
-- `@version(≥23)` (meta v4): Events are placed per-operation in
-  `operations[i].events`.
-
-### 11.9 XLM Balance Reconciliation
-
-`@version(<8)` only: For pre-protocol-8 transactions that could
-create or destroy XLM due to historical bugs, a reconciliation pass
-emits corrective **mint** or **burn** events for the native asset.
-
-The reconciler:
-1. Computes the net XLM balance delta across all modified accounts
-   in the operation's ledger changes.
-2. If `delta > 0`: emits `mint(native, opSource, delta)`, inserted
-   at the beginning of the operation's event list.
-3. If `delta < 0`: emits `burn(native, opSource, |delta|)`.
-4. If `delta == 0`: no event emitted.
-
-The reconciler does NOT run for Inflation operations (which have
-their own explicit mint events). It only emits `mint`/`burn`, never
-`transfer`.
+`@version(≥V_23)` switches event encoding to the protocol 23 SAC
+format (different topic prefixes). The `OpEventManager` flag
+`mUpdateSACEventsToProtocol23Format` toggles this behavior.
 
 ---
 
-## 12. Error Handling
+## 15. Error Handling
 
-### 12.1 Transaction-Level Result Codes
+### 15.1 Transaction-Level Result Codes
+
+`TransactionResultCode`:
 
 | Code | Value | Meaning |
 |------|-------|---------|
-| `txFEE_BUMP_INNER_SUCCESS` | 1 | Fee-bump succeeded; inner tx succeeded. |
-| `txSUCCESS` | 0 | All operations succeeded. |
-| `txFAILED` | -1 | One or more operations failed. |
-| `txTOO_EARLY` | -2 | Time/ledger bounds not yet satisfied. |
-| `txTOO_LATE` | -3 | Time/ledger bounds have passed. |
-| `txMISSING_OPERATION` | -4 | No operations in envelope. |
-| `txBAD_SEQ` | -5 | Sequence number mismatch. |
-| `txBAD_AUTH` | -6 | Insufficient or excess signatures. |
-| `txINSUFFICIENT_BALANCE` | -7 | Fee source cannot pay fee. |
-| `txNO_ACCOUNT` | -8 | Source account does not exist. |
-| `txINSUFFICIENT_FEE` | -9 | Fee below minimum. |
-| `txBAD_AUTH_EXTRA` | -10 | Extra signers not satisfied. |
-| `txINTERNAL_ERROR` | -11 | Unexpected internal error. |
-| `txNOT_SUPPORTED` | -12 | Transaction type not supported. |
-| `txFEE_BUMP_INNER_FAILED` | -13 | Fee-bump succeeded; inner tx failed. |
-| `txBAD_SPONSORSHIP` | -14 | Sponsorship invariant violated (unpaired Begin/End). |
-| `txBAD_MIN_SEQ_AGE_OR_GAP` | -15 | Sequence age/gap precondition not met. |
-| `txMALFORMED` | -16 | Envelope is structurally invalid. |
-| `txSOROBAN_INVALID` | -17 | Soroban resource validation failed. |
+| `txFEE_BUMP_INNER_SUCCESS` | 1 | Fee-bump inner tx succeeded. |
+| `txSUCCESS` | 0 | All ops succeeded. |
+| `txFAILED` | -1 | At least one op failed; no changes applied. |
+| `txTOO_EARLY` | -2 | closeTime < minTime or ledgerSeq < minLedger. |
+| `txTOO_LATE` | -3 | closeTime > maxTime or ledgerSeq >= maxLedger. |
+| `txMISSING_OPERATION` | -4 | No operations. |
+| `txBAD_SEQ` | -5 | Seq num mismatch. |
+| `txBAD_AUTH` | -6 | Insufficient signer weight. |
+| `txINSUFFICIENT_BALANCE` | -7 | Fee would breach reserve. |
+| `txNO_ACCOUNT` | -8 | Source account not found. |
+| `txINSUFFICIENT_FEE` | -9 | Inclusion fee below floor. |
+| `txBAD_AUTH_EXTRA` | -10 | Unused signature attached. |
+| `txINTERNAL_ERROR` | -11 | Unhandled exception or internal invariant violation. |
+| `txNOT_SUPPORTED` | -12 | Envelope type or precondition variant not supported at this protocol. |
+| `txFEE_BUMP_INNER_FAILED` | -13 | Inner tx ineligible (e.g., inner inclusion fee non-positive). |
+| `txBAD_SPONSORSHIP` | -14 | Sponsorship temp entries left at tx end. |
+| `txBAD_MIN_SEQ_AGE_OR_GAP` | -15 | Min seq age / gap preconditions not met. |
+| `txMALFORMED` | -16 | XDR or precondition malformed. |
+| `txSOROBAN_INVALID` | -17 | Soroban-specific precondition failed. |
+| `txFROZEN_KEY_ACCESSED` | -18 | CAP-77 frozen key touched. |
 
-### 12.2 Operation-Level Result Codes
+### 15.2 Operation-Level Result Codes
+
+The op-level wrapper code `OperationResultCode`:
 
 | Code | Value | Meaning |
 |------|-------|---------|
-| `opINNER` | 0 | Operation-specific result (success or failure). |
-| `opBAD_AUTH` | -1 | Insufficient signatures for this operation. |
-| `opNO_ACCOUNT` | -2 | Operation source account does not exist. |
-| `opNOT_SUPPORTED` | -3 | Operation type not supported at this protocol. |
-| `opTOO_MANY_SUBENTRIES` | -4 | Account sub-entry limit (1000) reached. |
-| `opEXCEEDED_WORK_LIMIT` | -5 | DEX crossing limit exceeded. |
-| `opTOO_MANY_SPONSORING` | -6 | Sponsor limit exceeded. |
+| `opINNER` | 0 | Result body is valid (inner per-op code). |
+| `opBAD_AUTH` | -1 | Insufficient signer weight for this op's threshold. |
+| `opNO_ACCOUNT` | -2 | Op source account not found. |
+| `opNOT_SUPPORTED` | -3 | Op type not supported at this protocol. |
+| `opTOO_MANY_SUBENTRIES` | -4 | Subentry cap (1000) exceeded. |
+| `opEXCEEDED_WORK_LIMIT` | -5 | Cross-offer limit exceeded. |
+| `opTOO_MANY_SPONSORING` | -6 | numSponsoring overflow. |
 
-When `code == opINNER`, the operation-specific result union contains
-the detailed result for that operation type.
+Inner per-op codes are listed alongside each op in §8. Appendix C lists
+all op-level inner codes.
 
-### 12.3 Sponsorship Validation
+### 15.3 Internal Errors
 
-After all operations in a transaction complete, the implementation
-MUST verify that all `BeginSponsoringFutureReserves` operations have
-been paired with corresponding `EndSponsoringFutureReserves`
-operations. If any unpaired sponsorship entries remain, the
-transaction MUST fail with `txBAD_SPONSORSHIP`.
+Exceptions from op application are caught by `applyOperations`. If
+caught:
 
-### 12.4 Error Transitions
-
-A transaction result MUST transition from success to error only (never
-error to success). Once `setError()` is called, the result code MUST
-NOT be changed back to a success code.
-
-When a Soroban transaction errors, the refundable fee tracker is
-reset (the full refundable fee is consumed — no refund on error).
-
-### 12.5 Internal Errors
-
-If an unexpected exception or invariant violation occurs during
-transaction application, the result MUST be set to
-`txINTERNAL_ERROR`. This indicates a bug in the implementation, not
-a user error. The transaction's state changes are rolled back, but
-the fee is still charged.
+- `InvariantDoesNotHold`, `std::bad_alloc` ⇒ abort the process.
+- `std::exception` ⇒ set `txINTERNAL_ERROR`, increment
+  `ledger.transaction.internal-error` counter (only when
+  `ledgerVersion ≥ LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT`).
+- If `HALT_ON_INTERNAL_TRANSACTION_ERROR` is configured, abort.
 
 ---
 
-## 13. Invariants and Safety Properties
+## 16. Invariants and Safety Properties
 
-### 13.1 Determinism
-
-All transaction processing MUST be fully deterministic. Given
-identical inputs (transaction set, ledger state, ledger header), any
-conforming implementation MUST produce:
-
-1. Identical `TransactionResult` for every transaction.
-2. Identical `TransactionMeta` for every transaction.
-3. Identical resulting ledger state.
-4. Identical ledger header (including `feePool`, `totalCoins`,
-   `txSetResultHash`).
-
-### 13.2 Fee Irrevocability
-
-Fee deduction MUST be committed before any operations execute. The
-fee is charged regardless of whether the transaction's operations
-succeed or fail.
-
-For fee-bump transactions, this applies to the outer fee: the outer
-fee is charged from the fee source account during pre-processing
-(Section 5.4), and this charge is irrevocable even if the inner
-transaction fails signature validation at apply time (e.g., because
-a prior transaction in the same ledger removed a signer from the
-inner source account). See Section 5.6, item 8.
-
-### 13.3 Balance Conservation
-
-The total number of stroops in the network MUST be conserved across
-each ledger close, with the following exception:
-- Inflation `@version(<12)` mints new stroops (increasing
-  `totalCoins`).
-
-For all other operations: the sum of all account balances plus the
-`feePool` plus all claimable balance amounts MUST remain constant.
-
-### 13.4 Sequence Number Monotonicity
-
-An account's sequence number MUST only increase. After a transaction
-is applied, the source account's sequence number MUST be ≥ its
-previous value.
-
-### 13.5 Reserve Sufficiency
-
-An account's native balance MUST always be ≥ its minimum reserve:
-```
-minReserve = baseReserve * (2 + numSubEntries + numSponsoring
-             - numSponsored)
-```
-
-Operations that would cause the balance to drop below the minimum
-reserve MUST fail, except for fee deduction which MAY reduce the
-balance below the reserve.
-
-### 13.6 Liability Consistency
-
-`@version(≥10)`: For each trustline and the native balance:
-```
-availableBalance = balance - sellingLiabilities
-availableLimit = limit - balance - buyingLiabilities
-```
-
-Both MUST be ≥ 0 at all times. Operations that would violate this
-MUST fail.
-
-### 13.7 Soroban Footprint Containment
-
-A Soroban transaction MUST NOT access any ledger key not declared in
-its footprint. Writes MUST only occur to keys in the read-write
-footprint.
-
-### 13.8 Soroban Resource Bounds
-
-A Soroban transaction MUST NOT exceed its declared resource limits
-(instructions, disk read bytes, write bytes). Exceeding any limit
-results in transaction failure.
-
-### 13.9 PRE_AUTH_TX Signer Consumption
-
-A PRE_AUTH_TX signer, once matched during signature verification,
-MUST be removed from the account's signer list. This removal persists
-regardless of the transaction outcome. The removal MUST occur AFTER
-all signature checks (both transaction-level and per-operation) have
-completed, so that PreAuthTx signers are still present when their
-weight is evaluated (see `processSignatures` in Section 6.2).
-
-### 13.10 Sponsorship Pairing
-
-Every `BeginSponsoringFutureReserves` within a transaction MUST have
-a corresponding `EndSponsoringFutureReserves`. Unmatched pairs cause
-the transaction to fail with `txBAD_SPONSORSHIP`.
-
-### 13.11 Operation Rollback Completeness
-
-When an operation fails, ALL state modifications made by that
-operation MUST be fully reversed. No partial state from a failed
-operation SHALL be visible to subsequent operations or transactions.
-This applies to all entry types including accounts, trustlines,
-offers, contract data, contract code, claimable balances, data
-entries, TTL entries, and liquidity pools. Hot archive restore keys
-tracked during the operation are also discarded (see Section 9.2).
+| ID | Statement |
+|----|-----------|
+| **INV-T1** | **Transaction hash determinism.** `getContentsHash()` MUST be `sha256(networkID, ENVELOPE_TYPE_TX or ENVELOPE_TYPE_TX_V0+0, tx)` for `TransactionFrame` and `sha256(networkID, ENVELOPE_TYPE_TX_FEE_BUMP, feeBump.tx)` for `FeeBumpTransactionFrame`. The hash MUST NOT include signatures and MUST be stable across re-serialization. |
+| **INV-T2** | **Sequence number monotonicity.** For `@version(≥V_10)` a successful or non-`kInvalid` tx MUST advance the source account's `seqNum` to `tx.seqNum` exactly once per ledger. `processSeqNum` is the sole writer. |
+| **INV-T3** | **Fee charging order.** `processFeeSeqNum` MUST run before `apply` for every tx in the apply set, and MUST charge the fee in the fee phase even if the apply phase later fails (except for refunds in `processPostApply`). |
+| **INV-T4** | **No negative balances.** Native and trustline `balance` fields MUST remain ≥ 0 at all times. Underflows MUST surface as `_UNDERFUNDED` op result codes. |
+| **INV-T5** | **Sponsorship counter conservation.** For every `BeginSponsoringFutureReserves`, exactly one `EndSponsoringFutureReserves` MUST be paired before tx end; otherwise `txBAD_SPONSORSHIP` is emitted (`@version(≥V_14)`). |
+| **INV-T6** | **Signature consumption.** After a successful tx, every signature in the envelope's signatures vector MUST have been consumed (`checkAllSignaturesUsed`). Unused signatures yield `txBAD_AUTH_EXTRA`. |
+| **INV-T7** | **One-time signer removal.** A `SIGNER_KEY_TYPE_PRE_AUTH_TX` whose preimage hash equals the tx's contents hash MUST be removed from every account that used it as a signer, regardless of tx success. |
+| **INV-T8** | **Footprint disjointness.** A Soroban transaction's `readOnly` and `readWrite` footprints MUST be pairwise disjoint, and each MUST contain no duplicates. |
+| **INV-T9** | **Soroban single-op rule.** A Soroban transaction MUST contain exactly one operation, and that operation MUST be one of the three Soroban op types. |
+| **INV-T10** | **TTL entry paired creation.** Every newly created `CONTRACT_CODE` or `CONTRACT_DATA` entry MUST be accompanied by a newly created `TTL` entry sharing its key derivation. From V_26 the Stellar Asset Contract may also create `ACCOUNT` / `TRUSTLINE` entries. |
+| **INV-T11** | **Resource fee non-overflow.** `non_refundable_fee + refundable_fee` MUST NOT overflow `int64`, and `sorobanData.resourceFee` MUST be at least the sum. |
+| **INV-T12** | **Fee-bump priority.** When inner inclusion fee is non-negative, `outerInclusion * minInnerInclusionRate ≥ innerInclusion * minOuterInclusionRate` MUST hold; otherwise the fee-bump is rejected. |
+| **INV-T13** | **Two-phase atomicity.** The fee phase MUST be commit-or-throw; the apply phase MUST roll back all entry mutations on op-level failure (except seq num and fee, which persist). |
+| **INV-T14** | **Cross-self prohibition.** Crossing one's own offer during DEX conversion is forbidden and MUST yield `*_CROSS_SELF` for the active op. |
+| **INV-T15** | **Tx-set apply order independence.** The result of applying a tx MUST depend only on the apply-ordered prefix, never on parallel-thread scheduling. For parallel Soroban (V_23+), this is enforced by footprint-based conflict separation upstream (`HERDER_SPEC §5.3`). |
 
 ---
 
-## 14. Constants
+## 17. Constants
 
-### 14.1 Protocol Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_OPS_PER_TX` | 100 | Maximum operations per transaction. |
-| `MAX_SIGNATURES_PER_ENVELOPE` | 20 | Maximum signatures per envelope. |
-| `MAX_OFFERS_TO_CROSS` | 1000 | Maximum DEX offers crossed per operation. |
-| `ACCOUNT_SUBENTRY_LIMIT` | 1000 | Maximum sub-entries per account. |
-| `MAX_SIGNERS_PER_ACCOUNT` | 20 | Maximum signers per account. |
-| `MAX_EXTRA_SIGNERS` | 2 | Maximum extra signers in PreconditionsV2. |
-| `CLAIM_PREDICATE_MAX_DEPTH` | 4 | Maximum nesting depth for claim predicates. |
-| `UINT8_MAX` | 255 | Maximum signer weight / threshold value. |
-| `MAX_SEQ_NUM_INCREASE` | 2^31 | Maximum gap-fill range for minSeqNum. |
-| `EXPECTED_CLOSE_TIME_MULT` | 2 | Multiplier for ledger-time estimation in sequence age checks. |
-
-### 14.2 Fee Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `GENESIS_LEDGER_BASE_FEE` | 100 | Initial base fee (stroops per operation). |
-| `GENESIS_LEDGER_BASE_RESERVE` | 100,000,000 | Initial base reserve (10 XLM). |
-| `MAX_RESOURCE_FEE` | 2^50 | Maximum declared Soroban resource fee (~112M XLM). |
-
-### 14.3 Inflation Constants (Historical)
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `INFLATION_FREQUENCY` | 604,800 | Seconds between inflation rounds (7 days). |
-| `INFLATION_RATE_TRILLIONTHS` | 190,721,000 | Annual inflation rate (~1%/year). |
-| `INFLATION_WIN_MIN_PERCENT` | 500,000,000 | Minimum vote fraction (0.05% of total coins). |
-| `INFLATION_NUM_WINNERS` | 2,000 | Maximum inflation payout recipients. |
-| `INFLATION_START_TIME` | 1,404,172,800 | Inflation epoch (July 1, 2014 UTC). |
-
-### 14.4 Soroban Network Configuration Parameters
-
-These parameters are stored on-ledger in `CONFIG_SETTING` entries and
-may be updated via network upgrades:
-
-| Parameter | Description |
-|-----------|-------------|
-| `txMaxInstructions` | Max CPU instructions per transaction. |
-| `ledgerMaxInstructions` | Max CPU instructions per ledger. |
-| `txMaxDiskReadBytes` | Max disk read bytes per transaction. |
-| `txMaxWriteBytes` | Max write bytes per transaction. |
-| `txMaxReadLedgerEntries` | Max read entries per transaction. |
-| `txMaxWriteLedgerEntries` | Max write entries per transaction. |
-| `txMaxSizeBytes` | Max serialized transaction size. |
-| `txMaxContractEventsSizeBytes` | Max total contract events size. |
-| `maxContractDataKeySizeBytes` | Max contract data key size. |
-| `maxContractSizeBytes` | Max contract code (Wasm) size. |
-| `maxContractDataEntrySizeBytes` | Max contract data entry size. |
-| `maxEntryTTL` | Max TTL for any entry. |
-| `minPersistentTTL` | Min TTL for persistent entries on restore. |
-| `minTemporaryTTL` | Min TTL for temporary entries on creation. |
-| `ledgerMaxDependentTxClusters` | Max clusters per parallel stage. |
-| `feeReadLedgerEntry` | Fee per read ledger entry (stroops). |
-| `feeWriteLedgerEntry` | Fee per write ledger entry (stroops). |
-| `feeRead1KB` | Fee per 1KB read (stroops). |
-| `feeHistorical1KB` | Fee per 1KB historical read (stroops). |
-| `feeTransactionSize1KB` | Fee per 1KB transaction size (stroops). |
-| `feeContractEvents1KB` | Fee per 1KB contract events (stroops). |
-| `feeRatePerInstructionsIncrement` | Fee per 10,000 CPU instructions. |
-
-### 14.5 Liquidity Pool Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `LIQUIDITY_POOL_FEE_V18` | 30 | Pool fee in basis points (0.30%). |
+| Constant | Value | Description | Section |
+|----------|-------|-------------|---------|
+| `MAX_OPERATIONS_PER_TX` | 100 | Maximum operations per transaction. | [3.2](#32-transaction-body) |
+| `MAX_SIGNATURES_PER_TX` | 20 | Maximum signatures in an envelope. | [3.1](#31-envelope-types) |
+| `MAX_EXTRA_SIGNERS` | 2 | Maximum extra signers in PRECOND_V2. | [3.3](#33-preconditions) |
+| `XDR_DEPTH_LIMIT` | 500 | Maximum nested XDR depth. | [5.1](#51-envelope-and-fee-pre-checks) |
+| `MAX_RESOURCE_FEE` | 1 << 50 (≈1.13e15) | Maximum Soroban resource fee in stroops. | [3.5](#35-sorobantransactiondata) |
+| `INFLATION_FREQUENCY` | 7 days (604800 s) | Period between inflation runs. | [8.11](#811-inflation) |
+| `INFLATION_RATE_TRILLIONTHS` | 190721000 | ~1% per year inflation rate. | [8.11](#811-inflation) |
+| `INFLATION_WIN_MIN_PERCENT` | 500000000 | 0.05% of totalCoins required to win inflation. | [8.11](#811-inflation) |
+| `INFLATION_NUM_WINNERS` | 2000 | Max inflation winners per round. | [8.11](#811-inflation) |
+| `INFLATION_START_TIME` | 1404172800 | 1-Jul-2014 Unix epoch. | [8.11](#811-inflation) |
+| `SIGNER_WEIGHT_MAX` | UINT8_MAX (255) | Clamped from V_10+. | [5.5](#55-signature-checking-algorithm) |
+| `CLAIM_PREDICATE_MAX_DEPTH` | 4 | Maximum recursion in claim predicates. | [8.14](#814-createclaimablebalance) |
+| `getMaxOffersToCross` | 1000 | Cross-limit per path payment / manage offer (from V_11+). | [10.5](#105-cross-limit) |
+| `SOROBAN_PROTOCOL_VERSION` | V_20 | First Soroban-supporting protocol. | [11.1](#111-structure) |
+| `PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION` | V_23 | First parallel-Soroban protocol. | [11.6](#116-parallel-execution) |
+| `AUTO_RESTORE_PROTOCOL_VERSION` | V_23 | First autorestore-supporting protocol. | [5.2](#52-commonvalidpreseqnum) |
+| `FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS` | V_11 | Introduces per-op work limits. | [10.5](#105-cross-limit) |
+| `THRESHOLD_MASTER_WEIGHT` | 0 | Index into `account.thresholds[]`. | [7.6](#76-threshold-levels) |
+| `THRESHOLD_LOW` | 1 | Index into `account.thresholds[]`. | [7.6](#76-threshold-levels) |
+| `THRESHOLD_MED` | 2 | Index into `account.thresholds[]`. | [7.6](#76-threshold-levels) |
+| `THRESHOLD_HIGH` | 3 | Index into `account.thresholds[]`. | [7.6](#76-threshold-levels) |
 
 ---
 
-## 15. References
+## 18. References
 
 | Reference | Description |
 |-----------|-------------|
-| [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
-| [stellar-xdr] | Stellar XDR definitions: `Stellar-transaction.x`, `Stellar-ledger-entries.x`, `Stellar-ledger.x`, `Stellar-types.x`. https://github.com/stellar/stellar-xdr/tree/curr/ |
-| [stellar-core] | stellar-core v25.2.2 source code (tag v25.2.2). https://github.com/stellar/stellar-core |
-| [CAP-0021] | Stellar CAP-0021, "Preconditions V2". https://stellar.org/protocol/cap-21 |
-| [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts". https://stellar.org/protocol/cap-46 |
-| [SCP whitepaper] | Stellar Consensus Protocol whitepaper. https://www.stellar.org/papers/stellar-consensus-protocol |
-| [Overlay Spec] | Stellar Overlay Protocol Specification (companion document). |
-| [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
+| RFC 2119 | Key words for use in RFCs to indicate requirement levels. |
+| CAP-0015 | Fee-bump transactions. |
+| CAP-0021 | Generalized transaction preconditions (PreconditionsV2). |
+| CAP-0023 | Two-part payments (claimable balances). |
+| CAP-0033 | Sponsored reserves. |
+| CAP-0034 | Subentry sponsorship counters. |
+| CAP-0035 | Asset clawback. |
+| CAP-0040 | Configurable signature support (signed payload signers). |
+| CAP-0042 | Liquidity pools. |
+| CAP-0046 | Soroban smart contracts (V_20). |
+| CAP-0062 | Soroban memo restrictions (V_25). |
+| CAP-0066 | Auto-restore archived persistent entries (V_23). |
+| CAP-0073 | SAC creates classic entries (V_26). |
+| CAP-0077 | Frozen keys (V_23). |
+| stellar-core v26.0.1 | Reference implementation pinned at submodule `stellar-core/`. |
+| `protocol-curr/xdr/Stellar-transaction.x` | XDR schemas for transaction types and result codes. |
+| `LEDGER_SPEC` | Ledger close pipeline and LedgerTxn nesting. |
+| `HERDER_SPEC` | Transaction-set construction, surge pricing, mempool. |
+| `OVERLAY_SPEC` | Transaction flooding. |
+| `BUCKETLISTDB_SPEC` | State storage layer. |
+| `CATCHUP_SPEC` | Transaction replay during catchup. |
 
 ---
 
-## 16. Appendices
+## 19. Appendices
 
-### Appendix A: Transaction Application Pipeline Diagram
-
-```mermaid
-flowchart TD
-    A[Transaction Envelope] --> B[Structural Validation]
-    B --> C{Valid?}
-    C -->|No| D[Return Error Result]
-    C -->|Yes| E[Fee & SeqNum Pre-Processing]
-    E --> F[commonPreApply]
-    F --> G[Build SignatureChecker]
-    G --> H[Stateful Validation]
-    H --> I{Valid?}
-    I -->|No| D
-    I -->|Yes| J[Verify Tx Signatures]
-    J --> K{Authorized?}
-    K -->|No| D
-    K -->|Yes| L[Record txChangesBefore]
-    L --> M[Apply Operations]
-    M --> N{All Ops OK?}
-    N -->|No| O[txFAILED]
-    N -->|Yes| P[Check All Sigs Used]
-    P --> Q{Unused Sigs?}
-    Q -->|Yes| R[txBAD_AUTH]
-    Q -->|No| S[txSUCCESS]
-    O --> T[Post-Apply / Refund]
-    R --> T
-    S --> T
-    T --> U[Record txChangesAfter]
-    U --> V[Build TransactionMeta]
-```
-
-### Appendix B: Operation Application Flow
+### Appendix A — Signature Checking Decision Tree
 
 ```mermaid
 flowchart TD
-    A[For each operation i] --> B[Create child LTX]
-    B --> C[Resolve source account]
-    C --> D[Check operation signature]
-    D --> E{Authorized?}
-    E -->|No| F[opBAD_AUTH]
-    E -->|Yes| G[doCheckValid]
-    G --> H{Valid?}
-    H -->|No| I[Operation-specific error]
-    H -->|Yes| J[doApply]
-    J --> K{Success?}
-    K -->|No| L[Rollback child LTX]
-    K -->|Yes| M[Record changes, Commit child LTX]
-    F --> N["@version(≥14): Stop"]
-    I --> N
-    L --> N
-    M --> O[Next operation]
+    A[checkSignature signers, neededWeight] --> V7{protocol == V_7?}
+    V7 -- yes --> SUCCESS[return true]
+    V7 -- no --> P[Split signers by SignerKey type]
+    P --> PA[For each PRE_AUTH_TX signer]
+    PA --> PA1{preAuthTx == contentsHash?}
+    PA1 -- yes --> PAW[add weight, clamp to UINT8_MAX at V_10+]
+    PAW --> PAC{totalWeight >= neededWeight?}
+    PAC -- yes --> SUCCESS
+    PAC -- no --> PA
+    PA1 -- no --> PA
+    PA -. done .-> HX[For each ED25519 sig vs HASH_X signers]
+    HX --> HXM{verify hash preimage?}
+    HXM -- yes --> HXW[add weight; mark sig used; remove signer]
+    HXW --> HXC{totalWeight >= neededWeight?}
+    HXC -- yes --> SUCCESS
+    HXC -- no --> HX
+    HXM -- no --> HX
+    HX -. done .-> ED[For each sig vs ED25519 signers]
+    ED --> EDM{ed25519 verify of contentsHash?}
+    EDM -- yes --> EDW[add weight; mark sig used; remove signer]
+    EDW --> EDC{totalWeight >= neededWeight?}
+    EDC -- yes --> SUCCESS
+    EDC -- no --> ED
+    EDM -- no --> ED
+    ED -. done .-> CKP{checkEd25519SignedPayload?}
+    CKP -- no --> FAIL[return false]
+    CKP -- yes --> SP[For each sig vs ED25519_SIGNED_PAYLOAD signers]
+    SP --> SPM{verify payload signature?}
+    SPM -- yes --> SPW[add weight; mark sig used; remove signer]
+    SPW --> SPC{totalWeight >= neededWeight?}
+    SPC -- yes --> SUCCESS
+    SPC -- no --> SP
+    SPM -- no --> SP
+    SP -. done .-> FAIL
 ```
 
-### Appendix C: Soroban Fee Flow
+### Appendix B — Fee-Bump Apply Sequence
 
 ```mermaid
-flowchart LR
-    A[Total Fee] --> B[Inclusion Fee]
-    A --> C[Declared Resource Fee]
-    C --> D[Non-Refundable]
-    C --> E[Refundable Budget]
-    D --> F[Compute + Bandwidth + Historical]
-    E --> G[Rent Consumed]
-    E --> H[Events Consumed]
-    E --> I[Refund to Fee Source]
+sequenceDiagram
+    participant LM as LedgerManager
+    participant FB as FeeBumpTransactionFrame
+    participant TX as Inner TransactionFrame
+    participant LT as outer LedgerTxn
+
+    LM->>FB: processFeeSeqNum(ltx, baseFee)
+    FB->>LT: load(feeSource)
+    FB->>LT: deduct fee, add to feePool
+    FB-->>LM: MutableTxResult with feeCharged
+    LM->>FB: apply(ltx, meta, txResult, sorobanCfg, prngSeed)
+    FB->>LT: sub-ltx for one-time signer removal
+    FB->>LT: pushTxChangesBefore
+    FB->>TX: inner.apply(chargeFee=false, ltx, meta, txResult, sorobanCfg, seed)
+    TX->>LT: commonPreApply (commonValid, processSeqNum, processSignatures)
+    TX->>LT: applyOperations (per-op apply, op meta, events)
+    TX-->>FB: result
+    FB-->>LM: result
+    LM->>FB: processPostApply(ltx, meta, txResult)
+    Note over FB,TX: Soroban only<br/>pre-V_23: refund and emit fee event AFTER_TX<br/>V_23+: deferred to processPostTxSetApply
 ```
+
+### Appendix C — Operation Inner Result Codes
+
+The full list of inner per-op result codes (`opINNER` wrapper) is given
+below; success codes are noted explicitly and all other values
+correspond to failure paths described in §8.
+
+| Op | Success | Failure codes |
+|----|---------|---------------|
+| CreateAccount | `_SUCCESS` | `_MALFORMED`, `_UNDERFUNDED`, `_LOW_RESERVE`, `_ALREADY_EXIST` |
+| Payment | `_SUCCESS` | `_MALFORMED`, `_UNDERFUNDED`, `_SRC_NO_TRUST`, `_SRC_NOT_AUTHORIZED`, `_NO_DESTINATION`, `_NO_TRUST`, `_NOT_AUTHORIZED`, `_LINE_FULL`, `_NO_ISSUER` |
+| PathPaymentStrictReceive | `_SUCCESS` | `_MALFORMED`, `_UNDERFUNDED`, `_SRC_NO_TRUST`, `_SRC_NOT_AUTHORIZED`, `_NO_DESTINATION`, `_NO_TRUST`, `_NOT_AUTHORIZED`, `_LINE_FULL`, `_NO_ISSUER`, `_TOO_FEW_OFFERS`, `_OFFER_CROSS_SELF`, `_OVER_SENDMAX` |
+| PathPaymentStrictSend | `_SUCCESS` | same shape; `_UNDER_DESTMIN` instead of `_OVER_SENDMAX` |
+| ManageSellOffer | `_SUCCESS` | `_MALFORMED`, `_SELL_NO_TRUST`, `_BUY_NO_TRUST`, `_SELL_NOT_AUTHORIZED`, `_BUY_NOT_AUTHORIZED`, `_LINE_FULL`, `_UNDERFUNDED`, `_CROSS_SELF`, `_SELL_NO_ISSUER`, `_BUY_NO_ISSUER`, `_NOT_FOUND`, `_LOW_RESERVE` |
+| ManageBuyOffer | as ManageSellOffer | as ManageSellOffer |
+| CreatePassiveSellOffer | as ManageSellOffer | as ManageSellOffer |
+| SetOptions | `_SUCCESS` | `_LOW_RESERVE`, `_TOO_MANY_SIGNERS`, `_BAD_FLAGS`, `_INVALID_INFLATION`, `_CANT_CHANGE`, `_UNKNOWN_FLAG`, `_THRESHOLD_OUT_OF_RANGE`, `_BAD_SIGNER`, `_INVALID_HOME_DOMAIN`, `_AUTH_REVOCABLE_REQUIRED` |
+| ChangeTrust | `_SUCCESS` | `_MALFORMED`, `_NO_ISSUER`, `_INVALID_LIMIT`, `_LOW_RESERVE`, `_SELF_NOT_ALLOWED`, `_TRUST_LINE_MISSING`, `_CANNOT_DELETE`, `_NOT_AUTH_MAINTAIN_LIABILITIES` |
+| AllowTrust | `_SUCCESS` | `_MALFORMED`, `_NO_TRUST_LINE`, `_TRUST_NOT_REQUIRED`, `_CANT_REVOKE`, `_SELF_NOT_ALLOWED`, `_LOW_RESERVE` |
+| AccountMerge | `_SUCCESS` | `_MALFORMED`, `_NO_ACCOUNT`, `_IMMUTABLE_SET`, `_HAS_SUB_ENTRIES`, `_SEQNUM_TOO_FAR`, `_DEST_FULL`, `_IS_SPONSOR` |
+| Inflation | `_SUCCESS` | `_NOT_TIME` |
+| ManageData | `_SUCCESS` | `_NOT_SUPPORTED_YET`, `_NAME_NOT_FOUND`, `_LOW_RESERVE`, `_INVALID_NAME` |
+| BumpSequence | `_SUCCESS` | `_BAD_SEQ` |
+| CreateClaimableBalance | `_SUCCESS` | `_MALFORMED`, `_LOW_RESERVE`, `_NO_TRUST`, `_NOT_AUTHORIZED`, `_UNDERFUNDED` |
+| ClaimClaimableBalance | `_SUCCESS` | `_DOES_NOT_EXIST`, `_CANNOT_CLAIM`, `_LINE_FULL`, `_NO_TRUST`, `_NOT_AUTHORIZED`, `_TRUSTLINE_FROZEN` |
+| BeginSponsoringFutureReserves | `_SUCCESS` | `_MALFORMED`, `_ALREADY_SPONSORED`, `_RECURSIVE` |
+| EndSponsoringFutureReserves | `_SUCCESS` | `_NOT_SPONSORED` |
+| RevokeSponsorship | `_SUCCESS` | `_DOES_NOT_EXIST`, `_NOT_SPONSOR`, `_LOW_RESERVE`, `_ONLY_TRANSFERABLE`, `_MALFORMED` |
+| Clawback | `_SUCCESS` | `_MALFORMED`, `_NOT_CLAWBACK_ENABLED`, `_NO_TRUST`, `_UNDERFUNDED` |
+| ClawbackClaimableBalance | `_SUCCESS` | `_DOES_NOT_EXIST`, `_NOT_ISSUER`, `_NOT_CLAWBACK_ENABLED` |
+| SetTrustLineFlags | `_SUCCESS` | `_MALFORMED`, `_NO_TRUST_LINE`, `_CANT_REVOKE`, `_INVALID_STATE`, `_LOW_RESERVE` |
+| LiquidityPoolDeposit | `_SUCCESS` | `_MALFORMED`, `_NO_TRUST`, `_NOT_AUTHORIZED`, `_UNDERFUNDED`, `_LINE_FULL`, `_BAD_PRICE`, `_POOL_FULL`, `_TRUSTLINE_FROZEN` |
+| LiquidityPoolWithdraw | `_SUCCESS` | `_MALFORMED`, `_NO_TRUST`, `_UNDERFUNDED`, `_LINE_FULL`, `_UNDER_MINIMUM`, `_TRUSTLINE_FROZEN` |
+| InvokeHostFunction | `_SUCCESS` | `_MALFORMED`, `_TRAPPED`, `_RESOURCE_LIMIT_EXCEEDED`, `_ENTRY_ARCHIVED`, `_INSUFFICIENT_REFUNDABLE_FEE` |
+| ExtendFootprintTTL | `_SUCCESS` | `_MALFORMED`, `_RESOURCE_LIMIT_EXCEEDED`, `_INSUFFICIENT_REFUNDABLE_FEE` |
+| RestoreFootprint | `_SUCCESS` | `_MALFORMED`, `_RESOURCE_LIMIT_EXCEEDED`, `_INSUFFICIENT_REFUNDABLE_FEE` |
+
+### Appendix D — DEX Crossing Worked Example
+
+Consider a `MANAGE_SELL_OFFER` selling 100 X for Y at price 2 Y per X.
+The book contains:
+
+| Offer | Seller | Sell Asset | Buy Asset | Amount | Price (buy/sell) |
+|-------|--------|------------|-----------|--------|------------------|
+| O1 | A | Y | X | 50 | 0.4 |
+| O2 | B | Y | X | 200 | 0.5 |
+| O3 | C | Y | X | 100 | 0.6 |
+
+The conversion (with `RoundingType::NORMAL`) walks the book from best
+price (lowest Y-per-X = inverse of 0.4):
+
+1. **Cross O1**: source pays 20 X for 50 Y at 0.4. `maxWheatPrice =
+   1/2 = 0.5`. O1.price 0.4 ≤ 0.5 ⇒ cross. Offer consumed.
+2. **Cross O2**: source pays 80 X for 160 Y at 0.5. `maxWheatPrice =
+   0.5`. Passive flag would stop here; sell offers cross at equality.
+3. **Stop**: maxSheepSend reached. `sheepSent = 100`, `wheatReceived =
+   210`, `sheepStays = false`, offer deletes.
+
+Each crossing produces a `ClaimAtom` with type `CLAIM_ATOM_TYPE_V0`
+naming the counterparty, the offer ID, and the assets/amounts; the
+host emits per-atom transfer events.
+
+### Appendix E — Result Code Decision Tree (Validation)
+
+```mermaid
+flowchart TD
+    XDR{XDR depth ok?<br/>fee valid?}
+    XDR -- no --> M[txMALFORMED]
+    XDR -- yes --> EV{envelope/type/precondition supported?}
+    EV -- no --> NS[txNOT_SUPPORTED]
+    EV -- yes --> NS2{extra signers malformed?}
+    NS2 -- yes --> M
+    NS2 -- no --> OP{numOps == 0?}
+    OP -- yes --> MO[txMISSING_OPERATION]
+    OP -- no --> CC{soroban consistency<br/>+ checkSorobanResources?}
+    CC -- malformed --> M
+    CC -- soroban bad --> SI[txSOROBAN_INVALID]
+    CC -- ok --> TB{time/ledger bounds ok?}
+    TB -- early --> TE[txTOO_EARLY]
+    TB -- late --> TL[txTOO_LATE]
+    TB -- ok --> IF{inclusion fee >= floor?}
+    IF -- no --> IFR[txINSUFFICIENT_FEE]
+    IF -- yes --> SA{source account exists?}
+    SA -- no --> NA[txNO_ACCOUNT]
+    SA -- yes --> FZ{frozen key accessed?}
+    FZ -- yes --> FK[txFROZEN_KEY_ACCESSED]
+    FZ -- no --> SQ{seqNum ok?}
+    SQ -- no --> BS[txBAD_SEQ]
+    SQ -- yes --> AGE{minSeqAge/gap ok?}
+    AGE -- no --> BMS[txBAD_MIN_SEQ_AGE_OR_GAP]
+    AGE -- yes --> AUTH{signatures ok?}
+    AUTH -- no --> BA[txBAD_AUTH]
+    AUTH -- yes --> BAL{balance >= fee?}
+    BAL -- no --> IB[txINSUFFICIENT_BALANCE]
+    BAL -- yes --> OPS[per-op checkValid loop]
+    OPS -- any fails --> F[txFAILED]
+    OPS -- all pass --> EXT{checkAllSignaturesUsed?}
+    EXT -- no --> AX[txBAD_AUTH_EXTRA]
+    EXT -- yes --> OK[txSUCCESS]
+```
+
+---
 
 [rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
+[cap-0015]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0015.md
+[cap-0021]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0021.md
+[cap-0023]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0023.md
+[cap-0033]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0033.md
+[cap-0035]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0035.md
+[cap-0040]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0040.md
+[cap-0042]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0042.md
+[cap-0046]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046.md
+[cap-0062]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0062.md
+[cap-0066]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0066.md
+[cap-0073]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0073.md
+[cap-0077]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0077.md
