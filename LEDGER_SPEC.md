@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -54,8 +54,8 @@ ledger state. It encompasses:
 - The genesis ledger bootstrap procedure.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
-its pseudocode companion (stellar-core-pc). Any conforming
+exclusively from the vetted stellar-core C++ implementation (v25.2.2).
+Any conforming
 implementation that produces identical ledger hashes, transaction result
 hashes, BucketList hashes, and ledger close metadata for all valid
 inputs is considered correct. Internal details such as memory management,
@@ -272,6 +272,19 @@ values. The supported entry types are:
 | `TTL` | 20+ | Time-to-live for a Soroban state entry. |
 | `CONFIG_SETTING` | 20+ | Network configuration setting (not a ledger key in the traditional sense). |
 
+**TTL key derivation**: A `TTL` entry is keyed by a 32-byte `keyHash`
+derived deterministically from its parent Soroban entry's key:
+
+```
+ttlKey.type    = TTL
+ttlKey.keyHash = SHA256(XDR_serialize(parentKey))
+```
+
+where `parentKey` MUST be a `CONTRACT_DATA` or `CONTRACT_CODE`
+`LedgerKey`. The derivation function is otherwise undefined; conforming
+implementations MUST use this exact recipe so that TTL lookups and
+co-location with parent entries are deterministic across the network.
+
 ### 3.7 Internal Entry Types
 
 In addition to the standard XDR ledger entry types, the transactional
@@ -367,7 +380,16 @@ After validation succeeds, the pipeline MUST set the ledger header's
 The transaction set MUST be converted from its wire format to an
 applicable form. For generalized transaction sets (protocol 20+), this
 involves resolving the per-phase structure and computing base fees for
-each component.
+each component. If preparation fails (the wire-format transaction set
+cannot be converted into an applicable form), the pipeline MUST abort
+with a fatal error.
+
+Additionally, before Step 4 the pipeline MUST verify that the
+proposed `ledgerVersion` (currently `header.ledgerVersion`, which has
+not yet been touched by upgrades) is no greater than
+`CURRENT_LEDGER_PROTOCOL_VERSION`. A higher version indicates the
+network has moved past what this node can support and the pipeline
+MUST abort.
 
 #### Step 6: Construct Meta Frame
 
@@ -501,7 +523,13 @@ The `processFeesSeqNums` procedure:
    internal entries for each source account, recording the highest
    sequence number seen for that account. This prevents sequence
    number reuse after an account merge and re-creation within the
-   same ledger.
+   same ledger. The detection is gated on the presence of any
+   `ACCOUNT_MERGE` operation across the whole set; if none is
+   present, no `MAX_SEQ_NUM_TO_APPLY` entries are created. Before
+   `create`, the procedure MUST verify that no
+   `MAX_SEQ_NUM_TO_APPLY` entry already exists for the source
+   account in the current `LedgerTxn` — a pre-existing entry
+   indicates a programming error and MUST abort.
 5. SHALL record fee processing changes in the meta frame (if
    streaming).
 6. SHALL commit the nested `LedgerTxn`.
@@ -652,6 +680,17 @@ The following rules govern LedgerTxn nesting:
    SHALL reactivate its entry handles.
 4. **Depth**: There is no formal limit on nesting depth, though
    typical usage nests 2–4 levels deep.
+5. **No writes while sealed or with child**: A `LedgerTxn` MUST
+   reject any state-mutating call (`create`, `erase`, `load`,
+   `loadWithoutRecord`, `loadHeader`, `markRestoredFromHotArchive`,
+   `restoreFromLiveBucketList`) if either (a) the transaction is
+   sealed or (b) it currently has an active child. These are
+   programming errors and MUST abort the close.
+6. **CONFIG_SETTING entries are not erasable**: `erase(key)` MUST
+   reject any key whose type is `CONFIG_SETTING`. Config settings
+   may only be updated (via `LEDGER_UPGRADE_CONFIG`) or, in the
+   case of non-upgradeable settings, mutated internally by the
+   pipeline (Section 9.4); they are never deleted.
 
 ### 6.4 Entry Operations
 
@@ -824,7 +863,44 @@ Implementations that use alternative state management approaches
 pre-scope entry value is captured exactly once and is never
 overwritten by later updates within the same scope.
 
-### 6.8 Unseal Header
+### 6.8 Restored Entries Tracking
+
+In addition to the per-key entry cache, every `LedgerTxn` maintains two
+**restored-entries maps** that record entries that have been restored
+during this close, partitioned by their source:
+
+| Map | Source | Populated by |
+|-----|--------|--------------|
+| `hotArchive` | Hot Archive BucketList (protocol 24+) | `markRestoredFromHotArchive(entry, ttlEntry)` |
+| `liveBucketList` | Live BucketList | `restoreFromLiveBucketList(entry, ttl)` |
+
+The maps obey the following invariants:
+
+1. **Mutual exclusivity**: No `LedgerKey` MAY appear in both the
+   `hotArchive` and `liveBucketList` maps. An entry is restored from
+   exactly one source.
+2. **TTL co-storage**: Every restored Soroban entry (`CONTRACT_DATA`
+   or `CONTRACT_CODE`) MUST be paired with its TTL entry. Both keys
+   and entries are inserted atomically into the same map.
+3. **Persistent-only**: Only persistent entry types may be restored;
+   inserting a non-persistent key SHALL abort.
+4. **Inheritance**: When a child `LedgerTxn` is constructed, it
+   inherits a copy of both restored-entry maps from its parent. New
+   restorations performed in the child are added to the child's copy.
+5. **Commit merge (with duplicates)**: When a child commits, its
+   restored-entries maps are merged into the parent's. Because the
+   child inherited the parent's maps at construction, duplicates are
+   expected and MUST NOT cause an error (`allowDuplicates=true` on
+   commit). When restoring entries during fine-grained operations
+   (per-operation → per-thread or per-thread → shared parallel-apply
+   state), duplicates are NOT permitted (`allowDuplicates=false`).
+6. **Rollback**: Both maps are cleared on rollback.
+
+The restored-entries maps are consumed by the finalize step (Section
+11.1) to drive hot archive eviction filtering and per-protocol
+invariant checks.
+
+### 6.9 Unseal Header
 
 The `unsealHeader` operation is a special mechanism used during the
 seal-and-store step. After the `LedgerTxn` has been sealed (all entries
@@ -1113,6 +1189,22 @@ operation records:
 The most recent ledger header hash is also stored in the persistent
 state table as `kLastClosedLedger` for crash recovery.
 
+Before any header is stored or accepted from persistent storage, an
+implementation MUST validate the following well-formedness predicates:
+
+```
+ledgerHeader.ledgerSeq <= INT32_MAX
+ledgerHeader.scpValue.closeTime <= INT64_MAX
+ledgerHeader.feePool >= 0
+ledgerHeader.idPool <= INT64_MAX
+```
+
+A header that fails any predicate MUST be rejected. The same predicate
+is applied both when writing a freshly closed header and when decoding
+a header read back from the database; a stored header that fails the
+predicate indicates database corruption and MUST be treated as a fatal
+error.
+
 ---
 
 ## 9. Network Configuration
@@ -1192,6 +1284,35 @@ pipeline:
   the current BucketList size (Section 11).
 - `EVICTION_ITERATOR`: Updated by the eviction scan subsystem (see
   BucketListDB Specification, Section 12).
+
+**State-size-window resize on config upgrade**: A `LEDGER_UPGRADE_CONFIG`
+that changes `STATE_ARCHIVAL.liveSorobanStateSizeWindowSampleSize` MUST
+resize the `BUCKETLIST_SIZE_WINDOW` deterministically:
+
+- If the new sample-window size equals the current size: no change.
+- If the new size is **smaller**: drop the oldest entries (from the
+  front) until the window has the new size.
+- If the new size is **larger**: backfill at the front by replicating
+  the current oldest entry so the new slots are the first to be
+  replaced by subsequent snapshots.
+
+After resizing, `window.length` MUST equal the new size.
+
+**Sampling cadence**: A new state-size snapshot is appended to
+`BUCKETLIST_SIZE_WINDOW` only when
+`currentLedgerSeq mod STATE_ARCHIVAL.liveSorobanStateSizeWindowSamplePeriod == 0`.
+On sampling, the oldest entry is removed and the new sample is pushed
+to the back. Before protocol 23, the snapshot value is the live
+BucketList size; from protocol 23 onward, it is the in-memory Soroban
+state size (Section 10.4).
+
+**State-size recomputation on protocol upgrade**: A
+`LEDGER_UPGRADE_VERSION` that triggers
+`handleUpgradeAffectingSorobanInMemoryStateSize` (e.g., crossing into
+protocol 23) MUST overwrite **every** slot of `BUCKETLIST_SIZE_WINDOW`
+with the newly recomputed in-memory Soroban state size. This is the
+only path that mutates more than one slot at a time, and it preserves
+window length.
 
 ### 9.5 Cost Model
 
@@ -1312,6 +1433,19 @@ This avoids separate lookups for TTL information during execution.
 
 If a TTL entry arrives before its parent entry (a "pending TTL"), it
 is stored temporarily and associated when the parent entry is loaded.
+
+**Pending-TTL drain invariant**: After every full `updateState`
+(applying a ledger's init/live/dead entries) and after
+`initializeStateFromSnapshot`, the pending-TTL buffer MUST be empty.
+A non-empty pending buffer at the end of an update indicates an
+orphaned TTL with no matching `CONTRACT_DATA`/`CONTRACT_CODE` entry
+and MUST abort.
+
+**Ledger-seq monotonicity**: Each `updateState(initEntries,
+liveEntries, deadEntries, header, ...)` call MUST advance the
+in-memory state's tracked ledger sequence by exactly one — i.e.,
+`header.ledgerSeq == previousTrackedSeq + 1`. Skipping ledgers or
+re-applying the same ledger is a programming error and MUST abort.
 
 ### 10.4 State Size Tracking
 
@@ -1452,6 +1586,15 @@ Via the `unsealHeader` callback:
    - The `HistoryArchiveState`.
    - The Soroban network configuration (protocol 20+).
 
+   The constructed `CompleteConstLedgerState` MUST satisfy the
+   following consistency invariants:
+   - `historyArchiveState.currentLedger == header.ledgerSeq`.
+   - If `header.ledgerSeq > 0`, the live BucketList snapshot's
+     header MUST equal the just-finalized `header`.
+
+   Violation of either invariant indicates a programmer error and
+   MUST abort.
+
 #### Step 3: Conditional Module Cache Rebuild
 
 For protocol 23+, if the module cache arena has grown beyond the
@@ -1522,7 +1665,29 @@ The meta frame contains:
 | **Evicted entries** | Soroban entries evicted in this ledger (protocol 20+). |
 | **Network configuration** | Current Soroban network config (protocol 20+). |
 
-### 12.4 Meta Streaming
+### 12.4 Evicted Entries Partitioning
+
+The `evictedKeys` field in the v1/v2 meta frame is populated from the
+finalize step's eviction result (Section 11.1) and partitioned as
+follows:
+
+- For each `key` in `evictedState.deletedKeys`: the key's type MUST
+  be either a temporary entry type (`CONTRACT_DATA` with
+  `durability == TEMPORARY`) or `TTL`. The key is appended directly
+  to `evictedKeys` (no payload — these are deletions).
+- For each `entry` in `evictedState.archivedEntries`: the entry MUST
+  be a persistent entry (`CONTRACT_DATA` with
+  `durability == PERSISTENT`, or `CONTRACT_CODE`). The entry's
+  `LedgerKey` is appended to `evictedKeys`.
+
+Violation of either type predicate indicates an internal consistency
+failure and MUST abort.
+
+Meta frames at version 0 do NOT carry evicted entries. The
+`populateEvictedEntries` step is skipped when the meta frame version
+is 0.
+
+### 12.5 Meta Streaming
 
 Meta frames are emitted to a configured output stream after the
 ledger is sealed but before the final commit sequence. The stream is
@@ -1743,7 +1908,6 @@ order book and path finding.
 |-----------|-------------|
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [stellar-core] | stellar-core v25.2.2 source code, `src/ledger/`, `src/herder/`. |
-| [stellar-core-pc] | stellar-core pseudocode companion, `src/ledger/`, `src/herder/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |
 | [TX Spec] | Stellar Transaction Processing Specification (companion document). |

@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -65,8 +65,8 @@ This specification covers:
   persistence.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
-its pseudocode companion (stellar-core-pc). Any conforming
+exclusively from the vetted stellar-core C++ implementation (v25.2.2).
+Any conforming
 implementation that produces identical bucket hashes, BucketList hashes,
 and query results for all valid inputs is considered correct. Internal
 details such as threading models, specific file system layouts, and
@@ -224,8 +224,17 @@ case METAENTRY:
 
 **Invariants:**
 
-- A bucket file MUST contain at most one METAENTRY.
+- A bucket file MUST contain at most one METAENTRY. A second METAENTRY,
+  or a METAENTRY appearing after any non-meta entry, is a fatal parse
+  error and the bucket SHALL be rejected.
 - If a METAENTRY is present, it MUST be the first record in the file.
+- For Hot Archive buckets, the METAENTRY's `ext.v()` MUST be 1 and
+  `ext.bucketListType` MUST be `HOT_ARCHIVE`; a parser that encounters
+  any other value SHALL reject the bucket.
+- In the absence of any METAENTRY (legacy pre-protocol-11 buckets), a
+  reader SHALL treat the bucket's protocol version as 0 (the genesis
+  lower bound). This avoids spurious "attempted downgrade" errors when
+  comparing protocol versions during merges.
 - INITENTRY records MUST NOT appear in buckets with protocol version
   before 11.
 - The `ledgerVersion` in METAENTRY records the maximum protocol version
@@ -500,17 +509,36 @@ When `addBatch` is called with init, live, and dead entry vectors, the
 entries are converted to `BucketEntry` records and sorted:
 
 ```
-convertToBucketEntry(initEntries, liveEntries, deadEntries):
+convertToBucketEntry(useInit, initEntries, liveEntries, deadEntries):
     result = []
     for entry in initEntries:
-        result.append(BucketEntry{type=INITENTRY, liveEntry=entry})
+        result.append(BucketEntry{
+            type = useInit ? INITENTRY : LIVEENTRY,
+            liveEntry = entry })
     for entry in liveEntries:
         result.append(BucketEntry{type=LIVEENTRY, liveEntry=entry})
     for key in deadEntries:
         result.append(BucketEntry{type=DEADENTRY, deadEntry=key})
     sort result by BucketEntryIdCmp
+    require no two entries in result share the same identity key
     return result
 ```
+
+The `useInit` flag is true for protocol versions
+>= `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (11) and false
+before that. Pre-protocol-11, init entries from the ledger MUST be
+written as LIVEENTRY records (since INITENTRY did not yet exist).
+
+The deduplication check is a fatal invariant: a single ledger close
+SHALL NOT produce two BucketList changes that share an identity key.
+A violation indicates upstream corruption and the batch MUST be
+rejected.
+
+For the Hot Archive BucketList, the analogous conversion accepts
+`archivedEntries` and `restoredEntries` and emits
+`HOT_ARCHIVE_ARCHIVED` / `HOT_ARCHIVE_LIVE` records. Each entry MUST
+be a persistent Soroban type; non-persistent entries SHALL cause
+an error.
 
 ### 5.3 Level 0 Update (addBatchInternal)
 
@@ -598,15 +626,39 @@ sorted merge-join that respects entry lifecycle semantics.
 The output bucket's protocol version is the maximum of:
 - The `new` bucket's protocol version
 - The `old` bucket's protocol version
-- The protocol versions of all shadow buckets (pre-protocol 12 only)
+- The protocol versions of any shadow buckets whose own version is
+  strictly less than `FIRST_PROTOCOL_SHADOWS_REMOVED` (12).
 
 ```
 calculateMergeProtocolVersion(new, old, shadows):
     version = max(new.protocolVersion, old.protocolVersion)
     for s in shadows:
-        version = max(version, s.protocolVersion)
+        if s.protocolVersion < FIRST_PROTOCOL_SHADOWS_REMOVED:
+            version = max(version, s.protocolVersion)
     return version
 ```
+
+The shadow cutoff is required for determinism: once any newer bucket
+level has cut over to the INITENTRY-supporting merge algorithm, INIT
+plus DEAD mutual annihilations can occur that would revive entry state
+on older levels if a shadow at a newer protocol were allowed to raise
+the merge's protocol version. The computed `version` MUST NOT exceed
+`maxProtocolVersion`; otherwise the merge SHALL fail.
+
+The output bucket's metadata extension MUST also be propagated:
+
+```
+if new.metadata.ext.v() == 1:
+    require maxProtocolVersion >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+    out.metadata.ext = new.metadata.ext
+else if old.metadata.ext.v() == 1:
+    require maxProtocolVersion >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+    out.metadata.ext = old.metadata.ext
+```
+
+This ensures that once a bucket has been written with `ext.v() == 1`
+(carrying the `bucketListType` discriminator), every merge that
+consumes it produces an output bucket with the same extension.
 
 ### 6.3 Merge Loop
 
@@ -654,12 +706,19 @@ been superseded by shallower levels. When outputting an entry, the merge
 checks if the entry's key exists in any shadow bucket:
 
 ```
-maybePut(out, entry, shadows):
+maybePut(out, entry, shadows, keepShadowedLifecycleEntries):
     if protocol >= FIRST_PROTOCOL_SHADOWS_REMOVED (12):
         out.put(entry)
         return
 
     if entry is METAENTRY:
+        out.put(entry)
+        return
+
+    // Protocol 11+: never elide INIT or DEAD entries via shadows.
+    // Only LIVE entries may be shadow-elided.
+    if keepShadowedLifecycleEntries
+       AND (entry.type == INITENTRY OR entry.type == DEADENTRY):
         out.put(entry)
         return
 
@@ -671,6 +730,15 @@ maybePut(out, entry, shadows):
 
     out.put(entry)
 ```
+
+The `keepShadowedLifecycleEntries` flag is true for merges at protocol
+versions >= `FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (11)
+and false before that. In protocol 11 and later (but still pre-protocol
+12), INITENTRY and DEADENTRY records MUST NOT be elided by shadow
+matching, because eliminating an INITENTRY or DEADENTRY could revive a
+stale state from a deeper level or break the INIT/DEAD annihilation
+contract. Only LIVEENTRY records may be removed by shadow matching in
+that window.
 
 From protocol 12 onward, shadows are removed entirely. Instead, the
 INIT/DEAD lifecycle (Section 6.5) prevents stale entry revival.
@@ -840,6 +908,12 @@ FutureBucket(app, curr, snap, shadows, maxProtocol, countEvents, level):
 
 **Shadow validation**: If the snap bucket's protocol version is >= 12
 (FIRST_PROTOCOL_SHADOWS_REMOVED), the shadows list MUST be empty.
+
+**Hot Archive validation**: For a HotArchiveBucket FutureBucket, if the
+snap bucket is non-empty its protocol version MUST be >=
+`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` (23). Constructing a
+Hot Archive merge with an earlier-protocol snap bucket SHALL cause an
+error.
 
 ### 7.3 Merge Start and Deduplication
 
@@ -1056,7 +1130,11 @@ directly (cache hit), avoiding disk reads.
 individual lookups per key.
 
 The in-memory index also maintains auxiliary data:
-- An asset-to-pool-ID mapping for liquidity pool queries.
+- An asset-to-pool-ID mapping for liquidity pool queries. Only
+  `INITENTRY` records of type `LIQUIDITY_POOL` contribute to this
+  mapping; `LIVEENTRY` and `DEADENTRY` records do not. This is
+  consistent because a liquidity pool's asset pair is fixed at
+  creation, so the mapping is exhaustive over pool lifetimes.
 - Entry counters and type-range offsets for compatibility with
   disk-based operations.
 
@@ -1072,7 +1150,8 @@ The disk index divides the bucket file into fixed-size **pages**
 3. **Entry counters**: counts and sizes of entries by type.
 4. **Pool ID index** (Live BucketList only): a mapping from Asset to
    the set of PoolIDs that reference that asset, built from
-   LIQUIDITY_POOL entries encountered during indexing.
+   `INITENTRY` records of type `LIQUIDITY_POOL` encountered during
+   indexing. Non-INIT liquidity pool entries do not contribute.
 5. **Type boundaries**: file offset ranges for each `LedgerEntryType`,
    enabling efficient type-restricted scans.
 
@@ -1438,19 +1517,37 @@ and wraps around from level 10 snap back to the starting level.
 
 ### 12.3 Starting Position
 
-The eviction iterator's starting position is reset when the BucketList
-structure changes due to a spill at or above the starting level:
+The eviction iterator's starting position is repositioned at the
+start of each scan when either (a) network configuration has lowered
+the starting level below the iterator's current position, or (b) the
+bucket the iterator was pointing at received an incoming spill on the
+previous ledger close (which would have invalidated its file offset):
 
 ```
-updateStartingEvictionIterator(iter, startingLevel, ledgerSeq):
-    if levelShouldSpill(ledgerSeq, startingLevel):
-        iter.bucketListLevel = startingLevel
-        iter.isCurrBucket = true
+updateStartingEvictionIterator(iter, firstScanLevel, ledgerSeq):
+    // (a) Config change: starting level moved up the BucketList
+    if iter.bucketListLevel < firstScanLevel:
         iter.bucketFileOffset = 0
+        iter.isCurrBucket = true
+        iter.bucketListLevel = firstScanLevel
+
+    // (b) Spill on previous ledger may have invalidated the offset
+    if iter.isCurrBucket:
+        // A curr bucket is rewritten when the level above spills
+        require iter.bucketListLevel != 0
+        if levelShouldSpill(ledgerSeq - 1, iter.bucketListLevel - 1):
+            iter.bucketFileOffset = 0
+    else:
+        // A snap bucket is rewritten when its own level spills
+        if levelShouldSpill(ledgerSeq - 1, iter.bucketListLevel):
+            iter.bucketFileOffset = 0
 ```
 
 The `startingEvictionScanLevel` is a network configuration parameter
-that determines which level the eviction scan begins at.
+that determines which level the eviction scan begins at. The iterator
+advances `curr → snap → next level → ...` and wraps from the deepest
+level back to `startingEvictionScanLevel`; on wrap, cycle metrics are
+submitted and a new cycle begins (Section 12.7).
 
 ### 12.4 Scan Process
 
@@ -1478,10 +1575,46 @@ scanForEviction(iter, scanSize, ledgerSeq):
 Within each bucket, the scan:
 
 1. Reads entries sequentially from the current offset.
-2. For each INIT or LIVE entry containing a Soroban type:
-   - Looks up the TTL key to determine if the entry is expired.
-   - If expired, adds it to the eviction candidate list.
+2. For each INIT or LIVE entry containing an evictable Soroban type:
+   - Pre-protocol-23: evictable type = temporary Soroban entry.
+   - Protocol 23 and later: evictable type = any Soroban entry
+     (persistent or temporary).
+   - Records the entry's TTL key for a later bulk lookup.
+   - For protocol 24 and later, when the entry is persistent, also
+     records the entry's own `LedgerEntryKey` so the eviction step
+     can replace the scanned (possibly stale) version with the newest
+     version of the entry before archiving it.
 3. Tracks bytes read and decrements from `scanSize`.
+
+After the per-bucket-region scan completes, all recorded keys (TTL
+keys plus, when applicable, persistent entry keys) are bulk-loaded
+through the BucketListDB query layer. For each candidate, if the TTL
+lookup confirms the entry is expired, the entry becomes an eviction
+candidate; otherwise it is discarded. For protocol 24 and later
+persistent entries, the candidate emitted to the eligible list MUST
+be the newest version returned by the bulk load, with its
+`liveUntilLedgerSeq` taken from the TTL entry.
+
+When the eviction candidates are applied during the next ledger
+close:
+
+1. Any candidate whose TTL key appears among the keys modified in the
+   current ledger MUST be removed from the eligible list before
+   applying. Concurrent modification (e.g., a transaction extending
+   the TTL) supersedes the eviction.
+2. The number of entries actually evicted SHALL be capped at
+   `sas.maxEntriesToArchive`.
+3. For each evicted entry:
+   - The entry key and its TTL key are both deleted from the live
+     state.
+   - If the entry is temporary, the entry key is added to the live
+     BucketList as a `DEADENTRY`.
+   - If the entry is persistent (protocol 23+), the entry is appended
+     to the Hot Archive BucketList as `HOT_ARCHIVE_ARCHIVED`. The TTL
+     key is NOT archived; only the data entry itself.
+4. The eviction iterator is advanced to the last evicted entry's
+   position when the cap is hit, or to the end of the scanned region
+   otherwise.
 
 ### 12.5 Eviction Entry Types
 
@@ -1503,16 +1636,30 @@ version from a deeper bucket) by performing an additional point lookup.
 ### 12.6 Scan Validity
 
 An eviction scan is invalidated if network configuration changes between
-the scan and the ledger close (e.g., due to a protocol upgrade):
+the scan and the ledger close. A protocol upgrade that crosses into
+`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` SHALL also invalidate
+any in-flight scan, since the set of evictable entry types changes.
+The specific fields of `StateArchivalSettings` that are checked for
+equality are `maxEntriesToArchive`, `evictionScanSize`, and
+`startingEvictionScanLevel`; other SAS fields do not invalidate a
+scan.
 
 ```
 isValid(currLedgerSeq, currLedgerVers, currSas):
+    if initialLedgerVers < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+       AND currLedgerVers >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION:
+        return false
     return initialLedgerSeq == currLedgerSeq
-       AND initialLedgerVers == currLedgerVers
-       AND initialSas == currSas
+       AND initialSas.maxEntriesToArchive
+           == currSas.maxEntriesToArchive
+       AND initialSas.evictionScanSize
+           == currSas.evictionScanSize
+       AND initialSas.startingEvictionScanLevel
+           == currSas.startingEvictionScanLevel
 ```
 
-If the scan is invalid, it MUST be restarted.
+If the scan is invalid, it MUST be restarted before its results are
+applied.
 
 ### 12.7 Eviction Cycle Metrics
 
@@ -1544,16 +1691,41 @@ entry types are served directly from the BucketList index
 (BucketListDB) and do not need SQL application.
 
 ```
-applyBucket(bucket, database):
-    // Seek to the OFFER range within the bucket
+applyBucket(bucket, level, maxProtocolVersion, database):
+    // Reject buckets newer than the supported protocol
+    require bucket.metadata.ledgerVersion <= maxProtocolVersion
+
     offsetRange = bucket.getRangeForType(OFFER)
     iter = BucketInputIterator(bucket, offset=offsetRange.start)
     while iter is valid AND within offsetRange:
         entry = *iter
+        checkProtocolLegality(entry, maxProtocolVersion)
+
         if entry is LIVEENTRY or INITENTRY:
             if entry.key not in seenKeys:
-                upsert entry into database (offer-specific handling)
                 seenKeys.add(entry.key)
+
+                @version(< FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY):
+                    // Pre-protocol 11 had no INITENTRY, so we must
+                    // distinguish create from update by checking
+                    // whether the entry already exists in the
+                    // accumulating ledger.
+                    if database.contains(entry.key):
+                        database.update(entry)
+                    else:
+                        database.create(entry)
+                @version(>= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY):
+                    if level == NUM_LEVELS - 1 AND entry.type == LIVEENTRY:
+                        // The deepest level has had its INIT entries
+                        // converted to LIVE by tombstone elision at
+                        // earlier merges; at apply time treat them
+                        // as fresh creates, because the earliest
+                        // state of every entry is INIT.
+                        database.create(entry)
+                    else if entry.type == LIVEENTRY:
+                        database.update(entry)
+                    else:
+                        database.create(entry)
         else if entry is DEADENTRY:
             // Record key as seen so deeper buckets don't revive it
             seenKeys.add(entry.key)
@@ -1785,7 +1957,6 @@ states from different ledgers.
 | [CAP-0046] | Stellar CAP-0046, "Soroban Smart Contracts", introduces CONTRACT_DATA, CONTRACT_CODE, TTL entries. |
 | [CAP-0057] | Stellar CAP-0057, "Hot Archive BucketList", introduces the Hot Archive for persistent entry eviction. |
 | [stellar-core] | stellar-core v25.2.2 source code, `src/bucket/` directory. |
-| [stellar-core-pc] | stellar-core pseudocode companion, `src/bucket/` directory. |
 
 ---
 

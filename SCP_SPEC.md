@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -889,7 +889,9 @@ leaders change across rounds.
 ### 8.5 Nomination Flow
 
 The `nominate(value, previousValue, timedout)` method drives each
-nomination round:
+nomination round. The caller MUST be a validator: invoking `nominate`
+on a watcher (non-validator) is a fatal protocol misuse and an
+implementation SHALL refuse to proceed.
 
 ```
 nominate(value, previousValue, timedout):

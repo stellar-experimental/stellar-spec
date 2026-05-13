@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -72,8 +72,8 @@ This specification covers:
 - Error handling, crash recovery, and retry semantics.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2) and
-its pseudocode companion (stellar-core-pc). Any conforming
+exclusively from the vetted stellar-core C++ implementation (v25.2.2).
+Any conforming
 implementation that produces identical ledger state for all valid inputs
 is considered correct. Internal details such as work scheduling
 frameworks, threading pools, and file system layouts are out of scope
@@ -238,7 +238,42 @@ that must be downloaded to convert state `other` into state `self`:
    levels).
 5. Return separate lists for live and hot archive buckets.
 
-### 3.4 Catchup Configuration
+**Precondition**: `differingBuckets` requires that all FutureBucket
+merges in `self` are already resolved (`futuresAllResolved() == true`).
+Walking an unresolved HAS would yield non-deterministic differentials.
+
+### 3.4 HAS Structural Validation
+
+Before applying a downloaded HAS (or before publishing one), the bucket
+structure MUST be validated. The validation walks levels from deepest
+to shallowest, enforcing:
+
+1. The number of levels MUST equal the BucketList level count for the
+   bucket type (live: 11; hot archive: 11).
+2. **Monotonic bucket version per level**: For each level, the `snap`
+   bucket's version is processed before the `curr` bucket's (snap is
+   always older). Each non-empty bucket's `bucketVersion` MUST be
+   ≥ the previously seen non-empty version. Once a non-empty bucket
+   has been seen, every subsequent bucket processed (going from deep
+   to shallow within a level, and shallow-to-deepest across levels)
+   MUST have a version ≥ the running minimum.
+3. **Level 0 future MUST be clear**: `currentBuckets[0].next.isClear()`
+   MUST hold for both live and hot archive bucket lists.
+4. **Per-level future-bucket state** (using the version of the
+   previous-level `snap`, since that bucket feeds this level's merge):
+   - `@version(≥ FIRST_PROTOCOL_SHADOWS_REMOVED)`: `level.next` MUST
+     be in the `clear` state.
+   - `@version(< FIRST_PROTOCOL_SHADOWS_REMOVED)`: `level.next` MUST
+     have an `outputHash` set.
+5. Default-initialized (all-zero) levels at the bottom (deepest
+   indexes) are skipped by the validator — once a non-empty bucket
+   has been seen, the running version is tracked and subsequent
+   levels are validated against it.
+
+Failing any of these checks MUST produce a "malformed HAS" verdict
+and cause the catchup pipeline to fail before applying buckets.
+
+### 3.5 Catchup Configuration
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -254,7 +289,7 @@ Modes:
 | `OFFLINE_BASIC` | Validate only files needed for catchup. |
 | `OFFLINE_COMPLETE` | Validate all history archive file types (including transaction results). |
 
-### 3.5 Catchup Range
+### 3.6 Catchup Range
 
 The result of range computation (Section 6):
 
@@ -264,7 +299,7 @@ The result of range computation (Section 6):
 | `applyBucketsAtLedger` | `uint32` | Ledger number for bucket application (0 if not applying buckets). |
 | `replayRange` | `LedgerRange` | Half-open range `[first, first+count)` of ledgers to replay. |
 
-### 3.6 Ledger Range
+### 3.7 Ledger Range
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -274,7 +309,7 @@ The result of range computation (Section 6):
 Derived: `limit() = first + count` (exclusive upper bound),
 `last() = first + count - 1` (inclusive, only valid if `count > 0`).
 
-### 3.7 Checkpoint Range
+### 3.8 Checkpoint Range
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -282,7 +317,7 @@ Derived: `limit() = first + count` (exclusive upper bound),
 | `count` | `uint32` | Number of checkpoints (not ledgers). |
 | `frequency` | `uint32` | Checkpoint frequency (normally 64). |
 
-### 3.8 File Transfer Info
+### 3.9 File Transfer Info
 
 Describes a single file for upload or download:
 
@@ -301,7 +336,7 @@ File type string mappings:
 | `RESULTS` | `"results"` |
 | `SCP` | `"scp"` |
 
-### 3.9 Ledger Verification Status
+### 3.10 Ledger Verification Status
 
 | Status | Meaning |
 |--------|---------|
@@ -495,7 +530,18 @@ Note: The HAS queue files stored locally use binary (cereal) serialization for e
 The upload process, triggered after checkpoint finalization:
 
 1. **Resolve**: Ensure all BucketList merges referenced in the HAS are
-   resolved. Wait for the configured `PUBLISH_TO_ARCHIVE_DELAY` duration (a time-based delay, not ledger-count-based) to avoid publishing data from a potentially diverged node.
+   resolved. Two delays gate publication, both intended to avoid
+   publishing data from a potentially diverged node:
+   - **Time-based**: The publish pipeline waits for at least
+     `PUBLISH_TO_ARCHIVE_DELAY` (a configured wall-clock duration)
+     to elapse before starting upload.
+   - **Ledger-based**: The resolve phase additionally waits until
+     either the node is running standalone OR the LCL has advanced
+     past the snapshot's `currentLedger` (i.e., at least one
+     subsequent ledger has closed without divergence). While
+     waiting, the pipeline polls every 1 second and calls
+     `resolveAnyReadyFutures()` on the snapshot's HAS so merges
+     can be picked up as they complete.
 
 2. **Write SCP messages**: If the node records SCP messages, write
    them to the SCP checkpoint file.
@@ -512,6 +558,8 @@ The upload process, triggered after checkpoint finalization:
    f. Upload the new HAS to both its permanent location
       (`history/{XX}/{YY}/{ZZ}/history-{hex}.json`) and the
       well-known location (`.well-known/stellar-history.json`).
+      Before uploading, the HAS MUST pass structural validation
+      (Section 3.4); a malformed HAS MUST NOT be published.
 
 4. **Cleanup**: On successful upload, delete local copies of published
    files (up to 100 checkpoints of historical files).
@@ -929,7 +977,41 @@ queue:
 This prevents unbounded history accumulation when replay outpaces
 archive publishing.
 
-### 11.5 Transaction File Gaps
+### 11.5 Knitting Replay to the Current LCL
+
+When a checkpoint apply begins, the downloaded ledger header file
+may span ledgers below, at, or above the current LCL. For each header
+read from the file, the apply pipeline classifies it relative to LCL
+and either skips, verifies-and-skips, or applies it:
+
+1. `header.ledgerSeq + 1 < LCL.ledgerSeq`: header is more than one
+   ledger before LCL — skip (read next entry).
+2. `header.ledgerSeq + 1 == LCL.ledgerSeq`: header is the immediate
+   predecessor of LCL. Its stored `hash` MUST equal
+   `LCL.previousLedgerHash`; otherwise the catchup fails with
+   "failed to connect on LCL predecessor". After the check, skip.
+3. `header.ledgerSeq == LCL.ledgerSeq`: header is LCL itself. Its
+   stored `hash` MUST equal `LCL.hash`; otherwise the catchup
+   fails with "disagreed on hash at LCL". After the check, skip.
+4. `header.ledgerSeq == LCL.ledgerSeq + 1`: header is the next
+   ledger to apply.
+   - `header.previousLedgerHash` MUST equal `LCL.hash`; otherwise
+     "disagreed on LCL hash" (fatal).
+   - The transaction set for `header.ledgerSeq` is read from the
+     checkpoint transactions file (Section 11.6).
+   - `header.scpValue.txSetHash` MUST equal `txSet.contentsHash`;
+     otherwise "replay txset hash differs" (fatal).
+   - The ledger is then applied; after apply, the resulting LCL
+     hash MUST equal `header.hash` (INV-C5).
+5. `header.ledgerSeq > LCL.ledgerSeq + 1`: header is past the next
+   sequential ledger — "replay overshot current ledger" (fatal).
+
+This knit-up routine ensures that a single replay sequence can start
+from any prior point in a downloaded checkpoint without applying
+stale or out-of-order ledgers, while still verifying the chain links
+on the boundary.
+
+### 11.6 Transaction File Gaps
 
 Transaction and result files may have gaps for empty ledgers (ledgers
 with no transactions). The replay algorithm handles this by using a
@@ -943,6 +1025,40 @@ with no transactions). The replay algorithm handles this by using a
 
 When a gap is detected, the ledger is applied with an empty
 transaction set.
+
+### 11.7 Transaction Results Verification (OFFLINE_COMPLETE)
+
+When the catchup mode is `OFFLINE_COMPLETE`, the pipeline downloads
+and verifies transaction result files for the replay range. For each
+checkpoint, verification walks the downloaded ledger header file and
+results file together:
+
+1. For each `LedgerHeaderHistoryEntry` `curr` in the header file
+   (low to high), retrieve the corresponding
+   `TransactionHistoryResultEntry` from the results stream using
+   gap-tolerant lookup (Section 11.6). Empty ledgers yield an empty
+   result set.
+2. Compute `resultSetHash = SHA256(txResultEntry.txResultSet)`.
+3. Verification check:
+   - **Genesis exemption**: If `curr.header.ledgerSeq ==
+     GENESIS_LEDGER_SEQ` AND the result set is empty, skip the hash
+     check (genesis has no results to hash).
+   - **Otherwise**: `resultSetHash` MUST equal
+     `curr.header.txSetResultHash`; a mismatch fails the
+     verification with "Hash of result set does not agree with
+     result hash in ledger header".
+4. **Range and ordering constraints on the results stream**: As the
+   stream advances, each read entry's `ledgerSeq` MUST satisfy:
+   - `firstLedgerInCheckpointContaining(checkpoint) ≤ ledgerSeq
+     ≤ checkpoint` — entries outside this range cause "Results
+     outside of checkpoint range".
+   - `ledgerSeq > previouslySeenLedgerSeq` — ledger sequences MUST
+     be strictly increasing; duplicates or backward sequences cause
+     "Malformed or duplicate results: ledgers must be strictly
+     increasing".
+
+Failure of any check fails the catchup; results-verification is
+single-attempt (no retry) and runs on a background thread.
 
 ---
 
@@ -1051,7 +1167,13 @@ If a downloaded file fails hash verification:
 
 Runtime failures while parsing or iterating downloaded ledger-header
 material MUST be classified as `ERR_CORRUPT_HEADER`, treated as
-history corruption rather than a transient network error.
+history corruption rather than a transient network error. As a
+specific case, XDR deserialization failures of the form
+"bad message size" (which can occur when an archive contains a
+header from a newer/larger format than this node knows about) MUST
+be classified as `ERR_BAD_LEDGER_VERSION` rather than
+`ERR_CORRUPT_HEADER`, since the typical cause is a node lagging
+behind the network protocol.
 
 ---
 
@@ -1146,7 +1268,6 @@ each checkpoint.
 | [rfc2119] | Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, March 1997. |
 | [rfc5785] | Nottingham, M., Hammer-Lahav, E., "Defining Well-Known Uniform Resource Identifiers (URIs)", RFC 5785, April 2010. |
 | [stellar-core] | stellar-core v25.2.2 source code, `src/catchup/`, `src/history/`. |
-| [stellar-core-pc] | stellar-core pseudocode companion, `src/catchup/`, `src/history/`. |
 | [BucketListDB Spec] | Stellar BucketList and BucketListDB Specification (companion document). |
 | [Ledger Spec] | Stellar Ledger Close Pipeline Specification (companion document). |
 | [SCP Spec] | Stellar Consensus Protocol (SCP) Specification (companion document). |

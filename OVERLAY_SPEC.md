@@ -2,7 +2,7 @@
 
 **Version:** 25 (Overlay Protocol v38–v39)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -454,12 +454,17 @@ in order:
    `AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED` (200). If not, send
    `ERROR_MSG(ERR_CONF, "flow control bytes disabled")` and drop.
 
-After successful AUTH:
+After successful AUTH (and after passing the acceptance and flow
+control flag checks), the receiver MUST, in order:
 
-- Both sides send an initial `SEND_MORE_EXTENDED` message to grant flow
-  control capacity (Section 8.3).
-- Both sides send `GET_SCP_STATE` to request the peer's current consensus
-  state.
+1. Send an initial `SEND_MORE_EXTENDED` granting flood capacity
+   (Section 8.3). This MUST be sent **before** any SCP state request
+   so the peer learns of the local reading capacity first.
+2. Start the outgoing tx-advert pipeline.
+3. Send `GET_SCP_STATE` with `getSCPLedgerSeq` set to the herder's
+   `getMinLedgerSeqToAskPeers()` — the minimum ledger sequence the
+   node still needs SCP state for (typically the start of its
+   remembered slot window).
 
 Note that the state transition to `GOT_AUTH` and the responder's reply
 (AUTH + PEERS) happen **before** the acceptance and flow control flag
@@ -768,13 +773,35 @@ struct PeerAddress {
   is allowed to send PEERS, receiving one means the remote initiator
   sent it in violation of the protocol).
 - At most one PEERS message is allowed per connection. A second PEERS
-  message MUST cause the connection to be dropped.
+  message MUST cause the connection to be dropped with reason
+  `"too many PEERS msgs"`.
 - At most **50** peer addresses are included.
 - IPv6 addresses, private addresses, localhost addresses, the recipient's
   own address, and addresses with invalid ports (0 or > 65535) MUST be
-  excluded.
-- Only peers with **10 or fewer** failures are included
+  excluded when **sending**.
+- Only peers with **10 or fewer** failures are included when **sending**
   (`numfailures <= MAX_FAILURES`).
+
+**Receive-side handling**: When processing a received PEERS message,
+the receiver MUST iterate the address list and apply the following
+filters to each entry, silently skipping non-conforming entries
+(the connection is NOT dropped on individual bad entries — only on
+duplicate PEERS messages or when received by the wrong role):
+
+1. Entries with `port == 0` or `port > 65535` are skipped.
+2. Entries whose `ip.type == IPv6` are skipped (IPv6 is not yet
+   supported by the peer database).
+3. Entries whose address is **private** (RFC 1918: `10.0.0.0/8`,
+   `172.16.0.0/12`, `192.168.0.0/16`) are skipped.
+4. Entries whose address equals `127.0.0.1` (localhost) are skipped
+   unless `ALLOW_LOCALHOST_FOR_TESTING` is set.
+5. Entries whose address equals the receiver's own address are
+   skipped.
+
+Surviving entries are inserted into the local peer database with
+`numFailures = 0` (the `numFailures` field from the wire is
+deliberately ignored — the receiver may have better luck reaching
+the peer than the sender did).
 
 ### 7.3 SCP Messages
 
@@ -1173,6 +1200,18 @@ message at most once.
 
 Flood records are garbage-collected when the consensus ledger advances
 past their creation ledger.
+
+**Early eviction on discard**: When a received message is rejected by
+the application layer, the flood record for that message hash is
+explicitly forgotten so the node is free to re-learn (and possibly
+re-broadcast) the message in the future:
+
+- For `TRANSACTION`: if the herder's `recvTransaction` returns
+  anything other than `PENDING` or `DUPLICATE`, the corresponding
+  flood record is removed.
+- For `SCP_MESSAGE`: if the herder's `recvSCPEnvelope` returns
+  `ENVELOPE_STATUS_DISCARDED`, the corresponding flood record is
+  removed.
 
 ### 9.3 Advertisement Batching
 
@@ -1755,6 +1794,15 @@ Additionally, each `TimeSlicedPeerData` includes:
 | `maxInboundPeerCount` | `uint32` | Configured max inbound peers |
 | `maxOutboundPeerCount` | `uint32` | Configured max outbound peers |
 
+**`lostSyncCount` initial-state adjustment**: When the surveyed node
+transitions COLLECTING → REPORTING and finalizes `lostSyncCount`, the
+value is computed as `currentLostSyncCount - initialLostSyncCount`.
+If the node's application state at the start of the collection phase
+was `ACQUIRING_CONSENSUS` or `CATCHING_UP` (i.e., the node was
+already out of sync when collection began), the finalized
+`lostSyncCount` is incremented by 1. This makes the count include
+the pre-existing out-of-sync condition.
+
 ### 11.7 Rate Limiting and Deduplication
 
 #### Ledger Validity Window
@@ -1774,10 +1822,21 @@ Per ledger, per surveyor: at most `MAX_REQUEST_LIMIT_PER_LEDGER` (10)
 unique surveyed nodes.
 
 Per ledger: at most `MAX_REQUEST_LIMIT_PER_LEDGER` (10) unique
-surveyors (self excluded from this limit).
+surveyors.
+
+**Surveyor self-exemption**: When the local node is itself the
+surveyor (`request.surveyorPeerID == local NodeID`), both limits
+above are bypassed:
+- The local surveyor MAY add a new surveyor entry even when the
+  per-ledger surveyor map is already at capacity.
+- The local surveyor MAY add new surveyed-node entries even when its
+  own per-surveyor surveyed-node count is at the limit.
+
+This ensures the operator-driven survey is never silently throttled
+by the local rate limiter.
 
 Duplicate `(surveyorPeerID, surveyedPeerID)` pairs on the same ledger
-are rejected.
+are rejected (regardless of self).
 
 #### Response Deduplication
 
@@ -1844,6 +1903,8 @@ specified, an `ERROR_MSG` is sent before dropping:
 | Out-of-order AUTH | `ERR_MISC` | "out-of-order AUTH message" |
 | Out-of-sync random drop | `ERR_LOAD` | "random disconnect due to out of sync" |
 | Invalid survey signature | `ERR_MISC` | "Survey has invalid signature" |
+| Corrupt XDR on the wire | `ERR_DATA` | "received corrupt XDR" |
+| Crypto error during message parsing | `ERR_DATA` | "crypto error" |
 
 The following conditions cause a silent drop (no ERROR_MSG):
 

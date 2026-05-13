@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -260,9 +260,13 @@ the following steps to initiate the next consensus round:
    e. Re-broadcast the queue to peers.
 
 3. **Gather candidate transactions**: Collect transactions from
-   both queues, excluding any whose starting sequence number
-   equals the source account's current sequence number (these
-   cannot yet be applied).
+   both queues, excluding any transaction whose sequence number
+   equals `getStartingSequenceNumber(nextLedgerSeq)`, defined as
+   `(nextLedgerSeq << 32)`. This is the sequence number assigned
+   to accounts created in the next ledger; a queued transaction
+   matching this value cannot be applied yet (it would conflict
+   with the minSeqLedgerGap newly-created-account guard) and is
+   carried forward to a later round.
 
 4. **Construct transaction set**: Build a transaction set from
    the gathered transactions using the surge pricing mechanism
@@ -454,6 +458,33 @@ yet available but all other checks pass, the value is **maybe
 valid** (SCP may proceed with nomination but MUST fully validate
 before ballot voting).
 
+**Per-slot dispatch for validation.** The slot index relative to
+the last closed ledger sequence determines which checks apply
+(beyond the structural and signature checks above, which always
+apply):
+
+| Slot relation | Validation rule |
+|---------------|-----------------|
+| `slotIndex == lastClosedLedgerSeq + 1` (current ledger) | Apply all checks. Resolve the transaction set; if available, run full transaction-set validation (Section 8). Result: `kFullyValidatedValue` if all pass, otherwise `kInvalidValue`. |
+| `slotIndex == lastClosedLedgerSeq` (previous ledger) | The value's `closeTime` MUST equal the LCL's `scpValue.closeTime`; otherwise `kInvalidValue`. |
+| `slotIndex < lastClosedLedgerSeq` (older slot) | The value's `closeTime` MUST be `>= lastClosedLedgerCloseTime` (basic sanity); otherwise `kInvalidValue`. |
+| `slotIndex > lastClosedLedgerSeq + 1` (future slot) | The close time MUST satisfy the future-bound check (`> lastCloseTime` and `<= currentWallClock + MAX_TIME_SLIP_SECONDS`); otherwise `kInvalidValue`. |
+
+For all non-current slots, if the node is not tracking the
+network, the result is downgraded to `kMaybeValidValue` (the node
+lacks the state needed to fully validate). When tracking, the
+"last close time" used in the future-bound check is the tracked
+consensus close time (`trackingConsensusCloseTime`) rather than
+the LCL close time, providing a tighter bound.
+
+> **Note:** Receiving an envelope for a slot strictly less than
+> the node's `nextConsensusLedgerIndex` returns `kMaybeValidValue`
+> ("we already moved on from this slot"). Receiving an envelope
+> for a slot strictly greater than `nextConsensusLedgerIndex`
+> while tracking returns `kInvalidValue` (the message is in the
+> future relative to local tracking and the node should not
+> validate it as authoritative).
+
 ### 5.4 Extracting a Valid Value
 
 When SCP calls `extractValidValue`, the herder MUST return a
@@ -512,15 +543,19 @@ The construction of a transaction set proceeds as follows:
 
 2. **Trim invalid transactions**: For each phase, validate every
    transaction against a snapshot of the current ledger state
-   (at `lastClosedLedgerSeq + 1`). Remove any transaction that
-   fails validation. After this per-transaction pass, group the
-   remaining transactions by fee source account and sum each
-   group's **full fees**. If a fee source's available native
-   balance at `lastClosedLedgerSeq + 1` is less than the summed
-   full fee, then **all** transactions in that group MUST be
-   removed from the candidate phase. The removed transactions are
-   recorded for diagnostic purposes but do not affect the
-   construction.
+   (at `lastClosedLedgerSeq + 1`). The time-bound checks during
+   this validation MUST use a close-time window of
+   `[lowerBoundCloseTimeOffset, upperBoundCloseTimeOffset]`, where
+   both bounds equal `nextCloseTime - previousLedgerCloseTime` (a
+   single, exact offset matching the close time being proposed,
+   per CAP-0034). Remove any transaction that fails validation.
+   After this per-transaction pass, group the remaining
+   transactions by fee source account and sum each group's
+   **full fees**. If a fee source's available native balance at
+   `lastClosedLedgerSeq + 1` is less than the summed full fee,
+   then **all** transactions in that group MUST be removed from
+   the candidate phase. The removed transactions are recorded for
+   diagnostic purposes but do not affect the construction.
 
 3. **Apply surge pricing**: For each phase, apply the surge
    pricing mechanism (Section 12) to select the highest-fee
@@ -608,6 +643,24 @@ base fee for each lane is computed as follows:
 
 The per-lane base fee is recorded in the generalized transaction
 set XDR as the `baseFee` field of each component.
+
+**Per-operation fee computation.** When comparing inclusion fees
+across transactions with different operation counts, the
+per-operation fee is computed as
+`bigDivide(inclusionFee, 1, numOperations, rounding)`. The
+rounding direction is protocol-dependent:
+
+- **Protocol ≥ SOROBAN_PROTOCOL_VERSION (≥20):** `ROUND_DOWN`.
+- **Protocol < SOROBAN_PROTOCOL_VERSION:** `ROUND_UP`.
+
+This computation is used in three places: (a) determining the
+"lowest per-operation included fee" per lane when computing base
+fees (above), (b) the surge pricing eviction floor (Section 12.7),
+and (c) legacy transaction set base fee derivation (Section 6.4).
+Soroban transactions always have a single operation, so the
+rounding direction has no observable effect for them; the
+distinction matters for classic transactions across the protocol
+boundary.
 
 ---
 
@@ -951,9 +1004,18 @@ the combination algorithm.
 
 ### 10.2 Transaction Set Selection
 
-Given a set of candidate StellarValues, the herder selects the
-"best" transaction set using the following ordered criteria.
-Each criterion is a tiebreaker for the previous one:
+Given a set of candidate StellarValues, the herder first filters
+the candidate set to those whose transaction set's
+`previousLedgerHash` matches the local node's current
+last-closed-ledger hash. Candidates whose tx set targets a
+different parent ledger MUST be excluded from selection (they
+could not be applied on top of the local LCL). If, after
+filtering, no eligible candidate remains, combination MUST fail
+with an error rather than silently producing a composite value.
+
+Among the remaining candidates, the herder selects the "best"
+transaction set using the following ordered criteria. Each
+criterion is a tiebreaker for the previous one:
 
 1. **Most operations**: Prefer the set containing the most total
    operations (sum of `getNumOperations()` across all transactions
@@ -1050,6 +1112,32 @@ the herder processes it through the following validation pipeline.
 Each step either accepts the transaction or rejects it with a
 specific result code.
 
+#### 11.3.0 Cross-Queue Source Account Check
+
+Before dispatching the transaction to its target queue, the
+herder enforces the "one transaction per source account per
+ledger" invariant **across both queues**:
+
+- If the new transaction is **classic** and the **Soroban**
+  queue already has a pending transaction with the same source
+  account, the new transaction is rejected with
+  `TRY_AGAIN_LATER`.
+- If the new transaction is **Soroban** and the **classic**
+  queue already has a pending transaction with the same source
+  account, the new transaction is rejected with
+  `TRY_AGAIN_LATER`.
+
+Replace-by-fee (Section 11.3.9) operates only within a single
+queue and does NOT apply across queues. The cross-queue check
+runs first because allowing two queued transactions with the
+same source — even one classic and one Soroban — would violate
+the generalized-transaction-set duplicate-source-account
+prohibition (Section 6.5) at construction time.
+
+If the new transaction is Soroban and no Soroban queue has been
+established (the network is on a pre-protocol-20 ledger version),
+the transaction is rejected with `txNOT_SUPPORTED`.
+
 #### 11.3.1 Structural Fee Validation
 
 The transaction's XDR fee fields MUST be structurally valid.
@@ -1098,6 +1186,14 @@ For Soroban transactions, the declared resources (instructions,
 read bytes, write bytes, etc.) MUST not exceed the network's
 per-transaction resource limits. If they do, the transaction
 is rejected with `txSOROBAN_INVALID`.
+
+For protocol versions **strictly less than 25**, the queue
+additionally rejects any Soroban transaction whose envelope
+contains a non-empty memo OR a muxed source account; these are
+not permitted on pre-protocol-25 Soroban transactions and yield
+`txSOROBAN_INVALID` with diagnostic text "Soroban txs not allowed
+to use memo or muxed source account". From protocol 25 onward
+this restriction is lifted.
 
 #### 11.3.9 Account Limit and Replace-by-Fee
 
@@ -1380,18 +1476,37 @@ limiting is instead handled by the parallel stage model
 To prevent a degenerate pattern where the queue repeatedly
 evicts good transactions and replaces them with marginally
 better ones, the herder maintains a per-lane **eviction fee
-floor** for each ledger cycle:
+floor** for each ledger cycle. The floor is keyed not by raw
+inclusion fee, but by the evicted transaction's **(inclusion
+fee, num operations)** pair, so comparisons are made on a
+per-operation fee-rate basis:
 
 - When a transaction is evicted from a specific lane due to
-  that lane's limit being exceeded, the evicted transaction's
-  inclusion fee becomes the floor for that lane.
-- When a transaction is evicted due to the generic lane's limit
-  being exceeded, the evicted transaction's inclusion fee
-  becomes the floor for the generic lane.
-- Any new transaction MUST have an inclusion fee strictly higher
-  than the applicable floor(s) to be accepted.
-- The floor is reset to zero on each ledger close (during the
-  queue's `shift` operation).
+  that lane's limit being exceeded, the herder records
+  `(evictedFee, evictedNumOps)` as the floor for that lane.
+- When a transaction is evicted due to the generic lane's
+  limit being exceeded, the herder records the same pair as
+  the floor for the **generic** lane.
+- A subsequent transaction `tx` with `(newFee, newNumOps)`
+  satisfies a floor `(refFee, refNumOps)` iff its per-op fee
+  rate is **strictly greater** than the floor's rate. The
+  required minimum new fee is computed as:
+
+  ```
+  minNewInclusionFee = bigDivide(refFee, newNumOps, refNumOps, ROUND_DOWN) + 1
+  ```
+
+  Equivalently: `newFee * refNumOps > refFee * newNumOps`.
+
+- A new transaction MUST clear **both** the applicable lane's
+  floor AND the generic lane's floor; otherwise eviction fails
+  and the reception is rejected with `txINSUFFICIENT_FEE`. The
+  reported minimum required full fee is
+  `minNewInclusionFee + (tx.fullFee - tx.inclusionFee)` (re-adding
+  the flat resource-fee component for Soroban).
+
+- The floors are reset to zero on each ledger close (during the
+  queue's `shift` operation, Section 11.4 step 4).
 
 ---
 

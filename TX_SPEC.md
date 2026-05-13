@@ -2,7 +2,7 @@
 
 **Version:** 25 (stellar-core v25.2.2 / Protocol 25)
 **Status:** Informational
-**Date:** 2026-02-20
+**Date:** 2026-05-13
 
 ---
 
@@ -48,8 +48,8 @@ out of scope except where they directly affect determinism or
 correctness.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v25.2.2)
-and its pseudocode companion (stellar-core-pc). Any conforming
+exclusively from the vetted stellar-core C++ implementation (v25.2.2).
+Any conforming
 implementation that produces identical observable behavior (transaction
 results, metadata, ledger state changes) for all valid inputs is
 considered correct.
@@ -546,6 +546,14 @@ no sufficient match was found, so the result is `false` regardless of
 (used by `checkSignatureNoAccount` below): a `neededWeight` of 0 does NOT
 mean the check automatically passes — at least one signer must match.
 
+**Protocol-7 quirk** `@version(=7)`: At protocol version 7 exactly (and
+**only** at this exact version), `SignatureChecker::checkSignature`
+unconditionally returns `true` and `checkAllSignaturesUsed` also
+unconditionally returns `true`. This is a historical bug preserved
+for determinism; transactions in protocol-7 ledgers MUST have their
+signature checks bypassed accordingly. All other protocol versions
+run the full algorithm above.
+
 **PRE_AUTH_TX signer consumption**: When a PRE_AUTH_TX signer matches,
 it MUST be removed from the source account's signer list regardless
 of whether the overall signature check succeeds or the transaction
@@ -829,6 +837,11 @@ individual transaction.
 
 ### 5.6 Fee-Bump Semantics
 
+Fee-bump transactions are **not supported** before protocol 13.
+`@version(<13)`: A fee-bump envelope causes the transaction to fail
+with `txNOT_SUPPORTED` during `commonValidPreSeqNum`. The rest of
+this section applies to `@version(≥13)`.
+
 A fee-bump transaction wraps an inner transaction with a new fee
 source and higher fee:
 
@@ -868,6 +881,25 @@ source and higher fee:
    `feeCharged` field in the result reflects the full fee that was
    deducted during pre-processing — it is never zero for a fee-bump
    transaction that reached the apply phase.
+
+9. **Per-operation inclusion fee comparison** (in `commonValidPreSeqNum`):
+   The outer fee-bump's per-op inclusion fee MUST be strictly greater
+   than the inner's per-op inclusion fee. Concretely, with
+   `outerInclusion = getInclusionFee()`,
+   `innerInclusion = mInnerTx.getInclusionFee()`,
+   `outerMinInclusion = getMinInclusionFee(self)`,
+   `innerMinInclusion = getMinInclusionFee(innerTx)`, the check is
+   `outerInclusion * innerMinInclusion >= innerInclusion *
+   outerMinInclusion` (128-bit cross-multiplied to avoid overflow).
+   If this fails, the result is `txINSUFFICIENT_FEE` with `feeCharged`
+   set to the required fee (rounded up).
+
+10. **Non-positive inner inclusion fee** `@version(<23)`: If
+    `mInnerTx.getInclusionFee() < 0`, the fee-bump fails with
+    `txFEE_BUMP_INNER_FAILED`. `@version(≥23)`: An inner Soroban
+    transaction is allowed to have a non-positive inclusion fee (the
+    fee-bump source supplies the full inclusion fee); the check above
+    is skipped in this case.
 
 ---
 
@@ -1270,11 +1302,18 @@ Same additional result codes as PathPaymentStrictReceive.
 
 Creates, updates, or deletes a sell offer on the DEX.
 
-**Validation**:
-- `amount` MUST be ≥ 0 (0 = delete). Result: `MANAGE_SELL_OFFER_MALFORMED`.
-- `price.n` and `price.d` MUST be > 0. Result: `MANAGE_SELL_OFFER_MALFORMED`.
-- `selling` and `buying` MUST be valid and different assets.
-  Result: `MANAGE_SELL_OFFER_MALFORMED`.
+**Validation** (checks in this order):
+1. `selling` and `buying` MUST be valid assets, and they MUST NOT be
+   equal. Result: `MANAGE_SELL_OFFER_MALFORMED`.
+2. `amount` MUST be ≥ 0 (0 = delete), and `price.n` and `price.d` MUST
+   be > 0. Result: `MANAGE_SELL_OFFER_MALFORMED`.
+3. **Delete-without-offerID rejection**: If `offerID == 0` and the
+   operation is a delete (`amount == 0`):
+   - `@version(<3)`: this combination was historically accepted.
+   - `@version(3..10)`: rejected with `MANAGE_SELL_OFFER_NOT_FOUND`.
+   - `@version(≥11)`: rejected with `MANAGE_SELL_OFFER_MALFORMED`.
+4. `@version(≥15)`: `offerID` MUST NOT be negative.
+   Result: `MANAGE_SELL_OFFER_MALFORMED`.
 
 **Execution** (shared with ManageBuyOffer and CreatePassiveSellOffer via
 a common base):
@@ -1286,21 +1325,36 @@ a common base):
 2. If `offerID != 0` (update): load existing offer, verify ownership.
    Result: `MANAGE_SELL_OFFER_NOT_FOUND`.
 
-3. Validate selling/buying trustlines exist and are authorized.
-   Result: `SELL_NO_TRUST`, `BUY_NO_TRUST`, `SELL_NOT_AUTHORIZED`,
-   `BUY_NOT_AUTHORIZED`.
+3. Validate selling/buying trustlines (in this order, only when the
+   asset is non-native):
+   - **Selling trustline** (first): `@version(<13)` requires the
+     issuer exists (`SELL_NO_ISSUER`); the trustline MUST exist
+     (`SELL_NO_TRUST`); the trustline's balance MUST be > 0
+     (`MANAGE_SELL_OFFER_UNDERFUNDED`); and the trustline MUST be
+     authorized (`SELL_NOT_AUTHORIZED`).
+   - **Buying trustline** (second): `@version(<13)` requires the
+     issuer exists (`BUY_NO_ISSUER`); the trustline MUST exist
+     (`BUY_NO_TRUST`); and the trustline MUST be authorized
+     (`BUY_NOT_AUTHORIZED`).
 
-4. `@version(<13)`: Verify selling/buying asset issuers exist.
-   Result: `SELL_NO_ISSUER`, `BUY_NO_ISSUER`.
+4. *(Combined into step 3 above.)*
 
 5. **Cross existing offers**: Walk the order book, crossing offers at
    favorable prices. For each crossed offer:
+   - The crossed offer's ID MUST NOT equal the source operation's
+     `offerID` (assertion; loading the same offer twice is a bug).
    - Exchange assets between the two parties.
    - `@version(≥10)`: Adjust buying/selling liabilities.
    - If the crossed offer is fully consumed, remove it.
-   - Self-crossing check: MUST NOT cross own offers.
-     Result: `MANAGE_SELL_OFFER_CROSS_SELF`.
-   - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`.
+   - Self-crossing check (offer-filter): if the crossed offer's seller
+     equals the source account, the operation MUST stop and fail with
+     `MANAGE_SELL_OFFER_CROSS_SELF`.
+   - **Passive-offer filter**: if `passive == true` and the crossed
+     offer's price is `≥` the source offer's price, the crossing
+     stops (no further offers crossed; this is `StopBadPrice` —
+     remaining amount stays on the book).
+   - Enforce `MAX_OFFERS_TO_CROSS` limit `@version(≥11)`. Hitting the
+     limit produces the outer-level result `opEXCEEDED_WORK_LIMIT`.
 
 6. If the new offer (`offerID == 0`) was fully consumed during
    crossing (no residual amount remains):
@@ -1395,17 +1449,25 @@ adjusted to reflect the exchanged amounts.
 Configures account settings. The fields are applied in the following
 order:
 
-**Threshold level**: HIGH if modifying master weight, thresholds, or
-signers. MEDIUM otherwise.
+**Threshold level**: HIGH if **any** of `masterWeight`,
+`lowThreshold`, `medThreshold`, `highThreshold`, or `signer` is
+present in the operation (regardless of value). MEDIUM otherwise.
 
 **Validation**:
 - `setFlags` and `clearFlags` MUST NOT contain unknown flag bits.
   Result: `SET_OPTIONS_UNKNOWN_FLAG`.
 - `setFlags` and `clearFlags` MUST NOT overlap.
   Result: `SET_OPTIONS_BAD_FLAGS`.
-- Threshold values MUST be ≤ 255.
+- Each of `masterWeight`, `lowThreshold`, `medThreshold`,
+  `highThreshold` (when present) MUST be ≤ `UINT8_MAX` (255).
   Result: `SET_OPTIONS_THRESHOLD_OUT_OF_RANGE`.
 - Signer MUST NOT be the account itself.
+  Result: `SET_OPTIONS_BAD_SIGNER`.
+- `@version(<3)`: Signer key MUST be a public key (the
+  `SIGNER_KEY_TYPE_PRE_AUTH_TX` and `SIGNER_KEY_TYPE_HASH_X` types
+  introduced in protocol 3 are rejected). Result:
+  `SET_OPTIONS_BAD_SIGNER`.
+- `@version(≥10)`: Signer `weight` MUST be ≤ `UINT8_MAX` (255).
   Result: `SET_OPTIONS_BAD_SIGNER`.
 - `ED25519_SIGNED_PAYLOAD` signers require `@version(≥19)` and a
   non-empty payload. Result: `SET_OPTIONS_BAD_SIGNER`.
@@ -1432,18 +1494,37 @@ signers. MEDIUM otherwise.
 
 Creates, updates, or removes a trustline.
 
-**Validation**:
-- Asset/pool MUST be valid. Result: `CHANGE_TRUST_MALFORMED`.
-- Source MUST NOT be the asset issuer. Result:
-  `CHANGE_TRUST_SELF_NOT_ALLOWED`.
+**Validation** (checks in this order):
 - `limit` MUST be ≥ 0. Result: `CHANGE_TRUST_MALFORMED`.
+- Asset/pool MUST be valid. Result: `CHANGE_TRUST_MALFORMED`.
+- `@version(≥10)`: Asset type MUST NOT be `NATIVE`.
+  Result: `CHANGE_TRUST_MALFORMED`.
+- `@version(≥16)`: Source MUST NOT be the asset issuer.
+  Result: `CHANGE_TRUST_MALFORMED`.
+
+**Self-issuance handling**:
+- `@version(≥3, <16)`: If the source is the asset issuer, the
+  operation fails with `CHANGE_TRUST_SELF_NOT_ALLOWED` during apply
+  (not validation).
+- `@version(<3)`: If the source is the asset issuer, a special path
+  applies: `limit` MUST be `INT64_MAX` (otherwise
+  `CHANGE_TRUST_INVALID_LIMIT`); the source account MUST exist
+  (otherwise `CHANGE_TRUST_NO_ISSUER`); the operation then succeeds
+  without creating any trustline entry.
 
 **Execution**:
 1. If `limit == 0` (remove trustline):
    - Trustline MUST exist. Result: `CHANGE_TRUST_INVALID_LIMIT`
      (if the trustline was not found when attempting to remove).
    - Balance MUST be 0. Selling/buying liabilities MUST be 0.
-   - For pool shares `@version(≥18)`: verify pool exists.
+   - For non-pool-share trustlines: if the trustline has extension
+     v2 and `liquidityPoolUseCount != 0` (the trustline's asset is
+     in use by at least one pool share owned by the same account),
+     the deletion fails. Result: `CHANGE_TRUST_CANNOT_DELETE`.
+   - For pool shares `@version(≥18)`: verify pool exists. After
+     removal, decrement the asset trustlines' pool use counts; if
+     the pool's `poolSharesTrustLineCount` reaches zero, delete the
+     pool entry.
    - Remove with sponsorship cleanup.
 
 2. If trustline does not exist (create):
@@ -1530,8 +1611,16 @@ remaining native balance.
 
 **Execution** (two code paths exist — `doApplyBeforeV16` and
 `doApplyFromV16` — but the observable check ordering from
-`@version(≥16)` onward is described here; the pre-v16 path has minor
-differences for stale-account handling in `@version(5..8)`):
+`@version(≥16)` onward is described here. The pre-v16 path has
+additional source-balance-resolution branches:
+- `@version(<6)`: `sourceBalance` is read directly from
+  `sourceAccount.balance`.
+- `@version(5..7)`: A separate read-only load of the source account
+  is performed first (the merge could be called against a stale
+  cached account); the account MUST exist (`ACCOUNT_MERGE_NO_ACCOUNT`).
+  `@version(≥6)` uses this stale-loaded balance as `sourceBalance`.
+- `@version(≥8)`: `sourceBalance` is read from the source account
+  loaded for mutation (no stale-account quirk).):
 
 1. Destination MUST exist. Result: `ACCOUNT_MERGE_NO_ACCOUNT`.
 2. Source MUST NOT be `AUTH_IMMUTABLE`. Result:
@@ -1565,15 +1654,29 @@ vote-getting accounts. **Disabled from `@version(≥12)`**.
 **Threshold level**: LOW.
 
 **Execution**:
-1. Check timing: ledger close time MUST be ≥ inflation time.
+1. Check timing: ledger close time MUST be
+   ≥ `INFLATION_START_TIME + inflationSeq * INFLATION_FREQUENCY`.
    Result: `INFLATION_NOT_TIME`.
 2. Query top 2000 accounts by inflation destination votes, requiring
-   ≥ 0.05% of total coins as vote weight.
-3. Compute inflation amount: `totalCoins * 190721000 / 10^12`
+   ≥ 0.05% of `totalCoins` as vote weight.
+3. Compute inflation amount: `floor(totalCoins * 190721000 / 10^12)`
    (~1%/year compound rate).
-4. Distribute `inflationAmount + feePool` proportionally to winners.
-5. `@version(≥10)`: Cap each winner's payout to prevent overflow.
-6. Unallocated remainder returns to `feePool`.
+4. Set `amountToDole = inflationAmount + feePool`. Zero `feePool` and
+   increment `inflationSeq` **before** distribution.
+5. Distribute `amountToDole` proportionally to winners:
+   - For each winner, `toDole = floor(amountToDole * winner.votes
+     / totalVotes)`. Skip when zero.
+   - `@version(≥10)`: Additionally cap `toDole` to
+     `getMaxAmountReceive(winner)` (computed via a read-only load
+     of the winner). Skip when this cap zeroes out.
+   - Credit `toDole` to the winner's balance.
+   - `@version(<8)`: Increment `header.totalCoins += toDole` **inside
+     the loop** (totalCoins grows incrementally per winner).
+6. Unallocated remainder returns to `feePool` (added back after the
+   distribution loop).
+7. `@version(≥8)`: Increment `header.totalCoins += inflationAmount`
+   **once**, after the distribution loop (in contrast to the per-winner
+   accumulation in v<8).
 
 ### 7.13 ManageData
 
@@ -1690,13 +1793,17 @@ Begins a sponsorship relationship. `@version(≥14)`.
 - `sponsoredID` MUST NOT be the source account.
   Result: `BEGIN_SPONSORING_FUTURE_RESERVES_MALFORMED`.
 
-**Execution**:
+**Execution** (guards in this order):
 1. A sponsorship for `sponsoredID` MUST NOT already exist.
    Result: `ALREADY_SPONSORED`.
-2. A sponsorship for the source account MUST NOT exist (no recursive
-   sponsoring). Result: `RECURSIVE`.
-3. Create `SPONSORSHIP` internal entry mapping `sponsoredID` to source.
-4. Create or increment `SPONSORSHIP_COUNTER` for source.
+2. A sponsorship for the source account MUST NOT exist (the source
+   is itself being sponsored — no chained sponsorship).
+   Result: `RECURSIVE`.
+3. A `SPONSORSHIP_COUNTER` for `sponsoredID` MUST NOT exist (the
+   target is itself an active sponsor — no two-level sponsor chain).
+   Result: `RECURSIVE`.
+4. Create `SPONSORSHIP` internal entry mapping `sponsoredID` to source.
+5. Create or increment `SPONSORSHIP_COUNTER` for source.
 
 ### 7.18 EndSponsoringFutureReserves
 
