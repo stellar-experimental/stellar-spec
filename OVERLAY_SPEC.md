@@ -525,7 +525,7 @@ Before the local state reaches `GOT_AUTH`, only `HELLO`, `AUTH`, and
 `ERROR_MSG` are accepted from the remote peer (see
 `Peer::recvRawMessage`). Any other message type received before
 `GOT_AUTH` causes the receiver to drop the connection with reason
-"received <type> before completed handshake".
+`"received <type> before completed handshake"`.
 
 Additionally:
 

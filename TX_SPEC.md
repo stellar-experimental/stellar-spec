@@ -1716,7 +1716,7 @@ entries additionally carry `ext.v1.ext.v2`:
 |-------|------|-------------|
 | `numSponsored` | uint32 | How many entries this account has paid reserves for that another account owns. |
 | `numSponsoring` | uint32 | How many entries this account owns whose reserves are paid by another. |
-| `signerSponsoringIDs` | xvector<optional AccountID> | Per-signer sponsor IDs, indexed parallel to `signers`. |
+| `signerSponsoringIDs` | `xvector<optional AccountID>` | Per-signer sponsor IDs, indexed parallel to `signers`. |
 
 ### 9.3 Reserve Math
 
