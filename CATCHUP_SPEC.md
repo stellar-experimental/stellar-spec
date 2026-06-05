@@ -980,11 +980,11 @@ sequenceDiagram
     LAM->>LAM: buffer, trim
     SCP->>LAM: ledger 1089 (out of order)
     LAM->>LAM: buffer (now contains 1088..1092 after trim)
-    Note over LAM: 1088 is first-of-checkpoint;<br/>trigger online catchup
+    Note over LAM: 1088 is first-of-checkpoint,<br/>trigger online catchup
     LAM->>CW: startCatchup(toLedger=1087,<br/>trustedHash=prevHash(1088), count=RECENT)
     CW->>ARCH: GET .well-known/stellar-history.json
     ARCH-->>CW: HAS at latest checkpoint
-    CW->>CW: resolve(toLedger); CatchupRange computed
+    CW->>CW: resolve(toLedger), CatchupRange computed
     CW->>ARCH: GET HAS for bucket-apply ledger
     ARCH-->>CW: HAS at apply-buckets checkpoint
     CW->>ARCH: BatchDownload ledger-*.xdr.gz for verify range
@@ -995,7 +995,7 @@ sequenceDiagram
     ARCH-->>CW: bucket files
     CW->>CW: VerifyBucketWork (per bucket)
     CW->>BM: ApplyBucketsWork (state at bucket-apply ledger)
-    BM-->>CW: state applied; AssumeState complete
+    BM-->>CW: state applied, AssumeState complete
     CW->>LM: setLastClosedLedger(bucket-apply ledger)
     CW->>ARCH: GET transaction-*.xdr.gz
     ARCH-->>CW: tx files
@@ -1004,7 +1004,7 @@ sequenceDiagram
     LAM-->>CW: ledger 1088
     CW->>LM: applyLedger(1088)..applyLedger(1092)
     CW-->>LAM: SUCCESS
-    LAM->>LAM: clear mCatchupWork; node is back in sync
+    LAM->>LAM: clear mCatchupWork, node is back in sync
 ```
 
 ---

@@ -1985,7 +1985,7 @@ sequenceDiagram
     A->>B: SEND_MORE_EXTENDED(numMessages, numBytes)
     A->>B: GET_SCP_STATE(minLedger)
 
-    Note over A,B: Handshake complete; flood traffic now permitted<br/>up to advertised capacity
+    Note over A,B: Handshake complete, flood traffic now permitted<br/>up to advertised capacity
 ```
 
 A failed validation at any step produces an `ERROR_MSG` and an
