@@ -1645,7 +1645,7 @@ sequenceDiagram
     participant L as Leader L
     participant Q as Quorum Q
     Note over v: nominate(value, prev, false)
-    v->>v: round = 1; leaders = {v, L}<br/>vote x_v
+    v->>v: round = 1, leaders = {v, L}<br/>vote x_v
     v-->>Q: SCP_ST_NOMINATE { votes={x_v} }
     L-->>v: SCP_ST_NOMINATE { votes={x_L} }
     v->>v: getNewValueFromNomination -> x_L<br/>(L is leader, mCandidates empty)<br/>vote x_L
@@ -1658,7 +1658,7 @@ sequenceDiagram
     Q-->>v: SCP_ST_NOMINATE { accepted={x_L} } (quorum)
     v->>v: federatedRatify(x_L) holds<br/>x_L in mCandidates<br/>cancel nomination timer
     v->>v: combineCandidates -> composite<br/>updatedCandidateValue<br/>bumpState(composite, force=false)
-    Note over v: BallotProtocol starts at &lt;1, composite&gt;
+    Note over v: BallotProtocol starts at ⟨1, composite⟩
 ```
 
 ### Appendix D. Ballot Protocol Sequence — Happy Path
@@ -1667,20 +1667,20 @@ sequenceDiagram
 sequenceDiagram
     participant v as Local node v
     participant Q as Quorum Q
-    v->>v: bumpState(z, force=false)<br/>b = &lt;1, z&gt;
-    v-->>Q: PREPARE { b=&lt;1,z&gt;, p=null, p'=null, nC=0, nH=0 }
-    Q-->>v: PREPARE { b=&lt;1,z&gt;, ... }
-    v->>v: attemptAcceptPrepared(&lt;1,z&gt;) succeeds<br/>p = &lt;1,z&gt;
-    v-->>Q: PREPARE { b=&lt;1,z&gt;, p=&lt;1,z&gt;, nH=0, nC=0 }
-    Q-->>v: PREPARE { b=&lt;1,z&gt;, p=&lt;1,z&gt;, ... }
-    v->>v: attemptConfirmPrepared(&lt;1,z&gt;) succeeds<br/>h = &lt;1,z&gt;; c = &lt;1,z&gt;
-    v-->>Q: PREPARE { b=&lt;1,z&gt;, p=&lt;1,z&gt;, nH=1, nC=1 }
-    Q-->>v: PREPARE { p=&lt;1,z&gt;, nH=1, nC=1 }
+    v->>v: bumpState(z, force=false)<br/>b = ⟨1, z⟩
+    v-->>Q: PREPARE { b=⟨1,z⟩, p=null, p'=null, nC=0, nH=0 }
+    Q-->>v: PREPARE { b=⟨1,z⟩, ... }
+    v->>v: attemptAcceptPrepared(⟨1,z⟩) succeeds<br/>p = ⟨1,z⟩
+    v-->>Q: PREPARE { b=⟨1,z⟩, p=⟨1,z⟩, nH=0, nC=0 }
+    Q-->>v: PREPARE { b=⟨1,z⟩, p=⟨1,z⟩, ... }
+    v->>v: attemptConfirmPrepared(⟨1,z⟩) succeeds<br/>h = ⟨1,z⟩, c = ⟨1,z⟩
+    v-->>Q: PREPARE { b=⟨1,z⟩, p=⟨1,z⟩, nH=1, nC=1 }
+    Q-->>v: PREPARE { p=⟨1,z⟩, nH=1, nC=1 }
     v->>v: attemptAcceptCommit succeeds (interval [1,1])<br/>phase = CONFIRM
-    v-->>Q: CONFIRM { b=&lt;1,z&gt;, nPrepared=1, nCommit=1, nH=1 }
+    v-->>Q: CONFIRM { b=⟨1,z⟩, nPrepared=1, nCommit=1, nH=1 }
     Q-->>v: CONFIRM { ... nCommit=1, nH=1 }
     v->>v: attemptConfirmCommit succeeds<br/>phase = EXTERNALIZE
-    v-->>Q: EXTERNALIZE { commit=&lt;1,z&gt;, nH=1 }
+    v-->>Q: EXTERNALIZE { commit=⟨1,z⟩, nH=1 }
     v->>v: stopNomination<br/>valueExternalized(z)
 ```
 

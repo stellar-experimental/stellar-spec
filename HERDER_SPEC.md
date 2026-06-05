@@ -216,7 +216,7 @@ stateDiagram-v2
     TRACKING --> SYNCING: consensus stuck timeout fires
     TRACKING --> TRACKING: externalize next slot
     SYNCING --> SYNCING: outOfSyncRecovery
-    note right of BOOTING: Forbidden:<br/>TRACKING -> BOOTING,<br/>SYNCING -> BOOTING
+    note right of BOOTING: Forbidden —<br/>TRACKING -> BOOTING,<br/>SYNCING -> BOOTING
 ```
 
 **State semantics**:
