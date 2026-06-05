@@ -1,0 +1,34 @@
+name: Render check
+
+# GitHub renders Mermaid diagrams client-side and silently shows
+# "Unable to render rich display" when a diagram fails to parse -- there is no
+# native CI signal for it. This workflow validates every ```mermaid block with
+# mermaid-cli (the same Mermaid engine GitHub uses) so a broken diagram fails
+# the PR instead of shipping a blank box.
+
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "scripts/check-mermaid.mjs"
+      - ".github/workflows/render-check.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mermaid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Tracks the Mermaid major GitHub currently renders with (v11.x).
+      - name: Install mermaid-cli
+        run: npm install -g @mermaid-js/mermaid-cli@11
+
+      - name: Validate mermaid diagrams
+        run: node scripts/check-mermaid.mjs
