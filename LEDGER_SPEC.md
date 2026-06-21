@@ -1,8 +1,8 @@
 # Stellar Ledger Close Pipeline Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ## Table of Contents
 
@@ -43,7 +43,7 @@ update sequence, the production of `LedgerCloseMeta`, and the persistence of
 the resulting state to buckets, the database, and history archives.
 
 This specification is **implementation agnostic**. It is derived exclusively
-from the vetted stellar-core C++ implementation (v26.0.1). Any conforming
+from the vetted stellar-core C++ implementation (v27.0.0). Any conforming
 implementation that produces an identical sequence of `LedgerHeader` hashes,
 identical bucket-list contents, identical `TransactionResultSet` contents, and
 an identical stream of `LedgerCloseMeta` for all valid inputs is considered
@@ -1435,7 +1435,7 @@ reference implementation. Networks MUST satisfy the minimums via
 | [2] | CAP-0046-12 "Soroban Resource Fees" |
 | [3] | CAP-0057 "Hot Archive and Restoration" |
 | [4] | CAP-0063 "Parallel Soroban Transaction Apply" |
-| [5] | stellar-core v26.0.1 source: `src/ledger/`, `src/main/` |
+| [5] | stellar-core v27.0.0 source: `src/ledger/`, `src/main/` |
 | [6] | XDR: `Stellar-ledger.x`, `Stellar-ledger-entries.x`, `Stellar-internal.x` |
 | [7] | HERDER_SPEC §6 — Transaction set construction and apply ordering |
 | [8] | TX_SPEC §6, §7, §11 — Transaction lifecycle, fee processing, parallel apply |

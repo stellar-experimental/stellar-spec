@@ -1,8 +1,8 @@
 # Stellar Herder Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -44,7 +44,7 @@ candidate values during the SCP nomination round, and schedules
 protocol-level upgrades.
 
 This specification is **implementation agnostic**. It is derived exclusively
-from the vetted stellar-core C++ implementation (v26.0.1). Any conforming
+from the vetted stellar-core C++ implementation (v27.0.0). Any conforming
 implementation that produces identical SCP envelopes, externalized
 StellarValues, transaction set hashes, and post-close ledger state for all
 valid inputs is considered correct.
@@ -1572,7 +1572,7 @@ Herder.
 | BUCKETLISTDB_SPEC | Stellar BucketListDB specification. |
 | CATCHUP_SPEC | Stellar Catchup, Replay, and History Publishing specification. |
 | CAP-0034 | "Preserve Transaction-Set Validity" — semantics of close-time in the externalized value. |
-| stellar-core v26.0.1 | The reference C++ implementation from which this specification is derived. |
+| stellar-core v27.0.0 | The reference C++ implementation from which this specification is derived. |
 
 ---
 

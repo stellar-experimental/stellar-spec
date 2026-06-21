@@ -1,8 +1,8 @@
 # Stellar Transaction Processing Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -40,7 +40,7 @@ and result/metadata production logic that any conforming implementation MUST
 reproduce to maintain ledger consensus parity with stellar-core.
 
 This specification is **implementation agnostic**. It is derived exclusively
-from the vetted stellar-core C++ implementation (v26.0.1). Any conforming
+from the vetted stellar-core C++ implementation (v27.0.0). Any conforming
 implementation that produces identical post-apply ledger state, transaction
 results, transaction meta, and emitted events for all valid inputs is
 considered correct.
@@ -1803,9 +1803,24 @@ Pool fee is encoded in `params.fee` (basis points). Conversion uses
 ### 10.5 Cross Limit
 
 `getMaxOffersToCross()` returns a fixed protocol-wide cap (1000 in
-v26.0.1). When exceeded, the operation fails with
+v27.0.0). When exceeded, the operation fails with
 `opEXCEEDED_WORK_LIMIT`. This applies from
 `FIRST_PROTOCOL_SUPPORTING_OPERATION_LIMITS = V_11`.
+
+`@version(≥V_27)`: the cross-limit accounting additionally charges for
+offers crossed only while comparing offer and liquidity-pool prices at
+each step — crossings that are discarded when the pool is ultimately
+selected. At each step where the pool counterparty wins, the engine
+counts the number of such non-committed offer crossings and compares it
+against the remaining budget: if that count is greater than or equal to
+the remaining `maxOffersToCross`, the operation fails with
+`eCrossedTooMany` ⇒ `opEXCEEDED_WORK_LIMIT`; otherwise the remaining
+budget is reduced by that count (the `≥` test reserves at least one unit
+for the pool's own `ClaimAtom`). The committed offer trail decrements the
+budget independently. Before V_27 these comparison-only crossings did not
+consume the work budget, so a path payment or manage-offer operation that
+repeatedly compares against many offers but crosses pools instead can now
+fail with `opEXCEEDED_WORK_LIMIT` where it previously succeeded.
 
 ---
 
@@ -1861,7 +1876,7 @@ Soroban host. It takes:
 - Serialized `SorobanResources`.
 - Auto-restored RW entry indices.
 - Source account ID.
-- Auth entries.
+- Auth entries (`SorobanAuthorizationEntry`; credential variants in §11.7).
 - `CxxLedgerInfo`: protocol version, ledger seq, base reserve, close
   time, memory limit, min/max TTLs, network ID, cost params.
 - Ledger entry buffers + TTL buffers (parallel arrays).
@@ -1903,6 +1918,43 @@ under `ThreadParallelApplyLedgerState`. The flow is:
 
 Conflict detection (footprint-based) is the herder's responsibility
 (`HERDER_SPEC §5.3`).
+
+### 11.7 Authorization Credentials
+
+Each `SorobanAuthorizationEntry` carries a `SorobanCredentials` union
+selecting how the authorization is proven. The credential type is
+observable on the wire and determines which signature payload, if any, a
+conforming node MUST accept; the cryptographic verification, nonce
+consumption, and expiration enforcement are performed deterministically
+by the protocol-version Soroban host (§11.4) and are authoritative.
+
+The credential variants are:
+
+| Variant | Value | Availability | Payload |
+|---------|-------|--------------|---------|
+| `SOROBAN_CREDENTIALS_SOURCE_ACCOUNT` | 0 | all | none (covered by the transaction's own signatures) |
+| `SOROBAN_CREDENTIALS_ADDRESS` | 1 | all | `SorobanAddressCredentials` (address, nonce, `signatureExpirationLedger`, signature) |
+| `SOROBAN_CREDENTIALS_ADDRESS_V2` | 2 | `@version(≥V_27)` | `SorobanAddressCredentials` (CAP-71) |
+| `SOROBAN_CREDENTIALS_ADDRESS_WITH_DELEGATES` | 3 | `@version(≥V_27)` | `SorobanAddressCredentialsWithDelegates`: a base `SorobanAddressCredentials` plus a vector of `SorobanDelegateSignature` (CAP-71) |
+
+`@version(≥V_27)` (CAP-71): a `SorobanDelegateSignature` carries an
+`SCAddress`, an `SCVal` signature, and a recursive `nestedDelegates`
+vector, allowing an authorizing address to delegate proof of
+authorization to one or more other addresses, each of which MAY in turn
+delegate further. A node before V_27 MUST reject the `ADDRESS_V2` and
+`ADDRESS_WITH_DELEGATES` credential types.
+
+The signature payload is identified by a `HashIDPreimage` variant:
+
+- `ENVELOPE_TYPE_SOROBAN_AUTHORIZATION` (pre-existing) binds
+  `networkID`, `nonce`, `signatureExpirationLedger`, and the
+  `SorobanAuthorizedInvocation` tree.
+- `@version(≥V_27)` `ENVELOPE_TYPE_SOROBAN_AUTHORIZATION_WITH_ADDRESS`
+  additionally binds the credential `SCAddress` into the signed preimage
+  (`networkID`, `nonce`, `signatureExpirationLedger`, `address`,
+  `invocation`), so that a signature is bound to the specific
+  authorizing address. This preimage is used by the V_27 credential
+  variants.
 
 ---
 
@@ -2191,7 +2243,8 @@ caught:
 | CAP-0066 | Auto-restore archived persistent entries (V_23). |
 | CAP-0073 | SAC creates classic entries (V_26). |
 | CAP-0077 | Frozen keys (V_23). |
-| stellar-core v26.0.1 | Reference implementation pinned at submodule `stellar-core/`. |
+| CAP-0071 | Soroban authorization delegation: `ADDRESS_V2` / `ADDRESS_WITH_DELEGATES` credentials (V_27). |
+| stellar-core v27.0.0 | Reference implementation pinned at submodule `stellar-core/`. |
 | `protocol-curr/xdr/Stellar-transaction.x` | XDR schemas for transaction types and result codes. |
 | `LEDGER_SPEC` | Ledger close pipeline and LedgerTxn nesting. |
 | `HERDER_SPEC` | Transaction-set construction, surge pricing, mempool. |

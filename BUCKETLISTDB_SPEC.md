@@ -1,8 +1,8 @@
 # Stellar BucketList and BucketListDB Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -49,7 +49,7 @@ the auxiliary SQL database for `LedgerEntry` lookup with per-bucket
 indexes and Bloom filters.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v26.0.1).
+exclusively from the vetted stellar-core C++ implementation (v27.0.0).
 Any conforming implementation that produces an identical
 `bucketListHash` for the same input sequence of ledger close batches,
 and that returns identical query results for any `LedgerKey`, is

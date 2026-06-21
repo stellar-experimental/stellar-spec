@@ -1,8 +1,8 @@
 # Stellar Catchup, Replay, and History Publishing Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -42,7 +42,7 @@ This specification defines the observable protocol behavior of the Stellar catch
 - The catchup algorithm by which a desynchronized node reconstitutes ledger state from history archives and re-enters consensus.
 - The verification rules a conforming implementation MUST apply to history archive content before accepting it as authoritative.
 
-This specification is **implementation agnostic**. It is derived exclusively from the vetted stellar-core C++ implementation (v26.0.1). Any conforming implementation that produces identical history archive contents and identical post-catchup ledger state for all valid inputs is considered correct.
+This specification is **implementation agnostic**. It is derived exclusively from the vetted stellar-core C++ implementation (v27.0.0). Any conforming implementation that produces identical history archive contents and identical post-catchup ledger state for all valid inputs is considered correct.
 
 Out of scope:
 
@@ -898,7 +898,7 @@ The `CHECKPOINT_FREQUENCY` value of 64 is consensus-fixed (every conforming arch
 
 | Reference | Description |
 |-----------|-------------|
-| [stellar-core-v26.0.1] | The reference implementation, `stellar-core/` submodule at v26.0.1. |
+| [stellar-core-v27.0.0] | The reference implementation, `stellar-core/` submodule at v27.0.0. |
 | [RFC-2119] | Key words for use in RFCs to Indicate Requirement Levels. |
 | [RFC-5785] | Defining Well-Known Uniform Resource Identifiers. The `.well-known/stellar-history.json` convention follows this RFC. |
 | [BUCKETLISTDB_SPEC] | Stellar Bucket List Database Specification. Defines BucketList structure, bucket merge semantics, and bucket-apply algorithms referenced by §10. |
@@ -948,7 +948,7 @@ A `version == 2` HAS at checkpoint 0xbf might serialize as:
 ```json
 {
     "version": 2,
-    "server": "v26.0.1",
+    "server": "v27.0.0",
     "networkPassphrase": "Public Global Stellar Network ; September 2015",
     "currentLedger": 191,
     "currentBuckets": [
@@ -1025,7 +1025,7 @@ A replay run that processes a checkpoint file MUST exercise only cases 1–4 in 
 
 ---
 
-[stellar-core-v26.0.1]: https://github.com/stellar/stellar-core/tree/v26.0.1
+[stellar-core-v27.0.0]: https://github.com/stellar/stellar-core/tree/v27.0.0
 [RFC-2119]: https://www.rfc-editor.org/rfc/rfc2119
 [RFC-5785]: https://www.rfc-editor.org/rfc/rfc5785
 [BUCKETLISTDB_SPEC]: ./BUCKETLISTDB_SPEC.md

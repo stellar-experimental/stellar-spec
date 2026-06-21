@@ -1,8 +1,8 @@
 # Stellar Consensus Protocol (SCP) Specification
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -39,7 +39,7 @@ nomination and ballot algorithms, and the invariants that any
 conforming implementation MUST maintain.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v26.0.1).
+exclusively from the vetted stellar-core C++ implementation (v27.0.0).
 Any conforming implementation that produces identical externalized
 values and SCP envelopes for all valid inputs is considered correct.
 

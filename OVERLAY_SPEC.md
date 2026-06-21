@@ -1,8 +1,8 @@
 # Stellar Overlay Protocol Specification
 
-**Version:** 26 (Overlay Protocol v38–v39)
+**Version:** 27 (Overlay Protocol v38–v41)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ## Table of Contents
 
@@ -37,7 +37,7 @@ peer-to-peer transport layer that propagates SCP envelopes, transactions,
 transaction sets, quorum sets, and survey data between Stellar nodes.
 
 This specification is **implementation agnostic**. It is derived
-exclusively from the vetted stellar-core C++ implementation (v26.0.1).
+exclusively from the vetted stellar-core C++ implementation (v27.0.0).
 Any conforming implementation that produces identical wire-observable
 behavior — message bytes, sequencing, handshake decisions, flow control
 grants, flooding patterns, and peer-management transitions — for all
@@ -153,7 +153,8 @@ flood messages up to the receiver's last advertised capacity, and the
 receiver MUST issue `SEND_MORE_EXTENDED` to grant additional capacity.
 
 The protocol has its own version axis independent of the ledger
-protocol version. v26.0.1 supports overlay protocol versions 38–40,
+protocol version. v27.0.0 supports overlay protocol versions 38–41
+(`OVERLAY_PROTOCOL_MIN_VERSION = 38`, `OVERLAY_PROTOCOL_VERSION = 41`),
 with each peer advertising `[overlayMinVersion, overlayVersion]` in
 its `HELLO` and aborting on disjoint ranges.
 
@@ -188,7 +189,7 @@ removed). See §6 for the full registry.
 
 A `PeerAddress` carries an IPv4 or IPv6 address (4-byte or 16-byte
 opaque), a 32-bit `port`, and a 32-bit `numFailures` counter. IPv6
-addresses are accepted on the wire but, in v26.0.1, are not yet
+addresses are accepted on the wire but, in v27.0.0, are not yet
 supported and MUST be silently ignored on receipt (see §10.5).
 
 ### 3.3 Wire-Level Size Limits
@@ -792,7 +793,7 @@ overlay calls `Peer::handleMaxTxSizeIncrease(increase)`:
 ## 8. Transaction Flooding
 
 Transaction propagation uses a **pull (advert/demand)** model in
-v26.0.1: the holder of a transaction advertises its hash, and
+v27.0.0: the holder of a transaction advertises its hash, and
 interested peers explicitly request (demand) it.
 
 ### 8.1 Advert Phase
@@ -1089,7 +1090,7 @@ Every `PEER_AUTHENTICATION_TIMEOUT + 1 = 3` seconds:
 
 ### 10.5 IPv6 and Private Addresses
 
-In v26.0.1:
+In v27.0.0:
 
 - IPv6 entries in any `PEERS` message MUST be silently ignored.
 - Private RFC 1918 addresses MUST be silently ignored unless the
@@ -1555,7 +1556,7 @@ comments (e.g., `// Invariant: INV-O3`).
 | `HDRSZ` | 4 bytes | Record-marking header length. | [4.2](#42-record-marking) |
 | `AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED` | 200 | Mandatory `AUTH.flags` value. | [5.4.4](#544-the-auth-message) |
 | `OVERLAY_PROTOCOL_MIN_VERSION` (default) | 38 | Min supported overlay version. | [5.4.1](#541-the-hello-message) |
-| `OVERLAY_PROTOCOL_VERSION` (default) | 40 | Max supported overlay version. | [5.4.1](#541-the-hello-message) |
+| `OVERLAY_PROTOCOL_VERSION` (default) | 41 | Max supported overlay version. | [5.4.1](#541-the-hello-message) |
 
 ### 15.2 Timing Constants
 
@@ -1644,7 +1645,7 @@ comments (e.g., `// Invariant: INV-O3`).
 
 The complete XDR schema for overlay messages is reproduced below
 (from `stellar-core/src/protocol-curr/xdr/Stellar-overlay.x`,
-v26.0.1). Field semantics are described in §3 through §11.
+v27.0.0). Field semantics are described in §3 through §11.
 
 ```xdr
 namespace stellar

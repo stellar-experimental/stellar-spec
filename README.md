@@ -1,8 +1,8 @@
 # Stellar Protocol Specification Suite
 
-**Version:** 26 (stellar-core v26.0.1 / Protocol 26)
+**Version:** 27 (stellar-core v27.0.0 / Protocol 27)
 **Status:** Informational
-**Date:** 2026-05-13
+**Date:** 2026-06-21
 
 ---
 
@@ -22,8 +22,8 @@
 
 This suite collects seven implementation-agnostic specifications that
 together describe the observable behavior of the Stellar network at
-Protocol 26. Each document is derived exclusively from the vetted
-stellar-core C++ reference implementation (v26.0.1) and isolates the
+Protocol 27. Each document is derived exclusively from the vetted
+stellar-core C++ reference implementation (v27.0.0) and isolates the
 subset of behavior that is consensus-deterministic — that is, the
 behavior any conforming node MUST reproduce bit-for-bit in order to
 remain interoperable with the existing validator quorum.
@@ -95,7 +95,7 @@ document defines its own interface contract in its §1.x
 | Document | Subsystem | Description |
 |----------|-----------|-------------|
 | [SCP_SPEC.md](./SCP_SPEC.md) | Stellar Consensus Protocol | Federated Byzantine agreement: quorum sets, federated voting primitives, slot lifecycle, nomination and ballot protocols, EXTERNALIZE finality. Defines invariants `INV-S1`..`INV-S18`. |
-| [OVERLAY_SPEC.md](./OVERLAY_SPEC.md) | Peer-to-Peer Overlay | Wire protocol: connection lifecycle, authenticated framing, flow control, transaction flooding (push/pull adverts and demands), peer management, survey protocol. Overlay Protocol v38–v39; invariants `INV-O1`..`INV-O19`. |
+| [OVERLAY_SPEC.md](./OVERLAY_SPEC.md) | Peer-to-Peer Overlay | Wire protocol: connection lifecycle, authenticated framing, flow control, transaction flooding (push/pull adverts and demands), peer management, survey protocol. Overlay Protocol v38–v41; invariants `INV-O1`..`INV-O19`. |
 | [HERDER_SPEC.md](./HERDER_SPEC.md) | Consensus Driver | Consensus round lifecycle, `StellarValue` construction and validation, transaction set construction (classic and parallel Soroban), candidate combination, transaction queue, surge pricing, SCP envelope cache, protocol upgrade scheduling. Invariants `INV-H1`..`INV-H9`. |
 | [LEDGER_SPEC.md](./LEDGER_SPEC.md) | Ledger Close Pipeline | Multi-phase ledger close: fee phase, apply phase, upgrades, seal-and-store; nested `LedgerTxn` model; header management and skip list; Soroban network configuration and state; ledger close meta. Invariants `INV-L1`..`INV-L15`. |
 | [TX_SPEC.md](./TX_SPEC.md) | Transaction Processing | Transaction lifecycle, signature checking, operation execution (all op types), sponsorship, DEX conversion engine, Soroban execution and fee model, metadata and event emission, result codes. Invariants `INV-T1`..`INV-T15`. |
@@ -319,7 +319,7 @@ document.
 | [RFC 7748][rfc7748] | Elliptic Curves for Security (Curve25519, X25519). |
 | [RFC 2104][rfc2104] | HMAC: Keyed-Hashing for Message Authentication. |
 | [FIPS 180-4][fips180] | Secure Hash Standard (SHA-256). |
-| [stellar-core v26.0.1][stellar-core] | Reference implementation pinned in the `stellar-core/` submodule and the source from which every spec in this suite is derived. |
+| [stellar-core v27.0.0][stellar-core] | Reference implementation pinned in the `stellar-core/` submodule and the source from which every spec in this suite is derived. |
 | [stellar-xdr][stellar-xdr] | Canonical XDR schema for all wire-format and on-disk types referenced from this suite. |
 | [CAP catalog][cap-index] | Core Advancement Proposals — the protocol-evolution change record referenced from individual spec sections. |
 
@@ -330,6 +330,6 @@ document.
 [rfc7748]: https://www.rfc-editor.org/rfc/rfc7748
 [rfc2104]: https://www.rfc-editor.org/rfc/rfc2104
 [fips180]: https://csrc.nist.gov/publications/detail/fips/180/4/final
-[stellar-core]: https://github.com/stellar/stellar-core/tree/v26.0.1
+[stellar-core]: https://github.com/stellar/stellar-core/tree/v27.0.0
 [stellar-xdr]: https://github.com/stellar/stellar-xdr
 [cap-index]: https://github.com/stellar/stellar-protocol/tree/master/core
